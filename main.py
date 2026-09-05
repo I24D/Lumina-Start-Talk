@@ -30,6 +30,17 @@ if _platform.system() == "Windows":
 
     _subprocess.Popen = _Popen
 
+# ── Single instance ────────────────────────────────────────────────────────────
+# Two HUDs would fight over the microphone, so every launcher — shortcut, .bat,
+# or the microphone button in the Lumina OpenClaw web UI — may start LUMINA
+# blindly: a duplicate raises the running window and leaves. This sits above the
+# heavy imports below on purpose; discovering the duplicate after loading
+# sounddevice, numpy and the Gemini SDK would cost seconds for nothing.
+from core.single_instance import claim_or_focus
+
+if not claim_or_focus():
+    raise SystemExit(0)
+
 # ─────────────────────────────────────────────────────────────────────────────
 
 import asyncio
