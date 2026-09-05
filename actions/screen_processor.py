@@ -82,7 +82,7 @@ _IMG_MAX_H = 720
 _JPEG_Q    = 82
 
 _SYSTEM_PROMPT = (
-    "You are JARVIS, Tony Stark's AI assistant. "
+    "You are LUMINA, a capable personal AI assistant. "
     "You are given an image from either the user's screen or their webcam. "
     "Analyze what you see with detail and intelligence. "
     "Describe objects, text, people, components, and their context clearly. "
@@ -342,7 +342,7 @@ class _VisionSession:
                     if transcript and self._player:
                         full = re.sub(r"\s+", " ", " ".join(transcript)).strip()
                         if full:
-                            self._player.write_log(f"Jarvis: {full}")
+                            self._player.write_log(f"LUMINA: {full}")
                             print(f"[Vision] 💬 {full}")
                     transcript = []
                     # Auto-close camera ~2s after JARVIS finishes speaking

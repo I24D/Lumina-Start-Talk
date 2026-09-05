@@ -1,0 +1,28 @@
+name: 💡 Feature or plugin idea / Idea
+description: Suggest a new skill or improvement
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Escribe en **español o inglés**. Para cambios grandes, abre primero una
+        [discusión](../../discussions) antes de escribir mucho código.
+  - type: textarea
+    id: idea
+    attributes:
+      label: What should Lumina be able to do?
+      description: Describe it as you would say it out loud to the assistant.
+    validations:
+      required: true
+  - type: textarea
+    id: why
+    attributes:
+      label: Why is this useful?
+    validations:
+      required: true
+  - type: dropdown
+    id: plugin
+    attributes:
+      label: Could this be a plugin?
+      description: Most new skills fit in a single file in `plugins/` without touching the core.
+      options: ["Yes, probably a plugin", "No, it needs core changes", "Not sure"]

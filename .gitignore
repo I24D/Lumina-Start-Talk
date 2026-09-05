@@ -22,3 +22,8 @@ memory/*.json
 Thumbs.db
 desktop.ini
 *.bak
+
+# Local secrets — never commit
+.env
+.env.*
+config/api_keys.json

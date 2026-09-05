@@ -1,0 +1,52 @@
+name: 🐛 Bug report / Reporte de error
+description: Something in Lumina does not work as expected
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Escribe en **español o inglés**, como prefieras.
+
+        ⚠️ **Before you post:** remove API keys, tokens and any personal message content from
+        logs and screenshots. Notification text is easy to paste by accident.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened? / ¿Qué pasó?
+      description: What you asked Lumina, and what it did instead.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect? / ¿Qué esperabas?
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Activity Log / console output
+      description: >
+        The lines around the failure. Launch with `python main.py` instead of `pythonw.exe`
+        to see console output. Redact anything personal.
+      render: text
+  - type: input
+    id: os
+    attributes:
+      label: OS and version
+      placeholder: Windows 11 Pro 26200 / macOS 15 / Ubuntu 24.04
+    validations:
+      required: true
+  - type: input
+    id: python
+    attributes:
+      label: Python version
+      placeholder: "3.12.4"
+    validations:
+      required: true
+  - type: dropdown
+    id: admin
+    attributes:
+      label: Running as administrator?
+      description: A few features (temperature sensors, some system controls) need it.
+      options: ["No", "Yes", "Not sure"]

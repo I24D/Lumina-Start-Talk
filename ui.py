@@ -24,7 +24,7 @@ from PyQt6.QtCore import (
 )
 from PyQt6.QtGui import (
     QBrush, QColor, QConicalGradient, QDragEnterEvent, QDropEvent, QFont,
-    QFontDatabase, QKeySequence, QLinearGradient, QPainter, QPainterPath,
+    QFontDatabase, QIcon, QKeySequence, QLinearGradient, QPainter, QPainterPath,
     QPen, QPixmap, QRadialGradient, QShortcut,
 )
 from PyQt6.QtWidgets import (
@@ -41,6 +41,9 @@ def _base_dir() -> Path:
 BASE_DIR   = _base_dir()
 CONFIG_DIR = BASE_DIR / "config"
 API_FILE   = CONFIG_DIR / "api_keys.json"
+APP_NAME   = "LUMINA"
+APP_ICON_PNG = CONFIG_DIR / "lumina.png"
+APP_ICON_ICO = CONFIG_DIR / "lumina.ico"
 
 
 def _read_full_config() -> dict:
@@ -51,36 +54,36 @@ def _read_full_config() -> dict:
         return {}
 
 
-_DEFAULT_W, _DEFAULT_H = 980, 700
-_MIN_W,     _MIN_H     = 820, 580
-_LEFT_W  = 148
-_RIGHT_W = 340
+_DEFAULT_W, _DEFAULT_H = 1080, 740
+_MIN_W,     _MIN_H     = 860, 600
+_LEFT_W  = 156
+_RIGHT_W = 360
 
 _OS = platform.system()  # "Windows" | "Darwin" | "Linux"
 
 
 class C:
-    BG        = "#00060a"
-    PANEL     = "#010d14"
-    PANEL2    = "#010f18"
-    BORDER    = "#0d3347"
-    BORDER_B  = "#1a5c7a"
-    BORDER_A  = "#0f4060"
-    PRI       = "#00d4ff"
-    PRI_DIM   = "#007a99"
-    PRI_GHO   = "#001f2e"
-    ACC       = "#ff6b00"
-    ACC2      = "#ffcc00"
+    BG        = "#0d0204"
+    PANEL     = "#150407"
+    PANEL2    = "#1c0609"
+    BORDER    = "#4a151c"
+    BORDER_B  = "#8c2633"
+    BORDER_A  = "#651d27"
+    PRI       = "#ff3b4d"
+    PRI_DIM   = "#b92335"
+    PRI_GHO   = "#3b0a10"
+    ACC       = "#ff814a"
+    ACC2      = "#ffc857"
     GREEN     = "#00ff88"
     GREEN_D   = "#00aa55"
-    RED       = "#ff3355"
-    MUTED_C   = "#ff3366"
-    TEXT      = "#8ffcff"
-    TEXT_DIM  = "#3a8a9a"
-    TEXT_MED  = "#5ab8cc"
-    WHITE     = "#d8f8ff"
-    DARK      = "#000d14"
-    BAR_BG    = "#011520"
+    RED       = "#ff3347"
+    MUTED_C   = "#ff4965"
+    TEXT      = "#ffdce1"
+    TEXT_DIM  = "#a96771"
+    TEXT_MED  = "#d5969f"
+    WHITE     = "#fff5f6"
+    DARK      = "#090102"
+    BAR_BG    = "#23070b"
 
 
 # Ana renge (accent) bağlı anahtarlar — durum renkleri (ACC, GREEN, RED…) sabit kalır
@@ -92,6 +95,32 @@ _HUE_LINKED = (
 _PALETTE_DEFAULTS: dict[str, str] = {k: getattr(C, k) for k in _HUE_LINKED}
 
 DEFAULT_UI_COLOR = _PALETTE_DEFAULTS["PRI"]
+LEGACY_UI_COLOR  = "#00d4ff"
+
+_NIGHT_OVERRIDES = {
+    "BG":       "#000000",
+    "PANEL":    "#050505",
+    "PANEL2":   "#090909",
+    "DARK":     "#020202",
+    "BAR_BG":   "#0d0d0d",
+    "TEXT":     "#eadfe1",
+    "TEXT_DIM": "#846c70",
+    "TEXT_MED": "#b99da2",
+    "WHITE":    "#f8f3f4",
+}
+
+
+def _effective_ui_color(config: dict) -> str:
+    """Migrate the old cyan factory colour to Lumina red without touching secrets."""
+    saved = str(config.get("ui_color") or "").strip().lower()
+    return DEFAULT_UI_COLOR if not saved or saved == LEGACY_UI_COLOR else saved
+
+
+def apply_night_palette(enabled: bool) -> None:
+    """Turn the neutral surfaces black while preserving the selected accent."""
+    if enabled:
+        for key, value in _NIGHT_OVERRIDES.items():
+            setattr(C, key, value)
 
 
 def apply_ui_accent(accent_hex: str) -> bool:
@@ -338,7 +367,7 @@ class _SysMetrics:
 _metrics = _SysMetrics()
 
 class HudCanvas(QWidget):
-    def __init__(self, face_path: str, assistant_name: str = "J.A.R.V.I.S", parent=None):
+    def __init__(self, face_path: str, assistant_name: str = APP_NAME, parent=None):
         super().__init__(parent)
         self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent)
         self.setMinimumSize(300, 300)
@@ -584,7 +613,8 @@ class HudCanvas(QWidget):
             p.drawPixmap(int(cx - fsz / 2), int(cy - fsz / 2), scaled)
         else:
             orb_r = int(fw * 0.27 * self._scale)
-            oc    = (200, 0, 50) if self.muted else (0, 60, 110)
+            orb   = QColor(C.MUTED_C if self.muted else C.PRI)
+            oc    = (orb.red(), orb.green(), orb.blue())
             for i in range(8, 0, -1):
                 r2  = int(orb_r * i / 8)
                 frc = i / 8
@@ -741,7 +771,7 @@ class LogWidget(QTextEdit):
         self._text    = ""
         self._pos     = 0
         self._tag     = "sys"
-        self._ai_name_lc = "jarvis"   # updated when assistant name changes
+        self._ai_name_lc = APP_NAME.lower()   # updated when assistant name changes
         self._tmr = QTimer(self)
         self._tmr.timeout.connect(self._step)
         self._sig.connect(self._enqueue)
@@ -890,7 +920,7 @@ class FileDropZone(QWidget):
 
     def _browse(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, "Select a file for JARVIS", str(Path.home()),
+            self, f"Select a file for {APP_NAME}", str(Path.home()),
             "All Files (*.*);;"
             "Images (*.jpg *.jpeg *.png *.gif *.webp *.bmp *.svg);;"
             "Documents (*.pdf *.docx *.txt *.md *.pptx);;"
@@ -924,7 +954,7 @@ class _DropCanvas(QWidget):
         pad  = 6
         rect = QRectF(pad, pad, W - pad * 2, H - pad * 2)
 
-        bg_col = qcol("#001a24" if z._drag_over else ("#001218" if z._hovering else C.PANEL))
+        bg_col = qcol(C.PRI_GHO if z._drag_over else (C.PANEL2 if z._hovering else C.PANEL))
         p.setBrush(QBrush(bg_col)); p.setPen(Qt.PenStyle.NoPen)
         p.drawRoundedRect(rect, 6, 6)
 
@@ -957,7 +987,7 @@ class _DropCanvas(QWidget):
         p.drawText(QRectF(0, cy + 8, W, 16), Qt.AlignmentFlag.AlignCenter,
                    "Drop file here  or  Click to Browse")
         p.setFont(QFont("Courier New", 7))
-        p.setPen(QPen(qcol("#1a4a5a"), 1))
+        p.setPen(QPen(qcol(C.TEXT_DIM), 1))
         p.drawText(QRectF(0, cy + 24, W, 14), Qt.AlignmentFlag.AlignCenter,
                    "Images · Video · Audio · PDF · Docs · Code · Data")
 
@@ -998,7 +1028,7 @@ class _DropCanvas(QWidget):
                    f"{ext_str}  ·  {size_str}")
 
         p.setFont(QFont("Courier New", 6))
-        p.setPen(QPen(qcol("#1e5c6a"), 1))
+        p.setPen(QPen(qcol(C.BORDER_B), 1))
         par = str(path.parent)
         if len(par) > 42: par = "…" + par[-41:]
         p.drawText(QRectF(tx, H * 0.18 + 34, tw, 12),
@@ -1026,7 +1056,7 @@ class _CameraPreview(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setStyleSheet(f"""
             _CameraPreview {{
-                background: rgba(0, 6, 10, 242);
+                background: {C.PANEL};
                 border: 1px solid {C.PRI};
                 border-radius: 6px;
             }}
@@ -1091,7 +1121,7 @@ class SetupOverlay(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setStyleSheet(f"""
             SetupOverlay {{
-                background: rgba(0, 6, 10, 245);
+                background: {C.PANEL};
                 border: 1px solid {C.BORDER_B};
                 border-radius: 6px;
             }}
@@ -1116,7 +1146,7 @@ class SetupOverlay(QWidget):
             return w
 
         layout.addWidget(_lbl("◈  INITIALISATION REQUIRED", 13, True))
-        layout.addWidget(_lbl("Configure J.A.R.V.I.S. before first boot.", 9, color=C.PRI_DIM))
+        layout.addWidget(_lbl(f"Configure {APP_NAME} before first boot.", 9, color=C.PRI_DIM))
         layout.addSpacing(6)
 
         sep = QFrame(); sep.setFrameShape(QFrame.Shape.HLine)
@@ -1132,7 +1162,7 @@ class SetupOverlay(QWidget):
         self._key_input.setFixedHeight(32)
         self._key_input.setStyleSheet(f"""
             QLineEdit {{
-                background: #000d12; color: {C.TEXT};
+                background: {C.DARK}; color: {C.TEXT};
                 border: 1px solid {C.BORDER}; border-radius: 3px; padding: 4px 8px;
             }}
             QLineEdit:focus {{ border: 1px solid {C.PRI}; }}
@@ -1182,7 +1212,8 @@ class SetupOverlay(QWidget):
 
     def _sel(self, key: str):
         self._sel_os = key
-        pal = {"windows":(C.PRI,"#001a22"),"mac":(C.ACC2,"#1a1400"),"linux":(C.GREEN,"#001a0d")}
+        pal = {"windows": (C.PRI, C.DARK), "mac": (C.ACC2, C.DARK),
+               "linux": (C.GREEN, C.DARK)}
         for k, btn in self._os_btns.items():
             if k == key:
                 fg, bg = pal[k]
@@ -1195,7 +1226,7 @@ class SetupOverlay(QWidget):
             else:
                 btn.setStyleSheet(f"""
                     QPushButton {{
-                        background: #000d12; color: {C.TEXT_DIM};
+                        background: {C.DARK}; color: {C.TEXT_DIM};
                         border: 1px solid {C.BORDER}; border-radius: 3px;
                     }}
                     QPushButton:hover {{ color: {C.TEXT}; border: 1px solid {C.BORDER_B}; }}
@@ -1312,13 +1343,13 @@ class CustomizeOverlay(QWidget):
     saved = pyqtSignal(str, str, str, str)   # assistant_name, user_name, ui_color, voice
     _OW, _OH = 400, 588
 
-    def __init__(self, assistant_name="JARVIS", user_name="",
+    def __init__(self, assistant_name=APP_NAME, user_name="",
                  ui_color=DEFAULT_UI_COLOR, voice="", parent=None):
         super().__init__(parent)
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setStyleSheet(f"""
             CustomizeOverlay {{
-                background: rgba(0, 6, 10, 245);
+                background: {C.PANEL};
                 border: 1px solid {C.BORDER_B};
                 border-radius: 6px;
             }}
@@ -1334,7 +1365,7 @@ class CustomizeOverlay(QWidget):
             w.setStyleSheet(f"color: {color}; background: transparent;")
             return w
 
-        _fs = (f"QLineEdit {{ background: #000d12; color: {C.TEXT}; "
+        _fs = (f"QLineEdit {{ background: {C.DARK}; color: {C.TEXT}; "
                f"border: 1px solid {C.BORDER}; border-radius: 3px; padding: 4px 8px; }}"
                f"QLineEdit:focus {{ border: 1px solid {C.PRI}; }}")
 
@@ -1418,7 +1449,7 @@ class CustomizeOverlay(QWidget):
         self._wheel.hue_committed.connect(self._on_wheel_commit)
 
         self._hex_input = QLineEdit(self._sel_color)
-        self._hex_input.setPlaceholderText("#00d4ff   (custom hex colour)")
+        self._hex_input.setPlaceholderText(f"{DEFAULT_UI_COLOR}   (custom hex colour)")
         self._hex_input.setFont(QFont("Courier New", 10))
         self._hex_input.setFixedHeight(28)
         self._hex_input.setStyleSheet(_fs)
@@ -1518,7 +1549,7 @@ class CustomizeOverlay(QWidget):
         self.hide()
 
     def _save(self):
-        name = self._name_input.text().strip() or "JARVIS"
+        name = self._name_input.text().strip() or APP_NAME
         user = self._user_input.text().strip()
         self.saved.emit(name, user, self._sel_color or DEFAULT_UI_COLOR, self._sel_voice)
         self.hide()
@@ -1534,7 +1565,7 @@ class PluginManagerOverlay(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setStyleSheet(f"""
             PluginManagerOverlay {{
-                background: rgba(0, 6, 10, 245);
+                background: {C.PANEL};
                 border: 1px solid {C.BORDER_B};
                 border-radius: 6px;
             }}
@@ -1738,11 +1769,11 @@ class ConfirmBanner(_HudOverlay):
 
 
 class AudioDeviceOverlay(_HudOverlay):
-    """Choose which microphone JARVIS listens to and which speakers it uses.
+    """Choose which microphone LUMINA listens to and which speakers it uses.
 
     Both audio streams used to open with no `device=` at all, so they always
     took the OS default — which on Windows moves by itself the moment a headset
-    is plugged in. 'JARVIS can't hear me' is usually 'JARVIS is listening to the
+    is plugged in. 'LUMINA can't hear me' is usually 'LUMINA is listening to the
     webcam'."""
 
     picked = pyqtSignal()      # emitted after Apply, when something changed
@@ -1756,7 +1787,7 @@ class AudioDeviceOverlay(_HudOverlay):
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setStyleSheet(f"""
             AudioDeviceOverlay {{
-                background: rgba(0, 6, 10, 245);
+                background: {C.PANEL};
                 border: 1px solid {C.BORDER_B};
                 border-radius: 6px;
             }}
@@ -1777,10 +1808,10 @@ class AudioDeviceOverlay(_HudOverlay):
         lay.addWidget(sep)
 
         _combo_css = (
-            f"QComboBox {{ background: #000d12; color: {C.TEXT}; "
+            f"QComboBox {{ background: {C.DARK}; color: {C.TEXT}; "
             f"border: 1px solid {C.BORDER}; border-radius: 3px; padding: 4px 8px; }}"
             f"QComboBox:hover {{ border-color: {C.BORDER_B}; }}"
-            f"QComboBox QAbstractItemView {{ background: #000d12; color: {C.TEXT}; "
+            f"QComboBox QAbstractItemView {{ background: {C.DARK}; color: {C.TEXT}; "
             f"selection-background-color: {C.PRI_GHO}; border: 1px solid {C.BORDER}; }}"
         )
 
@@ -1810,10 +1841,10 @@ class AudioDeviceOverlay(_HudOverlay):
             lay.addWidget(box)
             return box
 
-        self._in_box  = _row("MICROPHONE — what JARVIS hears you with",
+        self._in_box  = _row(f"MICROPHONE — what {APP_NAME} hears you with",
                              "input", get_input_device())
         lay.addSpacing(4)
-        self._out_box = _row("SPEAKERS — what JARVIS talks through",
+        self._out_box = _row(f"SPEAKERS — what {APP_NAME} talks through",
                              "output", get_output_device())
 
         note = QLabel("Applying reconnects the session. Your conversation is kept.")
@@ -1867,7 +1898,7 @@ class AudioDeviceOverlay(_HudOverlay):
 
 
 class MemoryOverlay(_HudOverlay):
-    """Everything JARVIS has stored about you, and when it learned it.
+    """Everything LUMINA has stored about you, and when it learned it.
 
     Memory used to be a 2200-character store that deleted its oldest entries
     when full and mentioned it only on stdout. The cap is gone; this panel is
@@ -1881,7 +1912,7 @@ class MemoryOverlay(_HudOverlay):
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setStyleSheet(f"""
             MemoryOverlay {{
-                background: rgba(0, 6, 10, 246);
+                background: {C.PANEL};
                 border: 1px solid {C.BORDER_B};
                 border-radius: 6px;
             }}
@@ -1961,7 +1992,7 @@ class MemoryOverlay(_HudOverlay):
 
         from memory.memory_manager import all_entries_for_ui
 
-        hdr = QLabel("🧠  WHAT JARVIS REMEMBERS")
+        hdr = QLabel(f"🧠  WHAT {APP_NAME} REMEMBERS")
         hdr.setFont(QFont("Courier New", 12, QFont.Weight.Bold))
         hdr.setStyleSheet(f"color: {C.PRI}; background: transparent;")
         self._lay.addWidget(hdr)
@@ -2063,7 +2094,7 @@ class MemoryOverlay(_HudOverlay):
 
 
 class ClipboardPanel(QWidget):
-    """Floating panel shown when text is copied — offers quick Jarvis actions."""
+    """Floating panel shown when text is copied — offers quick Lumina actions."""
 
     action_requested = pyqtSignal(str)
     _W, _H = 326, 112
@@ -2073,7 +2104,7 @@ class ClipboardPanel(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setStyleSheet(f"""
             ClipboardPanel {{
-                background: rgba(0, 8, 14, 248);
+                background: {C.PANEL};
                 border: 1px solid {C.BORDER_B};
                 border-radius: 6px;
             }}
@@ -2161,7 +2192,7 @@ class RemoteKeyOverlay(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setStyleSheet(f"""
             RemoteKeyOverlay {{
-                background: rgba(0, 4, 12, 0.95);
+                background: {C.PANEL};
                 border: 1px solid {C.BORDER_B};
                 border-radius: 14px;
             }}
@@ -2339,7 +2370,7 @@ class RemoteKeyOverlay(QWidget):
         self._qr_label.setStyleSheet(
             "color: #00ff88; background: #001a0d; border-radius: 10px;"
         )
-        self._timer_lbl.setText("Phone connected — JARVIS ready")
+        self._timer_lbl.setText(f"Phone connected — {APP_NAME} ready")
         self._timer_lbl.setStyleSheet(f"color: {C.GREEN}; background: transparent;")
 
     def _refresh_key(self):
@@ -2394,15 +2425,18 @@ class MainWindow(QMainWindow):
 
         # Load customization from config
         _cfg = _read_full_config()
-        self._assistant_name: str = (_cfg.get("assistant_name") or "JARVIS").strip()
+        self._assistant_name: str = (_cfg.get("assistant_name") or APP_NAME).strip()
         _display = self._assistant_name.upper()
 
-        # Kayıtlı UI rengini panel/stylesheet'ler kurulmadan ÖNCE uygula
-        _ui_color = (_cfg.get("ui_color") or "").strip()
-        if _ui_color and _ui_color.lower() != DEFAULT_UI_COLOR:
-            apply_ui_accent(_ui_color)
+        # Apply the saved theme before any widget captures palette colours.
+        _ui_color = _effective_ui_color(_cfg)
+        self._night_mode = bool(_cfg.get("night_mode", False))
+        apply_ui_accent(_ui_color)
+        apply_night_palette(self._night_mode)
 
-        self.setWindowTitle(f"{_display} — MARK LII")
+        self.setWindowTitle(APP_NAME)
+        if APP_ICON_ICO.exists():
+            self.setWindowIcon(QIcon(str(APP_ICON_ICO)))
         self.setMinimumSize(_MIN_W, _MIN_H)
         self.resize(_DEFAULT_W, _DEFAULT_H)
 
@@ -2447,7 +2481,7 @@ class MainWindow(QMainWindow):
 
         # Live camera container — replaces HUD when camera stream is active
         _cam_cont = QWidget()
-        _cam_cont.setStyleSheet("background: #000308;")
+        _cam_cont.setStyleSheet(f"background: {C.BG};")
         _cam_v = QVBoxLayout(_cam_cont)
         _cam_v.setContentsMargins(0, 0, 0, 0)
         _cam_v.setSpacing(0)
@@ -2510,6 +2544,7 @@ class MainWindow(QMainWindow):
         # Quick-access drawer (floating overlay, built after central widget layout is done)
         self._quick_drawer = self._build_quick_drawer()
         self._update_autostart_btn(self._check_autostart())
+        self._update_night_btn()
         from memory.config_manager import get_brief_enabled as _gbe
         self._update_brief_btn(_gbe())
 
@@ -2632,8 +2667,26 @@ class MainWindow(QMainWindow):
         self._cam_stop.set()
 
     # ------------------------------------------------------------------
-    # Icon generation — arc-reactor style, rendered with Pillow
+    # Icon generation — Lumina mascot rendered into a multi-resolution ICO
     # ------------------------------------------------------------------
+    @staticmethod
+    def _build_lumina_icon(out_path: Path) -> bool:
+        """Build the Windows icon from the bundled Lumina mascot PNG."""
+        try:
+            import PIL.Image
+            source = PIL.Image.open(APP_ICON_PNG).convert("RGBA")
+            source.save(
+                out_path,
+                format="ICO",
+                sizes=[(256, 256), (128, 128), (64, 64),
+                       (48, 48), (32, 32), (16, 16)],
+            )
+            return True
+        except Exception as e:
+            print(f"[Shortcut] Lumina icon generation failed: {e}")
+            return False
+
+    # Legacy generator retained only for compatibility with older callers.
     @staticmethod
     def _build_jarvis_icon(out_path: Path) -> bool:
         """
@@ -2750,7 +2803,7 @@ class MainWindow(QMainWindow):
             sc.TargetPath       = target
             sc.Arguments        = f'"{args}"'
             sc.WorkingDirectory = work_dir
-            sc.Description      = "J.A.R.V.I.S AI Assistant"
+            sc.Description      = "LUMINA AI Assistant"
             sc.IconLocation     = icon_loc
             sc.save()
             return
@@ -2765,7 +2818,7 @@ class MainWindow(QMainWindow):
             f'sc.TargetPath = "{target}"',
             f'sc.Arguments = Chr(34) & "{args}" & Chr(34)',
             f'sc.WorkingDirectory = "{work_dir}"',
-            'sc.Description = "J.A.R.V.I.S AI Assistant"',
+            'sc.Description = "LUMINA AI Assistant"',
             f'sc.IconLocation = "{icon_loc}"',
             'sc.Save',
         ])
@@ -2876,10 +2929,10 @@ class MainWindow(QMainWindow):
         python  = Path(sys.executable)
         desktop = self._get_desktop_dir()
 
-        # Arc-reactor icon (.ico — also exported as .png for Linux/macOS)
-        ico_path = Path(__file__).resolve().parent / "config" / "jarvis.ico"
+        # Lumina mascot icon (.ico — also exported as .png for Linux/macOS)
+        ico_path = APP_ICON_ICO
         if not ico_path.exists():
-            self._build_jarvis_icon(ico_path)
+            self._build_lumina_icon(ico_path)
 
         try:
             _os = platform.system()
@@ -2888,14 +2941,14 @@ class MainWindow(QMainWindow):
             if _os == "Windows":
                 pythonw  = python.parent / "pythonw.exe"
                 target   = str(pythonw if pythonw.exists() else python)
-                lnk      = str(desktop / "J.A.R.V.I.S.lnk")
+                lnk      = str(desktop / "LUMINA.lnk")
                 icon_loc = str(ico_path) if ico_path.exists() else f"{target},0"
                 self._create_lnk_windows(lnk, target, str(script),
                                          str(script.parent), icon_loc)
 
             # ── macOS — proper .app bundle (no Terminal window) ───────────────
             elif _os == "Darwin":
-                app     = desktop / "J.A.R.V.I.S.app"
+                app     = desktop / "LUMINA.app"
                 mac_dir = app / "Contents" / "MacOS"
                 res_dir = app / "Contents" / "Resources"
                 mac_dir.mkdir(parents=True, exist_ok=True)
@@ -2903,7 +2956,7 @@ class MainWindow(QMainWindow):
 
                 # Launcher executable (bash — runs as background process,
                 # macOS does NOT open Terminal for executables inside .app bundles)
-                launcher = mac_dir / "JARVIS"
+                launcher = mac_dir / "LUMINA"
                 launcher.write_text(
                     "#!/usr/bin/env bash\n"
                     f'cd "{script.parent}"\n'
@@ -2918,10 +2971,10 @@ class MainWindow(QMainWindow):
                     '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
                     '"http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
                     '<plist version="1.0"><dict>\n'
-                    '  <key>CFBundleExecutable</key><string>JARVIS</string>\n'
+                    '  <key>CFBundleExecutable</key><string>LUMINA</string>\n'
                     '  <key>CFBundleIdentifier</key>'
-                    '<string>com.jarvis.assistant</string>\n'
-                    '  <key>CFBundleName</key><string>J.A.R.V.I.S</string>\n'
+                    '<string>com.lumina.assistant</string>\n'
+                    '  <key>CFBundleName</key><string>LUMINA</string>\n'
                     '  <key>CFBundlePackageType</key><string>APPL</string>\n'
                     '  <key>CFBundleVersion</key><string>1.0</string>\n'
                     '</dict></plist>\n'
@@ -2959,10 +3012,10 @@ class MainWindow(QMainWindow):
                         png_path = ico_path  # fallback to .ico
 
                 icon_line = f"Icon={png_path}\n" if png_path.exists() else ""
-                desk = desktop / "J.A.R.V.I.S.desktop"
+                desk = desktop / "LUMINA.desktop"
                 desk.write_text(
                     "[Desktop Entry]\n"
-                    "Name=J.A.R.V.I.S\n"
+                    "Name=LUMINA\n"
                     f"Exec={python} {script}\n"
                     f"Path={script.parent}\n"
                     "Type=Application\n"
@@ -3074,22 +3127,33 @@ class MainWindow(QMainWindow):
 
     def _build_header(self) -> QWidget:
         w = QWidget()
-        w.setFixedHeight(54)
+        w.setFixedHeight(64)
         w.setStyleSheet(f"background: {C.DARK}; border-bottom: 1px solid {C.BORDER_B};")
         lay = QHBoxLayout(w)
-        lay.setContentsMargins(16, 0, 16, 0)
+        lay.setContentsMargins(14, 0, 14, 0)
 
-        def _badge(txt, color=C.TEXT_MED):
-            l = QLabel(txt)
-            l.setFont(QFont("Courier New", 8))
-            l.setStyleSheet(f"color: {color}; background: transparent;")
-            return l
+        left = QWidget()
+        left.setFixedWidth(180)
+        left.setStyleSheet("background: transparent;")
+        left_lay = QHBoxLayout(left)
+        left_lay.setContentsMargins(0, 0, 0, 0)
+        left_lay.setSpacing(10)
+        mascot = QLabel()
+        mascot.setFixedSize(40, 40)
+        mascot.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        mascot.setStyleSheet("background: transparent;")
+        if APP_ICON_PNG.exists():
+            px = QPixmap(str(APP_ICON_PNG))
+            mascot.setPixmap(px.scaled(
+                38, 38, Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            ))
+        mascot.setToolTip(APP_NAME)
+        left_lay.addWidget(mascot)
 
-        lay.addWidget(_badge("MARK LII", C.PRI_DIM))
-        lay.addSpacing(8)
         self._drawer_btn = QPushButton("⚙")
-        self._drawer_btn.setFixedSize(26, 26)
-        self._drawer_btn.setFont(QFont("Courier New", 11))
+        self._drawer_btn.setFixedSize(32, 32)
+        self._drawer_btn.setFont(QFont("Courier New", 13))
         self._drawer_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._drawer_btn.setToolTip("Settings & Controls")
         self._drawer_btn.setStyleSheet(f"""
@@ -3102,28 +3166,28 @@ class MainWindow(QMainWindow):
         """)
         self._drawer_btn.setCheckable(True)
         self._drawer_btn.clicked.connect(self._toggle_drawer)
-        lay.addWidget(self._drawer_btn)
-        lay.addStretch()
+        left_lay.addWidget(self._drawer_btn)
+        left_lay.addStretch()
+        lay.addWidget(left)
 
         mid = QVBoxLayout(); mid.setSpacing(1)
-        _disp = self._assistant_name.upper()
-        self._title_lbl = QLabel(_disp)
+        self._title_lbl = QLabel(APP_NAME)
         self._title_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._title_lbl.setFont(QFont("Courier New", 17, QFont.Weight.Bold))
         self._title_lbl.setStyleSheet(f"color: {C.PRI}; background: transparent;")
         mid.addWidget(self._title_lbl)
-        _sub_text = ("Just A Rather Very Intelligent System"
-                     if _disp in ("JARVIS", "J.A.R.V.I.S")
-                     else "Personal AI Assistant")
-        self._sub_lbl = QLabel(_sub_text)
+        self._sub_lbl = QLabel("PERSONAL AI ASSISTANT")
         self._sub_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._sub_lbl.setFont(QFont("Courier New", 7))
         self._sub_lbl.setStyleSheet(f"color: {C.PRI_DIM}; background: transparent;")
         mid.addWidget(self._sub_lbl)
-        lay.addLayout(mid)
-        lay.addStretch()
+        lay.addLayout(mid, stretch=1)
 
+        right = QWidget()
+        right.setFixedWidth(180)
+        right.setStyleSheet("background: transparent;")
         right_col = QVBoxLayout(); right_col.setSpacing(2)
+        right_col.setContentsMargins(0, 0, 0, 0)
         self._clock_lbl = QLabel("00:00:00")
         self._clock_lbl.setFont(QFont("Courier New", 14, QFont.Weight.Bold))
         self._clock_lbl.setStyleSheet(f"color: {C.PRI}; background: transparent;")
@@ -3134,7 +3198,8 @@ class MainWindow(QMainWindow):
         self._date_lbl.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent;")
         self._date_lbl.setAlignment(Qt.AlignmentFlag.AlignRight)
         right_col.addWidget(self._date_lbl)
-        lay.addLayout(right_col)
+        right.setLayout(right_col)
+        lay.addWidget(right)
         return w
 
     def _tick_clock(self):
@@ -3200,7 +3265,7 @@ class MainWindow(QMainWindow):
         for txt, col in [
             ("AI CORE\nACTIVE",  C.GREEN),
             ("SEC\nCLEARED",     C.PRI),
-            ("PROTOCOL\nXLIX",   C.TEXT_DIM),
+            ("SYSTEM\nREADY",    C.TEXT_DIM),
         ]:
             lbl = QLabel(txt)
             lbl.setFont(QFont("Courier New", 7, QFont.Weight.Bold))
@@ -3285,7 +3350,7 @@ class MainWindow(QMainWindow):
         """Floating overlay panel shown when the ⚙ header button is toggled."""
         _BTN_STYLE_PRI = f"""
             QPushButton {{
-                background: #00091a; color: {C.PRI};
+                background: {C.PANEL}; color: {C.PRI};
                 border: 1px solid {C.PRI_DIM}; border-radius: 3px;
                 text-align: left; padding: 0 8px;
             }}
@@ -3337,6 +3402,13 @@ class MainWindow(QMainWindow):
         fs_btn.setStyleSheet(_BTN_STYLE_DIM)
         fs_btn.clicked.connect(self._toggle_fullscreen)
         lay.addWidget(fs_btn)
+
+        self._night_btn = QPushButton()
+        self._night_btn.setFixedHeight(26)
+        self._night_btn.setFont(QFont("Courier New", 7, QFont.Weight.Bold))
+        self._night_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._night_btn.clicked.connect(self._toggle_night_mode)
+        lay.addWidget(self._night_btn)
 
         sc_btn = QPushButton("⊞  CREATE DESKTOP SHORTCUT")
         sc_btn.setFixedHeight(26)
@@ -3419,7 +3491,7 @@ class MainWindow(QMainWindow):
         self._input.setFixedHeight(30)
         self._input.setStyleSheet(f"""
             QLineEdit {{
-                background: #000d14; color: {C.WHITE};
+                background: {C.DARK}; color: {C.WHITE};
                 border: 1px solid {C.BORDER}; border-radius: 3px; padding: 3px 7px;
             }}
             QLineEdit:focus {{ border: 1px solid {C.PRI}; }}
@@ -3549,7 +3621,7 @@ class MainWindow(QMainWindow):
 
     def _build_footer(self) -> QWidget:
         w = QWidget()
-        w.setFixedHeight(22)
+        w.setFixedHeight(26)
         w.setStyleSheet(f"background: {C.DARK}; border-top: 1px solid {C.BORDER};")
         lay = QHBoxLayout(w); lay.setContentsMargins(14, 0, 14, 0)
 
@@ -3560,7 +3632,8 @@ class MainWindow(QMainWindow):
 
         lay.addWidget(_fl("[F4] Mute  ·  [F11] Fullscreen"))
         lay.addStretch()
-        lay.addWidget(_fl("By FatihMakes", C.PRI_DIM))
+        self._footer_theme_lbl = _fl("RED INTERFACE", C.PRI_DIM)
+        lay.addWidget(self._footer_theme_lbl)
         return w
 
     def _on_file_selected(self, path: str):
@@ -3716,6 +3789,49 @@ class MainWindow(QMainWindow):
                 QPushButton:hover {{ color: {C.TEXT}; border: 1px solid {C.BORDER_B}; }}
             """)
 
+    def _toggle_night_mode(self):
+        old = current_palette()
+        self._night_mode = not self._night_mode
+        accent = _effective_ui_color(_read_full_config())
+        apply_ui_accent(accent)
+        apply_night_palette(self._night_mode)
+        retheme_all_widgets(old, current_palette())
+
+        from memory.config_manager import save_night_mode
+        save_night_mode(self._night_mode)
+        self._update_night_btn()
+        self._log.append_log(
+            f"SYS: {'Night' if self._night_mode else 'Red'} interface enabled."
+        )
+
+    def _update_night_btn(self):
+        if not hasattr(self, "_night_btn"):
+            return
+        if self._night_mode:
+            self._night_btn.setText("☾  NIGHT MODE: ON")
+            self._night_btn.setStyleSheet(f"""
+                QPushButton {{
+                    background: {C.PRI_GHO}; color: {C.PRI};
+                    border: 1px solid {C.PRI_DIM}; border-radius: 3px;
+                    text-align: left; padding: 0 8px;
+                }}
+                QPushButton:hover {{ border-color: {C.PRI}; }}
+            """)
+            if hasattr(self, "_footer_theme_lbl"):
+                self._footer_theme_lbl.setText("NIGHT MODE")
+        else:
+            self._night_btn.setText("☾  NIGHT MODE: OFF")
+            self._night_btn.setStyleSheet(f"""
+                QPushButton {{
+                    background: transparent; color: {C.TEXT_MED};
+                    border: 1px solid {C.BORDER}; border-radius: 3px;
+                    text-align: left; padding: 0 8px;
+                }}
+                QPushButton:hover {{ color: {C.PRI}; border-color: {C.BORDER_B}; }}
+            """)
+            if hasattr(self, "_footer_theme_lbl"):
+                self._footer_theme_lbl.setText("RED INTERFACE")
+
     def _toggle_brief(self):
         from memory.config_manager import get_brief_enabled, save_brief_enabled
         new_val = not get_brief_enabled()
@@ -3754,9 +3870,9 @@ class MainWindow(QMainWindow):
             self._customize_overlay.hide()
         cw = self.centralWidget()
         ov = CustomizeOverlay(
-            cfg.get("assistant_name", "JARVIS") or "JARVIS",
+            cfg.get("assistant_name", APP_NAME) or APP_NAME,
             cfg.get("user_name", ""),
-            cfg.get("ui_color", "") or DEFAULT_UI_COLOR,
+            _effective_ui_color(cfg),
             cfg.get("voice_name", ""),
             parent=cw,
         )
@@ -3776,19 +3892,17 @@ class MainWindow(QMainWindow):
         """Canlı önizleme — tüm arayüzü yeni renge boyar (config'e YAZMAZ)."""
         old = current_palette()
         if apply_ui_accent(hex_color):
+            apply_night_palette(self._night_mode)
             retheme_all_widgets(old, current_palette())
 
     def _apply_name_update(self, name: str, user_name: str, ui_color: str = "",
                            voice: str = ""):
         """Update all name/theme-dependent UI elements and persist to config."""
-        self._assistant_name = name.strip() or "JARVIS"
+        self._assistant_name = name.strip() or APP_NAME
         display = self._assistant_name.upper()
-        self.setWindowTitle(f"{display} — MARK LII")
-        self._title_lbl.setText(display)
-        if display in ("JARVIS", "J.A.R.V.I.S"):
-            self._sub_lbl.setText("Just A Rather Very Intelligent System")
-        else:
-            self._sub_lbl.setText("Personal AI Assistant")
+        self.setWindowTitle(APP_NAME)
+        self._title_lbl.setText(APP_NAME)
+        self._sub_lbl.setText("PERSONAL AI ASSISTANT")
         self._log._ai_name_lc = self._assistant_name.lower()
         self.hud._assistant_name = display
 
@@ -3796,6 +3910,7 @@ class MainWindow(QMainWindow):
         if ui_color:
             old = current_palette()
             if apply_ui_accent(ui_color):
+                apply_night_palette(self._night_mode)
                 # Tüm arayüzü (paneller, butonlar, kenarlıklar, HUD) canlı boya
                 retheme_all_widgets(old, current_palette())
                 color_changed = old["PRI"] != C.PRI
@@ -3999,7 +4114,13 @@ class MainWindow(QMainWindow):
     def _on_setup_done(self, key: str, os_name: str):
         os.makedirs(CONFIG_DIR, exist_ok=True)
         API_FILE.write_text(
-            json.dumps({"gemini_api_key": key, "os_system": os_name}, indent=4),
+            json.dumps({
+                "gemini_api_key": key,
+                "os_system": os_name,
+                "assistant_name": APP_NAME,
+                "ui_color": DEFAULT_UI_COLOR,
+                "night_mode": False,
+            }, indent=4),
             encoding="utf-8",
         )
         self._ready = True
@@ -4007,7 +4128,7 @@ class MainWindow(QMainWindow):
             self._overlay.hide()
             self._overlay = None
         self._apply_state("LISTENING")
-        self._assistant_name = _read_full_config().get("assistant_name", "JARVIS") or "JARVIS"
+        self._assistant_name = _read_full_config().get("assistant_name", APP_NAME) or APP_NAME
         self._log.append_log(f"SYS: Initialised. OS={os_name.upper()}. {self._assistant_name} online.")
 
 class _RootShim:
@@ -4023,6 +4144,8 @@ class JarvisUI:
     def __init__(self, face_path: str, size=None):
         self._app = QApplication.instance() or QApplication(sys.argv)
         self._app.setStyle("Fusion")
+        if APP_ICON_ICO.exists():
+            self._app.setWindowIcon(QIcon(str(APP_ICON_ICO)))
         self._win = MainWindow(face_path)
         self._win.show()
         self.root = _RootShim(self._app)

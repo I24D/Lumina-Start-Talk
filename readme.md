@@ -1,17 +1,63 @@
-# ⚙️ MARK LII (52)
-### The Ultimate Cross-Platform Personal AI Assistant — By FatihMakes
+# LUMINA START TALK
+### Voice-first desktop assistant — part of the **Lumina IA** family
 
-> 📺 **[Watch the full setup video on YouTube](https://www.youtube.com/@FatihMakes)**
+**Principal developer:** **Dal Nijaruq** ([@I24D](https://github.com/I24D)) · LUMINA IA
+
+[![Part of Lumina IA](https://img.shields.io/badge/Lumina%20IA-family-0aa?style=flat-square)](https://github.com/I24D/Public-Lumina)
+[![Licence: CC BY-NC 4.0](https://img.shields.io/badge/licence-CC%20BY--NC%204.0-lightgrey?style=flat-square)](LICENSE)
+[![Contributions welcome](https://img.shields.io/badge/contributions-welcome-brightgreen?style=flat-square)](CONTRIBUTING.md)
 
 A real-time voice AI that can hear, see, understand, and control your computer — on any OS. Supports Windows, macOS, and Linux. Built on the Gemini Live API for native audio streaming, delivering zero subscriptions and total digital autonomy.
 
 ---
 
+## 🌐 The Lumina IA family
+
+Lumina Start Talk is the **desktop voice assistant** of a wider platform built by Dal Nijaruq.
+Each project stands alone, and together they form one assistant across the places you work.
+
+| Project | What it is |
+|---|---|
+| **Lumina Start Talk** (this repo) | Voice-first desktop assistant — real-time speech, screen vision, system control, phone notifications |
+| [Lumina Code](https://github.com/I24D/Lumina_Code) | AI coding agent for VS Code on Windows — native voice, bounded autonomous goals, MCP |
+| [Lumina OpenClaw](https://github.com/I24D/Lumina-Openclaw) | Gateway of the family — routing and integrations |
+| [Public Lumina](https://github.com/I24D/Public-Lumina) | Architecture, design decisions and roadmap for the platform |
+| [Lumina Novela](https://github.com/I24D/Lumina-Novela) | *La promesa de un sueño* — the bilingual novel behind the name |
+
+---
+
+## 🤝 Contributing
+
+Contributions are welcome — from anyone, in **English or Spanish**. Bug reports, new plugins,
+translations and documentation all help. The plugin system means you can add a whole new skill
+without touching the core: one file in `plugins/`.
+
+Start with **[CONTRIBUTING.md](CONTRIBUTING.md)**, open an
+[issue](https://github.com/I24D/Lumina-Start-Talk/issues) or join the
+[discussions](https://github.com/I24D/Lumina-Start-Talk/discussions).
+
+---
+
+## 📜 Credits & licence
+
+Lumina Start Talk is a modified version of **[MARK LII](https://github.com/FatihMakes/Mark-LII)**,
+created by **[FatihMakes](https://github.com/FatihMakes)** and released under
+**[CC BY-NC 4.0](LICENSE)**. Full credit for the original engine goes to them.
+
+**Changes made in this fork:** renamed and re-themed as Lumina Start Talk, Spanish-first
+assistant configuration, and a new `phone_notifications` plugin that reads and clears the
+notifications mirrored from the phone through Windows Phone Link (Enlace Móvil).
+
+The CC BY-NC licence carries over to this project: **use it freely, but not commercially**, and
+keep the attribution to FatihMakes if you build on it.
+
+---
+
 ## ✨ Overview
 
-MARK LII is the **personalization** release: the assistant that becomes *yours*. Pick the voice it speaks with, tune the colour of the whole HUD, and watch it power on with a boot chime and a swelling animation like a machine coming to life. The interface now breathes with you too — the waveform and the arc-reactor core pulse to your **real** voice while you speak and to JARVIS's own voice while it answers.
+LUMINA is a personal assistant that becomes *yours*. Pick the voice it speaks with, tune the colour of the whole HUD, and watch it power on with a boot chime and a swelling animation like a machine coming to life. The interface breathes with you too — the waveform and core pulse to your **real** voice while you speak and to LUMINA's own voice while it answers.
 
-All of that sits on the Mark LI foundation: a plugin engine you extend without ever touching the core, native audio that hears the emotion in your voice, knows when you're not talking to it, and can hold one conversation for hours.
+It combines a plugin engine you can extend without touching the core, native audio that hears the emotion in your voice, and long-running conversations.
 
 It's not just an assistant — it's an extension of your digital life.
 
@@ -24,14 +70,14 @@ It's not just an assistant — it's an extension of your digital life.
 |---|---|
 | 🎙️ Voice Picker | Choose from 5 native Gemini voices and switch live from the UI — no restart |
 | 🎨 Live Theming | Recolour the entire HUD from a hue wheel or hex — applied instantly across every panel |
-| 〰️ Reactive HUD | Waveform and reactor core pulse to real audio — your mic while listening, JARVIS while speaking |
+| 〰️ Reactive HUD | Waveform and reactor core pulse to real audio — your mic while listening, LUMINA while speaking |
 | 🧠 Recallable Memory | No size limit and nothing silently forgotten — the prompt carries what fits, the rest is looked up on demand from a local search |
-| 👁️ Memory Panel | See every fact JARVIS has stored about you, when it learned it, and delete any of it in one click |
+| 👁️ Memory Panel | See every fact LUMINA has stored about you, when it learned it, and delete any of it in one click |
 | ↩️ Undo | Take back what the assistant did — files it moved, renamed, created or wrote, and settings it changed |
 | ⚠️ Real Confirmation | Shutdown, restart and WiFi wait for a button **you** press — the model cannot confirm its own irreversible actions |
 | 🎧 Audio Device Picker | Choose the microphone and speakers by name, filtered to the short list your OS shows — and measured, so every entry actually works |
 | 🔗 Session Continuity | A dropped connection, a voice change or a device change no longer wipes the conversation |
-| 🧩 Plugin System | Drop a single `.py` file into `plugins/` — JARVIS learns a new skill on next launch |
+| 🧩 Plugin System | Drop a single `.py` file into `plugins/` — LUMINA learns a new skill on next launch |
 | 🎙️ Real-time Voice | Ultra-low latency conversation in any language via Gemini Live API |
 | 💓 Affective Dialog | Hears the emotion in your voice and adapts its tone in response |
 | 🤫 Proactive Audio | Knows when you're not talking to it — background chatter never triggers a reply |
@@ -66,28 +112,28 @@ It's not just an assistant — it's an extension of your digital life.
 
 ---
 
-## 🆕 What's New in Mark LII
+## 🆕 LUMINA highlights
 
-Mark LII is about making JARVIS feel like *your own* machine. Four small-but-delightful upgrades — all universal: no hardcoded values, no bundled asset files, and no assumptions about your language or operating system.
+LUMINA is designed to feel like *your own* machine, with portable behavior and no assumptions about your language or operating system.
 
-### 🎙️ Voice Picker — Give JARVIS the Voice You Want
-JARVIS is no longer stuck with one voice. Open **⚙ Customise Assistant** and choose between five native Gemini voices — **Charon, Puck, Kore, Fenrir, Aoede** — each with its own character. The switch is live: the session rebuilds itself the instant you apply, so the new voice takes over without you restarting anything, and session resumption keeps your conversation going. The voice names are language-neutral, so the picker reads the same in every locale.
+### 🎙️ Voice Picker — Give LUMINA the Voice You Want
+LUMINA is not stuck with one voice. Open **⚙ Customise Assistant** and choose between five native Gemini voices — **Charon, Puck, Kore, Fenrir, Aoede** — each with its own character. The switch is live: the session rebuilds itself the instant you apply, so the new voice takes over without you restarting anything, and session resumption keeps your conversation going. The voice names are language-neutral, so the picker reads the same in every locale.
 
 ### 🎨 Live Theming — Recolour the Entire Interface
-Drag the hue wheel (or type an exact hex code) and the whole HUD re-themes in real time — panels, borders, the reactor core, the waveform, every button. Make it classic arc-reactor cyan, Iron Man gold, hostile red, or anything in between. Your choice is saved and restored on the next launch.
+LUMINA starts with a red visual identity inspired by its mascot. Drag the hue wheel (or type an exact hex code) to re-theme the HUD in real time, or use **Night Mode** in the controls drawer for black surfaces with restrained accent lighting. Your choice is saved and restored on the next launch.
 
 ### 〰️ Reactive HUD — The Interface Breathes With the Room
-The waveform and the arc-reactor core now respond to **real audio**, not a random animation. While JARVIS listens, they pulse to your microphone; while JARVIS speaks, they pulse to its own voice — louder speech, taller bars and a brighter, wider core. When the room goes quiet, everything settles back into a gentle idle ripple. It makes the assistant feel genuinely alive and connected to what's happening.
+The waveform and the core respond to **real audio**, not a random animation. While LUMINA listens, they pulse to your microphone; while LUMINA speaks, they pulse to its own voice — louder speech, taller bars and a brighter, wider core. When the room goes quiet, everything settles back into a gentle idle ripple.
 
 Every launch now opens with a proper boot: a ~2.4-second cinematic **transform** sound — a reactor spinning up, servos locking into place, and a bright chord confirming "online" — plays as the HUD swells up from a dim point, rings spin up, and a bright pulse sweeps outward. It's synthesized entirely in code (no sound file to ship, identical on Windows, macOS and Linux), and you can turn it on or off any time from the **🔊 BOOT SOUND** toggle in the ⚙ controls. If a machine has no audio output, it simply stays silent — never an error.
 
-> Built on Mark LI's foundation: the **🧩 Plugin System** (extend JARVIS with a single drop-in file), **💓 Affective Dialog**, **🤫 Proactive Audio**, and **♾️ Unlimited Sessions** are all still here and unchanged.
+The **🧩 Plugin System**, **💓 Affective Dialog**, **🤫 Proactive Audio**, and **♾️ Unlimited Sessions** work together as LUMINA's foundation.
 
 ---
 
-## 🔄 The Foundation Update — in every Mark from LII
+## 🔄 Reliable foundation
 
-These four landed across **Mark LII, LIII, LIV and LV at the same time**, after each of those releases had already shipped. They are not what any one of those versions originally introduced; they are the floor all of them now stand on, so moving up a Mark never costs you something the one below it had.
+These improvements form one reliable base across supported operating systems.
 
 No new dependencies. No bundled asset files. No hardcoded language, and nothing that assumes one operating system.
 
@@ -107,7 +153,7 @@ The part that is easy to get wrong: **a model cannot look something up if it doe
 
 ### ↩️ Undo — it can take back what it did
 
-JARVIS moves files, renames them, writes to them and changes your settings. None of that had a way back; if it misheard you, the only remedy was to fix it by hand.
+LUMINA moves files, renames them, writes to them and changes your settings. Every supported change is designed with a safe path back.
 
 Say **"undo"** — in any language — and it reverses its own last action:
 
@@ -137,13 +183,13 @@ if action in _DANGEROUS_ACTIONS:            # {"restart", "shutdown"}
 
 `confirmed` is a **tool parameter, which means the model fills it in.** Nothing stopped it sending `confirmed=yes` on the first call and nothing checked that a human was ever involved. It was a convention, not a gate. And its coverage was two actions — so `toggle_wifi`, which cuts the assistant's own connection to the Live API and therefore *cannot be asked to undo itself*, went through with no gate at all.
 
-The token is now issued by the interface. Shutdown, restart and WiFi put a banner on the HUD and **return immediately**; the action runs only if you press CONFIRM. Nothing blocks — JARVIS keeps talking while the banner is up — so this is **cheaper than the old gate**, which burned two tool round trips on every power command.
+The token is issued by the interface. Shutdown, restart and WiFi put a banner on the HUD and **return immediately**; the action runs only if you press CONFIRM. Nothing blocks — LUMINA keeps talking while the banner is up.
 
 > The split between the two mechanisms is about reversibility, not about how alarming a word sounds. Anything undoable is done at once; only the genuinely irreversible asks. An assistant that checks with you before turning the volume down is one you stop talking to.
 
 ### 🎧 It finally asks which microphone
 
-Both audio streams opened with no device argument at all, so they always took whatever the OS called "default" — and on Windows that *moves on its own* the moment you plug a headset in. "JARVIS can't hear me" almost always meant "JARVIS is listening to the webcam".
+Audio streams can follow the devices selected in the UI instead of whichever endpoint the OS happens to call "default". If a saved device disappears, LUMINA safely falls back to the system default.
 
 ⚙ → **🎧 AUDIO DEVICES** lets you pick the microphone and the speakers by name. Two things matter more than the dropdown:
 
@@ -182,24 +228,10 @@ It is held in memory only, deliberately: writing it to disk would make a fresh l
 
 ---
 
-## 🗺️ Mark Roadmap
-
-| Mark | Focus |
-|---|---|
-| **XLVIII** | Instant interrupt · parallel news · two-phase briefing · exponential backoff · vision cooldown |
-| **XLIX** | Auto-start · clipboard intelligence · assistant customization |
-| **L** | Session memory · background monitoring · proactive 2.0 · instant vision · parallel news search |
-| **LI** | Plugin system · affective dialog · proactive audio · unlimited sessions |
-| **LII** | Voice picker · live theming · reactive HUD |
-| **LIII+** | Plugin files: email · quiz mode · calendar · and more |
-
----
-
 ## ⚡ Quick Start
 
 ```bash
-git clone https://github.com/FatihMakes/Mark-LII.git
-cd Mark-LII
+cd "Lumina Start talk"
 pip install -r requirements.txt
 python main.py
 ```
@@ -223,7 +255,7 @@ python main.py
 ## 🗂️ Project Structure
 
 ```
-Mark LII/
+Lumina Start talk/
 ├── main.py                   # Core loop — Gemini Live session, audio I/O, live audio levels, tool dispatch
 ├── ui.py                     # PyQt6 HUD — reactive waveform, boot animation, log panel, plugin manager, camera feed
 ├── setup.py                  # First-run configuration wizard
@@ -270,15 +302,3 @@ Mark LII/
 
 Personal and non-commercial use only.
 Licensed under **[Creative Commons BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/)**.
-
----
-
-## 👤 Connect with the Creator
-
-Engineered by a developer building a real-world JARVIS-style assistant.
-⭐ **Star the repository to support the journey to Mark 100.**
-
-| Platform | Link |
-| --- | --- |
-| YouTube | [@FatihMakes](https://www.youtube.com/@FatihMakes) |
-| Instagram | [@fatihmakes](https://www.instagram.com/fatihmakes) |

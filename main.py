@@ -130,7 +130,7 @@ def _load_system_prompt() -> str:
         return PROMPT_PATH.read_text(encoding="utf-8")
     except Exception:
         return (
-            "You are JARVIS, Tony Stark's AI assistant. "
+            "You are LUMINA, a capable personal AI assistant. "
             "Be concise, direct, and always use the provided tools to complete tasks. "
             "Never simulate or guess results — always call the appropriate tool."
         )
@@ -720,7 +720,7 @@ class JarvisLive:
 
     def __init__(self, ui: JarvisUI):
         self.ui             = ui
-        self._asst_name     = "JARVIS"   # updated each session from config
+        self._asst_name     = "LUMINA"   # updated each session from config
         self.session              = None
         self.audio_in_queue       = None
         self.out_queue            = None
@@ -922,10 +922,10 @@ class JarvisLive:
         # Load customization from config
         try:
             _cfg = json.loads(open(API_CONFIG_PATH, encoding="utf-8").read())
-            self._asst_name = (_cfg.get("assistant_name") or "JARVIS").strip()
+            self._asst_name = (_cfg.get("assistant_name") or "LUMINA").strip()
             _user_name = (_cfg.get("user_name") or "").strip()
         except Exception:
-            self._asst_name = "JARVIS"
+            self._asst_name = "LUMINA"
             _user_name = ""
 
         memory     = load_memory()
@@ -1874,7 +1874,7 @@ class JarvisLive:
                         # is the whole point, and it is invisible otherwise.
                         self.ui.write_log("SYS: Reconnected — conversation restored.")
                     self.ui.set_state("LISTENING")
-                    self.ui.write_log("SYS: JARVIS online.")
+                    self.ui.write_log(f"SYS: {self._asst_name} online.")
 
                     if self._dashboard:
                         await self._dashboard.broadcast({"type": "status", "state": "active"})

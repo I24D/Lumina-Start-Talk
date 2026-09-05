@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: 💬 Discussions
+    url: https://github.com/I24D/Lumina-Start-Talk/discussions
+    about: Questions, ideas and showing what you built — start here if it is not a bug.
+  - name: 🌐 The Lumina IA platform
+    url: https://github.com/I24D/Public-Lumina
+    about: Architecture, design decisions and roadmap for the whole Lumina family.

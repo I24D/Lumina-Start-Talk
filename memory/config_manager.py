@@ -52,8 +52,8 @@ def is_configured() -> bool:
 
 
 def get_assistant_name() -> str:
-    """Return the configured assistant name, or 'JARVIS' if not set."""
-    return load_api_keys().get("assistant_name", "JARVIS") or "JARVIS"
+    """Return the configured assistant name, or 'LUMINA' if not set."""
+    return load_api_keys().get("assistant_name", "LUMINA") or "LUMINA"
 
 
 def get_user_name() -> str:
@@ -70,7 +70,7 @@ def save_assistant_config(assistant_name: str, user_name: str) -> None:
             data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
         except Exception:
             data = {}
-    data["assistant_name"] = assistant_name.strip() or "JARVIS"
+    data["assistant_name"] = assistant_name.strip() or "LUMINA"
     data["user_name"] = user_name.strip()
     CONFIG_FILE.write_text(json.dumps(data, indent=4), encoding="utf-8")
 
@@ -142,6 +142,16 @@ def _patch_config(**fields) -> None:
             data = {}
     data.update(fields)
     CONFIG_FILE.write_text(json.dumps(data, indent=4), encoding="utf-8")
+
+
+def get_night_mode() -> bool:
+    """Return whether Lumina's black night palette is enabled."""
+    return bool(load_api_keys().get("night_mode", False))
+
+
+def save_night_mode(enabled: bool) -> None:
+    """Persist the UI theme without disturbing API keys or other settings."""
+    _patch_config(night_mode=bool(enabled))
 
 
 def get_input_device() -> str:
