@@ -3,9 +3,22 @@ import json
 import sys
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 
 from memory.config_manager import get_tavily_key
+
+
+def _searched_on() -> str:
+    """Stamp every result block with the date it was fetched.
+
+    Results carry no dates of their own — Tavily's general topic omits
+    published_date entirely and DDG text() never had one — so a page headed
+    "current models (April 2026)" reads as current no matter how long ago that
+    was. The assistant knows today's date from its system prompt; giving it the
+    fetch date too is what lets it notice the gap and say so."""
+    return f"(searched {datetime.now().strftime('%d %B %Y')})"
+
 
 # ── Gemini grounding quota circuit breaker ────────────────────────────────────
 # The google_search grounding tool has its own small quota, separate from plain
@@ -105,7 +118,9 @@ def _gemini_search(query: str) -> str:
     text = text.strip()
     if not text:
         raise ValueError("Gemini returned an empty response.")
-    return text
+    # Grounded prose is no less able to quote a page written months ago, so it
+    # gets the same fetch stamp as the other two backends.
+    return f"{_searched_on()}\n\n{text}"
 
 
 # ── Tavily ────────────────────────────────────────────────────────────────────
@@ -163,17 +178,31 @@ def _tavily_search(
     ]
 
     answer = (data.get("answer") or "").strip()
-    if answer:
-        # The answer is what gets spoken; the sources are appended for the
-        # on-screen panel, which mirrors this same string.
-        lines = [answer]
-        srcs  = [f"  • {r['title']} — {r['url']}" for r in results[:4] if r["url"]]
-        if srcs:
-            lines.append("\nSources:")
-            lines.extend(srcs)
-        return "\n".join(lines)
+    if not answer and not results:
+        return None
 
-    return _format_ddg(query, results) if results else None
+    # The summary and the snippets always travel together. Returning the summary
+    # alone was a real defect: it is generated from these same sources and has
+    # been observed to garble them outright — one run reported GPT-5 as "built
+    # by a team of inventors at Amazon" — and with the snippets dropped there
+    # was nothing left for the assistant to check it against.
+    lines = [f"Search results for: {query}", _searched_on(), ""]
+    if answer:
+        lines += ["Summary (generated — verify against the sources below):",
+                  answer, ""]
+
+    for i, r in enumerate(results, 1):
+        if r.get("title"):
+            lines.append(f"{i}. {r['title']}")
+        if r.get("snippet"):
+            # Capped because Tavily returns up to three chunks per source and a
+            # Live session pays for every one of them in context.
+            lines.append(f"   {r['snippet'][:500]}")
+        if r.get("url"):
+            lines.append(f"   Source: {r['url']}")
+        lines.append("")
+
+    return "\n".join(lines).strip()
 
 
 def _get_ddgs():
@@ -238,7 +267,7 @@ def _format_ddg(query: str, results: list[dict]) -> str:
     if not results:
         return f"No results found for: {query}"
 
-    lines = [f"Search results for: {query}\n"]
+    lines = [f"Search results for: {query}", _searched_on(), ""]
     for i, r in enumerate(results, 1):
         if r.get("title"):   lines.append(f"{i}. {r['title']}")
         if r.get("snippet"): lines.append(f"   {r['snippet']}")
@@ -251,7 +280,7 @@ def _format_news(query: str, results: list[dict]) -> str:
     if not results:
         return f"No news found for: {query}"
 
-    lines = [f"Latest news: {query}\n"]
+    lines = [f"Latest news: {query}", _searched_on(), ""]
     for i, r in enumerate(results, 1):
         title = r.get("title", "")
         if not title:
