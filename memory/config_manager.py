@@ -51,6 +51,21 @@ def is_configured() -> bool:
     return bool(key and len(key) > 15)
 
 
+# ── Tavily (optional search backend) ─────────────────────────────────────────
+# Deliberately absent from is_configured(): web_search.py skips Tavily entirely
+# when no key is stored, so a fresh clone searches exactly as it always did.
+# Only Gemini is required to run Lumina.
+
+def get_tavily_key() -> str:
+    """Tavily API key, or '' when the user has not configured one."""
+    return (load_api_keys().get("tavily_api_key", "") or "").strip()
+
+
+def save_tavily_key(key: str) -> None:
+    """Persist the Tavily key without disturbing any other setting."""
+    _patch_config(tavily_api_key=(key or "").strip())
+
+
 def get_assistant_name() -> str:
     """Return the configured assistant name, or 'LUMINA' if not set."""
     return load_api_keys().get("assistant_name", "LUMINA") or "LUMINA"

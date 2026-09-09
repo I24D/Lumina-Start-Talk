@@ -262,7 +262,7 @@ Lumina Start talk/
 ├── plugins/
 │   └── _template.py          # Copy this to write a new plugin — one file, drop in, done
 ├── actions/
-│   ├── web_search.py         # Gemini + DDG parallel search (news, research, price, compare)
+│   ├── web_search.py         # Gemini → Tavily → DDG fallback chain (news, research, price, compare)
 │   ├── screen_processor.py   # Screen capture & webcam vision via Gemini Live
 │   ├── background_monitor.py # User-configured topic watching — daily DDG check, no crypto
 │   ├── proactive.py          # Proactive 2.0 — time/context/rotation-aware check-ins

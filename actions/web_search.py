@@ -5,6 +5,8 @@ import threading
 import time
 from pathlib import Path
 
+from memory.config_manager import get_tavily_key
+
 # ── Gemini grounding quota circuit breaker ────────────────────────────────────
 # The google_search grounding tool has its own small quota, separate from plain
 # generation.  Once it is spent every call returns 429 — so retrying it at the
@@ -104,6 +106,74 @@ def _gemini_search(query: str) -> str:
     if not text:
         raise ValueError("Gemini returned an empty response.")
     return text
+
+
+# ── Tavily ────────────────────────────────────────────────────────────────────
+# Optional middle backend, tried after Gemini and before DDG. It is worth the
+# extra hop because it returns a synthesised answer like Gemini does, whereas
+# DDG only returns raw snippets — so when Gemini's grounding quota is spent the
+# assistant still has something worth reading aloud.
+#
+# Every failure path returns None rather than raising, so the caller never has
+# to tell "no key configured" apart from "the request failed": both simply fall
+# through to DDG.
+
+_TAVILY_URL     = "https://api.tavily.com/search"
+_TAVILY_TIMEOUT = 8.0
+
+
+def _tavily_search(
+    query: str,
+    topic: str = "general",
+    max_results: int = 6,
+    advanced: bool = False,
+) -> str | None:
+    key = get_tavily_key()
+    if not key:
+        return None
+
+    import requests
+
+    try:
+        r = requests.post(
+            _TAVILY_URL,
+            headers={"Authorization": f"Bearer {key}"},
+            json={
+                "query":          query,
+                "topic":          topic,
+                "max_results":    max_results,
+                "search_depth":   "advanced" if advanced else "basic",
+                "include_answer": True,
+            },
+            timeout=_TAVILY_TIMEOUT,
+        )
+        r.raise_for_status()
+        data = r.json()
+    except Exception as e:
+        print(f"[WebSearch] ⚠️ Tavily failed ({e}) — using DDG instead")
+        return None
+
+    results = [
+        {
+            "title":   x.get("title", ""),
+            "snippet": x.get("content", ""),
+            "url":     x.get("url", ""),
+        }
+        for x in data.get("results", [])
+    ]
+
+    answer = (data.get("answer") or "").strip()
+    if answer:
+        # The answer is what gets spoken; the sources are appended for the
+        # on-screen panel, which mirrors this same string.
+        lines = [answer]
+        srcs  = [f"  • {r['title']} — {r['url']}" for r in results[:4] if r["url"]]
+        if srcs:
+            lines.append("\nSources:")
+            lines.extend(srcs)
+        return "\n".join(lines)
+
+    return _format_ddg(query, results) if results else None
 
 
 def _get_ddgs():
@@ -238,13 +308,17 @@ def _gemini_headlines(n: int = 5) -> tuple[list[str], str]:
 # ── Modes ──────────────────────────────────────────────────────────────────────
 
 def _search(query: str) -> str:
-    """Default search — Gemini grounded, DDG fallback."""
+    """Default search — Gemini grounded, then Tavily, then DDG."""
     try:
         return _gemini_search(query)
     except Exception as e:
         _log_gemini_failure("Gemini search", e)
-        results = _ddg_search(query)
-        return _format_ddg(query, results)
+
+    text = _tavily_search(query)
+    if text:
+        return text
+
+    return _format_ddg(query, _ddg_search(query))
 
 
 def _news(query: str) -> str:
@@ -261,6 +335,10 @@ def _news(query: str) -> str:
     DDG news returns in well under a second and gives raw headlines, which is
     exactly what the briefing wants, so it goes first and Gemini is only touched
     when DDG comes back empty.
+
+    Tavily sits between the two for the same reason DDG leads: it has its own
+    credit pool, so spending one there is cheaper than spending the grounding
+    call that research/compare cannot do without.
     """
     gemini_query = f"latest news today: {query}" if query else "top world news today"
     ddg_query    = query if query else "world news today"
@@ -270,6 +348,13 @@ def _news(query: str) -> str:
 
     text = _run_bounded(_ddg_attempt, timeout=5.0, label="DDG news")
     if text and len(text) > 60 and not text.startswith("No news found"):
+        return text
+
+    text = _run_bounded(
+        lambda: _tavily_search(ddg_query, topic="news", max_results=8),
+        timeout=9.0, label="Tavily news",
+    )
+    if text and len(text) > 60:
         return text
 
     text = _run_bounded(
@@ -294,8 +379,14 @@ def _research(query: str) -> str:
         return _gemini_search(research_query)
     except Exception as e:
         _log_gemini_failure("Gemini research", e)
-        results = _ddg_search(query, max_results=10)
-        return _format_ddg(query, results)
+
+    # The one mode that pays for Tavily's advanced depth: research is where a
+    # thin answer is most obviously worse than none.
+    text = _tavily_search(query, max_results=10, advanced=True)
+    if text:
+        return text
+
+    return _format_ddg(query, _ddg_search(query, max_results=10))
 
 
 def _price(query: str) -> str:
@@ -305,8 +396,12 @@ def _price(query: str) -> str:
         return _gemini_search(price_query)
     except Exception as e:
         _log_gemini_failure("Gemini price", e)
-        results = _ddg_search(f"{query} price buy", max_results=6)
-        return _format_ddg(query, results)
+
+    text = _tavily_search(price_query)
+    if text:
+        return text
+
+    return _format_ddg(query, _ddg_search(f"{query} price buy", max_results=6))
 
 
 def _compare(items: list[str], aspect: str) -> str:
@@ -318,6 +413,10 @@ def _compare(items: list[str], aspect: str) -> str:
         return _gemini_search(query)
     except Exception as e:
         _log_gemini_failure("Gemini compare", e)
+
+    text = _tavily_search(query, max_results=8)
+    if text:
+        return text
 
     all_results: dict[str, list] = {}
     for item in items:
