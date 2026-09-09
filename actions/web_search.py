@@ -20,6 +20,16 @@ def _searched_on() -> str:
     return f"(searched {datetime.now().strftime('%d %B %Y')})"
 
 
+# Pinned on purpose, not lazily. "gemini-flash-latest" is a floating alias that
+# follows whichever model Google is currently promoting, and on this account it
+# lands on a 3.x model with no grounding allocation: 429 in under a second,
+# three times out of three, while 2.5-flash serves the same grounded request in
+# five seconds. An alias that can silently move onto a model the key cannot use
+# is a poor default for the one backend that is supposed to be the reliable one
+# — and it fails as a quota error, which is exactly the wrong diagnosis.
+_SEARCH_MODEL = "gemini-2.5-flash"
+
+
 # ── Gemini grounding quota circuit breaker ────────────────────────────────────
 # The google_search grounding tool has its own small quota, separate from plain
 # generation.  Once it is spent every call returns 429 — so retrying it at the
@@ -44,9 +54,15 @@ def _note_gemini_error(exc: Exception) -> None:
             already = time.monotonic() < _quota_blocked_until
             _quota_blocked_until = time.monotonic() + _QUOTA_COOLDOWN_SEC
         if not already:
+            # Deliberately not phrased as "quota exhausted". A 429 here means
+            # either the day's grounding is spent OR the key has no allocation
+            # for this model at all, and the two are indistinguishable from the
+            # response. Reading it as the first cost an afternoon.
             print(
-                "[WebSearch] Gemini grounding quota exhausted — skipping it for "
-                f"{_QUOTA_COOLDOWN_SEC // 60} min and serving results from DDG."
+                f"[WebSearch] {_SEARCH_MODEL} refused grounding (429) — skipping "
+                f"it for {_QUOTA_COOLDOWN_SEC // 60} min, serving from DDG. "
+                "Either the daily grounding quota is spent, or this key has no "
+                "quota for this model."
             )
 
 
@@ -102,7 +118,7 @@ def _gemini_search(query: str) -> str:
     client = genai.Client(api_key=_get_api_key())
     try:
         response = client.models.generate_content(
-            model="gemini-flash-latest",
+            model=_SEARCH_MODEL,
             contents=query,
             config={"tools": [{"google_search": {}}]},
         )
