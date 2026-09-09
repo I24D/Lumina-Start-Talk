@@ -51,19 +51,43 @@ def is_configured() -> bool:
     return bool(key and len(key) > 15)
 
 
-# ── Tavily (optional search backend) ─────────────────────────────────────────
-# Deliberately absent from is_configured(): web_search.py skips Tavily entirely
-# when no key is stored, so a fresh clone searches exactly as it always did.
-# Only Gemini is required to run Lumina.
+# ── Optional service keys ────────────────────────────────────────────────────
+# One entry per third-party key a user may supply. Everything the settings panel
+# needs in order to draw a field lives in this table, so adding the next
+# integration is one entry here plus its backend — never new interface code.
+#
+# None of these is required: every backend checks for its own key and stays out
+# of the way when it is missing. That is why is_configured() ignores this table
+# entirely — only the Gemini key is mandatory to run Lumina.
+#
+# Read the value through get_optional_key() on each use rather than caching it.
+# load_api_keys() re-reads the file every call, which is what lets a key entered
+# in the UI take effect without restarting the app.
+
+OPTIONAL_KEYS: list[dict] = [
+    {
+        "config_key": "tavily_api_key",
+        "label":      "TAVILY",
+        "purpose":    "Web search that keeps working when Gemini's search quota runs out.",
+        "signup":     "https://app.tavily.com",
+        "prefix":     "tvly-",
+    },
+]
+
+
+def get_optional_key(config_key: str) -> str:
+    """Stored value for one optional key, or '' when the user has not set it."""
+    return (load_api_keys().get(config_key, "") or "").strip()
+
+
+def save_optional_key(config_key: str, value: str) -> None:
+    """Persist one optional key. An empty value clears it — that is how someone
+    removes a service without hand-editing api_keys.json."""
+    _patch_config(**{config_key: (value or "").strip()})
+
 
 def get_tavily_key() -> str:
-    """Tavily API key, or '' when the user has not configured one."""
-    return (load_api_keys().get("tavily_api_key", "") or "").strip()
-
-
-def save_tavily_key(key: str) -> None:
-    """Persist the Tavily key without disturbing any other setting."""
-    _patch_config(tavily_api_key=(key or "").strip())
+    return get_optional_key("tavily_api_key")
 
 
 def get_assistant_name() -> str:

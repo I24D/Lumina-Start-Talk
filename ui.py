@@ -1908,6 +1908,167 @@ class AudioDeviceOverlay(_HudOverlay):
             self.picked.emit()
 
 
+class ApiKeysOverlay(_HudOverlay):
+    """Optional service keys, entered here instead of by hand in api_keys.json.
+
+    Every field is generated from config_manager.OPTIONAL_KEYS, so an
+    integration added to that table shows up here with no work in this file.
+    The point is that someone who clones the repo can reach the same Lumina as
+    the person who built it without being told to go and edit JSON."""
+
+    saved = pyqtSignal(list, list)      # (labels changed, labels of odd format)
+    _OW = 520
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        from memory.config_manager import OPTIONAL_KEYS, get_optional_key
+
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setStyleSheet(f"""
+            ApiKeysOverlay {{
+                background: {C.PANEL};
+                border: 1px solid {C.BORDER_B};
+                border-radius: 6px;
+            }}
+        """)
+        self.setFixedWidth(self._OW)
+
+        _field_css = f"""
+            QLineEdit {{
+                background: {C.DARK}; color: {C.TEXT};
+                border: 1px solid {C.BORDER}; border-radius: 3px; padding: 4px 8px;
+            }}
+            QLineEdit:focus {{ border: 1px solid {C.PRI}; }}
+        """
+        _eye_css = f"""
+            QPushButton {{ background: transparent; color: {C.TEXT_MED};
+                border: 1px solid {C.BORDER}; border-radius: 3px; }}
+            QPushButton:hover {{ color: {C.PRI}; border-color: {C.BORDER_B}; }}
+            QPushButton:checked {{ color: {C.PRI}; border-color: {C.PRI_DIM}; }}
+        """
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(20, 16, 20, 16)
+        lay.setSpacing(5)
+
+        hdr = QLabel("🔑  API KEYS")
+        hdr.setFont(QFont("Courier New", 11, QFont.Weight.Bold))
+        hdr.setStyleSheet(f"color: {C.PRI}; background: transparent;")
+        lay.addWidget(hdr)
+
+        intro = QLabel(
+            f"All optional — {APP_NAME} runs on the Gemini key alone. Each one "
+            "below switches on a feature; leaving it blank just leaves that "
+            "feature off. Changes apply immediately, no restart."
+        )
+        intro.setWordWrap(True)
+        intro.setFont(QFont("Courier New", 7))
+        intro.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent;")
+        lay.addWidget(intro)
+        lay.addSpacing(6)
+
+        # (spec, field, value as it was when the panel opened)
+        self._rows: list[tuple[dict, QLineEdit, str]] = []
+
+        for spec in OPTIONAL_KEYS:
+            sep = QFrame(); sep.setFrameShape(QFrame.Shape.HLine)
+            sep.setStyleSheet(f"color: {C.BORDER};")
+            lay.addWidget(sep)
+            lay.addSpacing(2)
+
+            stored = get_optional_key(spec["config_key"])
+            head = QLabel(f"{spec['label']}   "
+                          + ("● CONFIGURED" if stored else "○ NOT SET"))
+            head.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
+            head.setStyleSheet(
+                f"color: {C.ACC2 if stored else C.TEXT_DIM}; background: transparent;")
+            lay.addWidget(head)
+
+            why = QLabel(spec["purpose"])
+            why.setWordWrap(True)
+            why.setFont(QFont("Courier New", 7))
+            why.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent;")
+            lay.addWidget(why)
+
+            row = QHBoxLayout(); row.setSpacing(6)
+            edit = QLineEdit(stored)
+            edit.setEchoMode(QLineEdit.EchoMode.Password)
+            edit.setPlaceholderText(f"{spec.get('prefix', '')}…")
+            edit.setFont(QFont("Courier New", 9))
+            edit.setFixedHeight(30)
+            edit.setStyleSheet(_field_css)
+            row.addWidget(edit)
+
+            # Reveal toggle: checking a 50-character key you have just pasted
+            # into a field of dots is otherwise guesswork.
+            eye = QPushButton("👁")
+            eye.setFixedSize(30, 30)
+            eye.setCheckable(True)
+            eye.setCursor(Qt.CursorShape.PointingHandCursor)
+            eye.setStyleSheet(_eye_css)
+            eye.toggled.connect(
+                lambda on, e=edit: e.setEchoMode(
+                    QLineEdit.EchoMode.Normal if on else QLineEdit.EchoMode.Password
+                )
+            )
+            row.addWidget(eye)
+            lay.addLayout(row)
+
+            link = QLabel(f"Get one at  {spec['signup']}")
+            link.setFont(QFont("Courier New", 7))
+            link.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent;")
+            lay.addWidget(link)
+            lay.addSpacing(6)
+
+            self._rows.append((spec, edit, stored))
+
+        row = QHBoxLayout(); row.setSpacing(8)
+        ok = QPushButton("▸  SAVE")
+        ok.setFixedHeight(32)
+        ok.setFont(QFont("Courier New", 9, QFont.Weight.Bold))
+        ok.setCursor(Qt.CursorShape.PointingHandCursor)
+        ok.setStyleSheet(f"""
+            QPushButton {{ background: transparent; color: {C.PRI};
+                border: 1px solid {C.PRI_DIM}; border-radius: 3px; }}
+            QPushButton:hover {{ background: {C.PRI_GHO}; border-color: {C.PRI}; }}
+        """)
+        ok.clicked.connect(self._apply)
+        row.addWidget(ok)
+
+        cancel = QPushButton("CLOSE")
+        cancel.setFixedHeight(32)
+        cancel.setFont(QFont("Courier New", 9))
+        cancel.setCursor(Qt.CursorShape.PointingHandCursor)
+        cancel.setStyleSheet(f"""
+            QPushButton {{ background: transparent; color: {C.TEXT_MED};
+                border: 1px solid {C.BORDER}; border-radius: 3px; }}
+            QPushButton:hover {{ color: {C.TEXT}; border-color: {C.BORDER_B}; }}
+        """)
+        cancel.clicked.connect(self.hide)
+        row.addWidget(cancel)
+        lay.addLayout(row)
+
+    def _apply(self):
+        from memory.config_manager import save_optional_key
+
+        changed, odd = [], []
+        for spec, edit, before in self._rows:
+            now = edit.text().strip()
+            if now == before:
+                continue                     # untouched — do not rewrite the file
+            save_optional_key(spec["config_key"], now)
+            changed.append(spec["label"])
+
+            # A wrong-looking prefix is reported, never rejected: key formats do
+            # change, and refusing a valid new one is worse than a stale warning.
+            prefix = spec.get("prefix", "")
+            if now and prefix and not now.startswith(prefix):
+                odd.append(f"{spec['label']} (expected {prefix}…)")
+
+        self.hide()
+        self.saved.emit(changed, odd)
+
+
 class MemoryOverlay(_HudOverlay):
     """Everything LUMINA has stored about you, and when it learned it.
 
@@ -3374,6 +3535,14 @@ class MainWindow(QMainWindow):
         plugin_btn.clicked.connect(self._open_plugin_manager)
         lay.addWidget(plugin_btn)
 
+        keys_btn = QPushButton("🔑  API KEYS")
+        keys_btn.setFixedHeight(26)
+        keys_btn.setFont(QFont("Courier New", 7))
+        keys_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        keys_btn.setStyleSheet(_BTN_STYLE_DIM)
+        keys_btn.clicked.connect(self._open_api_keys)
+        lay.addWidget(keys_btn)
+
         w.adjustSize()
         return w
 
@@ -3898,6 +4067,22 @@ class MainWindow(QMainWindow):
         ov = MemoryOverlay(parent=self.centralWidget())
         self._centre_overlay(ov)
         self._memory_overlay = ov
+
+    # ── Optional API keys ────────────────────────────────────────────────────
+
+    def _open_api_keys(self):
+        ov = ApiKeysOverlay(parent=self.centralWidget())
+        ov.saved.connect(self._on_api_keys_saved)
+        self._centre_overlay(ov)
+        self._api_keys_overlay = ov         # keep a reference so it isn't GC'd
+
+    def _on_api_keys_saved(self, changed: list, odd: list):
+        for label in odd:
+            self._log.append_log(f"WARN: {label} — unusual format, saved anyway.")
+        if changed:
+            # No reconnect: these keys are read from disk on each use, unlike
+            # the voice, which is fixed when the Live session opens.
+            self._log.append_log(f"SYS: API keys updated — {', '.join(changed)}")
 
     # ── Irreversible-action confirmation ─────────────────────────────────────
 
