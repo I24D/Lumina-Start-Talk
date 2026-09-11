@@ -764,6 +764,26 @@ def _is_reconnect_signal(exc: BaseException) -> bool:
     return False
 
 
+def _flatten_error(exc: BaseException) -> str:
+    """Every message in an exception tree, joined.
+
+    The session runs inside a TaskGroup, so a failure arrives wrapped in a
+    BaseExceptionGroup whose own str() is just "unhandled errors in a TaskGroup
+    (1 sub-exception)" — the real reason sits in .exceptions. Classifying on
+    str(e) therefore misses it, and every branch below that looks for a specific
+    cause silently stops matching: a timeout stops being recognised as a network
+    error, a rejected resumption handle stops being dropped. This flattens the
+    tree so the classification sees what actually happened."""
+    parts = [f"{type(exc).__name__}: {exc}"]
+    if isinstance(exc, BaseExceptionGroup):
+        for sub in exc.exceptions:
+            parts.append(_flatten_error(sub))
+    cause = getattr(exc, "__cause__", None) or getattr(exc, "__context__", None)
+    if cause is not None and cause is not exc:
+        parts.append(f"{type(cause).__name__}: {cause}")
+    return " | ".join(parts)
+
+
 def _keep_context_of(exc: BaseException) -> bool:
     """Read `keep_context` off a reconnect signal, unwrapping the group the
     TaskGroup put it in. Defaults to True: an unexpected shape must not silently
@@ -2106,7 +2126,7 @@ class JarvisLive:
                     self._conn_backoff = 0
                     continue
 
-                err_str = str(e)
+                err_str = _flatten_error(e)
                 print(f"[JARVIS] Error ({type(e).__name__}): {e}")
                 traceback.print_exc()
 
@@ -2125,8 +2145,31 @@ class JarvisLive:
                     )
                     continue
 
-                # Invalid API key — stop hammering the API, prompt re-configuration
-                if "API key not valid" in err_str or "1007" in err_str:
+                # The server refused the audio we were sending. Seen mid-session
+                # after a long tool call, and fatal if it is resumed into: the
+                # handle restores the same rejected configuration and the next
+                # connection dies the same way. Start clean instead — the cost
+                # is the conversation history, which beats an assistant that
+                # cannot hear.
+                if "CONTENT_TYPE_AUDIO" in err_str or "audio content type" in err_str.lower():
+                    print("[JARVIS] 🔇 Server rejected the audio stream — reconnecting clean")
+                    self.ui.write_log("SYS: Audio session refused — rebuilding it.")
+                    self._resume_handle = None
+                    self._conn_backoff = 0
+                    continue
+
+                # Invalid API key — stop hammering the API, prompt re-configuration.
+                # Matched on what the API actually says about credentials. It used
+                # to also match "1007", which is merely the WebSocket close code
+                # for a bad payload and accompanies failures that have nothing to
+                # do with the key — including the audio rejection handled above.
+                # On that reading it demanded a new key and then blocked forever
+                # waiting for one, which is indistinguishable from the assistant
+                # having died.
+                if any(k in err_str for k in (
+                    "API key not valid", "API_KEY_INVALID",
+                    "UNAUTHENTICATED", "PERMISSION_DENIED",
+                )):
                     self.ui.write_log("ERR: API key invalid — please re-enter your key.")
                     self.ui.set_state("SLEEPING")
                     self.ui.prompt_reconfig()
