@@ -20,6 +20,16 @@ _APP_ALIASES: dict[str, dict[str, str]] = {
     "brave":              {"Windows": "brave",                   "Darwin": "Brave Browser",        "Linux": "brave-browser"},
     "safari":             {"Windows": "msedge",                  "Darwin": "Safari",               "Linux": "firefox"},
     "opera":              {"Windows": "opera",                   "Darwin": "Opera",                "Linux": "opera"},
+    # Packaged apps are launched by AppUserModelID (see _launch_windows): they
+    # have no exe on PATH, and typing their name into the Start menu only works
+    # when the user says the localised name Windows happens to use — "Enlace
+    # Móvil" here, "Phone Link" on an English install, with the search finding
+    # nothing either way when the two disagree.
+    "phone link":         {"Windows": "Microsoft.YourPhone_8wekyb3d8bbwe!App"},
+    "enlace movil":       {"Windows": "Microsoft.YourPhone_8wekyb3d8bbwe!App"},
+    "movil":              {"Windows": "Microsoft.YourPhone_8wekyb3d8bbwe!App"},
+    "yourphone":          {"Windows": "Microsoft.YourPhone_8wekyb3d8bbwe!App"},
+
     "whatsapp":           {"Windows": "WhatsApp",                "Darwin": "WhatsApp",             "Linux": "whatsapp"},
     "telegram":           {"Windows": "Telegram",                "Darwin": "Telegram",             "Linux": "telegram"},
     "discord":            {"Windows": "Discord",                 "Darwin": "Discord",              "Linux": "discord"},
@@ -65,8 +75,14 @@ _APP_ALIASES: dict[str, dict[str, str]] = {
 }
 
 
+# Spoken app names arrive accented — "Enlace Móvil", "Cámara" — while the alias
+# keys are ASCII. Folding the accents away makes one key match both spellings
+# instead of needing an entry per diacritic.
+_ACCENT_FOLD = str.maketrans("áàäâãéèëêíìïîóòöôõúùüûñç", "aaaaaeeeeiiiiooooouuuunc")
+
+
 def _normalize(raw: str) -> str:
-    key = raw.lower().strip()
+    key = raw.lower().strip().translate(_ACCENT_FOLD)
 
     if key in _APP_ALIASES:
         return _APP_ALIASES[key].get(_SYSTEM, raw)
@@ -99,6 +115,23 @@ def _launch_windows(app_name: str) -> bool:
             return True
         except Exception:
             pass
+
+    # An AppUserModelID — a packaged (Store/MSIX) app. These have no exe to run
+    # and no protocol to start, so the Start-menu typing below is all that was
+    # left for them, and that depends on the user saying the same localised name
+    # Windows shows. Reaching them through the AppsFolder namespace instead is
+    # exact, and independent of the display language.
+    if "!" in app_name:
+        try:
+            subprocess.Popen(
+                ["explorer.exe", f"shell:AppsFolder\\{app_name}"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            time.sleep(1.5)
+            return True
+        except Exception as e:
+            print(f"[open_app] AppsFolder launch failed: {e}")
 
     try:
         import pyautogui
