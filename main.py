@@ -137,10 +137,50 @@ def _load_system_prompt() -> str:
 
 _CTRL_RE = re.compile(r"<ctrl\d+>", re.IGNORECASE)
 
-def _clean_transcript(text: str) -> str:    
+def _clean_transcript(text: str) -> str:
     text = _CTRL_RE.sub("", text)
     text = re.sub(r"[\x00-\x08\x0b-\x1f]", "", text)
     return text.strip()
+
+
+# ── Wake phrases ─────────────────────────────────────────────────────────────
+# Proactive audio lets the model stay quiet when it judges that speech was not
+# addressed to it. That is the right default in a room with other people, and
+# wrong when it misjudges: the user talks and nothing answers, with no way back
+# in. These phrases are the way back in — they are checked locally, on the
+# transcript, so they work even when the model has decided to say nothing.
+#
+# Both languages, because the user speaks both. The assistant's name is
+# substituted at match time so a renamed assistant keeps its wake phrase.
+_WAKE_TEMPLATES = (
+    "{name} activate",
+    "{name} start talk",
+    "{name} activa",
+    "{name} despierta",
+    "activa {name}",
+    "despierta {name}",
+)
+
+_WAKE_STRIP_RE = re.compile(r"[^\w\s]", re.UNICODE)
+_WAKE_ACCENTS = str.maketrans("áàäâéèëêíìïîóòöôúùüûñ", "aaaaeeeeiiiioooouuuun")
+
+
+def _normalise_for_wake(text: str) -> str:
+    """Lowercase, unaccented, punctuation-free — so 'Lumina, ¡activate!' matches."""
+    text = text.lower().translate(_WAKE_ACCENTS)
+    return re.sub(r"\s+", " ", _WAKE_STRIP_RE.sub(" ", text)).strip()
+
+
+def _is_wake_phrase(text: str, assistant_name: str) -> bool:
+    """True when the user is asking the assistant to wake up."""
+    if not text:
+        return False
+    haystack = _normalise_for_wake(text)
+    name = _normalise_for_wake(assistant_name) or "lumina"
+    return any(
+        _normalise_for_wake(t.format(name=name)) in haystack
+        for t in _WAKE_TEMPLATES
+    )
 
 TOOL_DECLARATIONS = [
     {
@@ -741,6 +781,9 @@ class JarvisLive:
         self.ui.on_audio_device_change = self._on_audio_device_change
         self._reconnect_event: asyncio.Event | None = None
         self._reconnect_keep = True   # False → next rebuild drops the resumption handle
+        # Transcripts arrive in fragments, so the wake phrase is seen on several
+        # consecutive updates. This keeps one spoken phrase to one wake.
+        self._last_wake = 0.0
 
         # ── Session resumption ─────────────────────────────────────────
         # The server issues a resumption handle every few seconds and reissues
@@ -817,6 +860,52 @@ class JarvisLive:
         if loop and ev is not None:
             loop.call_soon_threadsafe(ev.set)
 
+    def wake(self, heard: str = "") -> None:
+        """Force the assistant back into the conversation.
+
+        Two different kinds of stuck, so two different remedies. When the
+        session is alive the model simply chose not to answer — proactive audio
+        judged the speech was not aimed at it — and an explicit client turn
+        overrides that judgement. When there is no session at all, nothing can
+        be sent, so the run loop is asked to rebuild one; the conversation is
+        kept, because waking up should not cost the user their context."""
+        self._last_wake = time.monotonic()
+        self.ui.write_log("SYS: Wake phrase heard — waking up.")
+        print(f"[JARVIS] ⏰ Wake phrase: {heard[:60]!r}")
+
+        # Only cut in when there is actually something to cut off. interrupt()
+        # raises _interrupted, and the recv loop drops the next turn_complete it
+        # sees to discard the abandoned reply — so interrupting while silent
+        # would swallow the very answer this wake is asking for.
+        with self._speaking_lock:
+            speaking = self._is_speaking
+        if speaking:
+            try:
+                self.interrupt()
+            except Exception:
+                pass
+
+        loop = getattr(self, "_loop", None)
+        if not self.session or not loop:
+            self.request_reconnect(keep_context=True, reason="wake phrase")
+            return
+
+        try:
+            asyncio.run_coroutine_threadsafe(
+                self.session.send_client_content(
+                    turns={"parts": [{"text": (
+                        "The user just said your wake phrase because you were not "
+                        "responding. Greet them in one short sentence, in their "
+                        "language, and ask what they need."
+                    )}]},
+                    turn_complete=True,
+                ),
+                loop,
+            )
+        except Exception as e:
+            print(f"[JARVIS] Wake failed, rebuilding the session: {e}")
+            self.request_reconnect(keep_context=True, reason="wake phrase")
+
     def _on_voice_change(self):
         """Voice picker applied.
 
@@ -863,6 +952,13 @@ class JarvisLive:
         return url, key, f"{url}/auto-login?key={key}", manual
 
     def _on_text_command(self, text: str):
+        # Before the session check, deliberately: typing the wake phrase is the
+        # last resort when the session is gone, and the old early return made
+        # that exact case do nothing at all.
+        if _is_wake_phrase(text, self._asst_name):
+            self.wake(text)
+            return
+
         if not self._loop or not self.session:
             return
         asyncio.run_coroutine_threadsafe(
@@ -1317,6 +1413,17 @@ class JarvisLive:
                             if txt:
                                 in_buf.append(txt)
                                 self._last_user_speech = time.monotonic()
+
+                                # Checked here rather than at turn_complete: if
+                                # the model has gone quiet there may never be a
+                                # turn to complete, and waiting for one is the
+                                # very failure the phrase exists to break.
+                                if (
+                                    time.monotonic() - self._last_wake > 5
+                                    and _is_wake_phrase(" ".join(in_buf), self._asst_name)
+                                ):
+                                    in_buf = []
+                                    self.wake(txt)
 
                         if sc.turn_complete:
                             if self._turn_done_event:
