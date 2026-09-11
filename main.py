@@ -93,6 +93,12 @@ BASE_DIR        = get_base_dir()
 API_CONFIG_PATH = BASE_DIR / "config" / "api_keys.json"
 PROMPT_PATH     = BASE_DIR / "core" / "prompt.txt"
 LIVE_MODEL          = "models/gemini-2.5-flash-native-audio-preview-12-2025"
+# How long the microphone may go without delivering a single block before it is
+# treated as dead rather than as a quiet room. Blocks arrive continuously while
+# a stream is healthy — silence still produces them — so a gap this long means
+# the device stopped, not that nobody spoke. Long enough that a brief hiccup
+# does not trigger a needless reopen.
+_MIC_STALL_SECONDS  = 6.0
 CHANNELS            = 1
 SEND_SAMPLE_RATE    = 16000
 RECEIVE_SAMPLE_RATE = 24000
@@ -825,6 +831,10 @@ class JarvisLive:
         # Transcripts arrive in fragments, so the wake phrase is seen on several
         # consecutive updates. This keeps one spoken phrase to one wake.
         self._last_wake = 0.0
+        # When the microphone last handed over a block of audio. Watched by
+        # _listen_audio, which cannot otherwise tell a silent room from a
+        # device that has stopped calling back.
+        self._last_mic_block = 0.0
 
         # ── Session resumption ─────────────────────────────────────────
         # The server issues a resumption handle every few seconds and reissues
@@ -849,7 +859,14 @@ class JarvisLive:
         self._last_user_speech = time.monotonic()  # updated on every user utterance
         self._session_log: list[str] = []          # conversation turns for end-of-session summary
 
-        self._enhanced_live = True  # affective dialog + proactive audio; auto-disabled if the server rejects them
+        # Tracked apart because models support them apart: gemini-3.1-flash-live
+        # takes proactive audio and refuses affective dialog. Bundled together,
+        # one refusal switched off both — and proactive audio is the one that
+        # keeps the assistant quiet when the room is talking about something
+        # else, so losing it as collateral is the wrong trade.
+        # Each is dropped only if the server actually objects to it.
+        self._affective_live = True
+        self._proactive_live = True
         _core_names = {t["name"] for t in TOOL_DECLARATIONS}
         self._plugin_registry = discover_plugins(
             plugins_dir=Path(__file__).resolve().parent / "plugins",
@@ -1123,13 +1140,21 @@ class JarvisLive:
                 )
             ),
         )
-        if self._enhanced_live:
-            # Affective dialog: JARVIS hears tone/emotion and adapts its voice.
-            # Proactive audio: JARVIS stays silent when speech isn't addressed
-            # to it (background chatter, talking to someone else in the room).
+        # Affective dialog: the assistant hears tone and emotion and adapts its
+        # own voice. Asked for separately, because not every Live model has it.
+        if self._affective_live:
             cfg["enable_affective_dialog"] = True
+        # Proactive audio: it stays silent when the speech was not addressed to
+        # it — background chatter, or someone else in the room being spoken to.
+        if self._proactive_live:
             cfg["proactivity"] = types.ProactivityConfig(proactive_audio=True)
         return types.LiveConnectConfig(**cfg)
+
+    @property
+    def _enhanced_live(self) -> bool:
+        """True while either enhanced feature is still in play — both live on
+        the v1alpha endpoint, so it decides which API version to connect to."""
+        return self._affective_live or self._proactive_live
 
     async def _execute_tool(self, fc) -> types.FunctionResponse:
         name = fc.name
@@ -1349,6 +1374,10 @@ class JarvisLive:
         loop = asyncio.get_event_loop()
 
         def callback(indata, frames, time_info, status):
+            # Stamped on every block, before any gate: this is proof the device
+            # is still delivering, which is a different question from whether we
+            # are currently forwarding what it delivers.
+            self._last_mic_block = time.monotonic()
             with self._speaking_lock:
                 jarvis_speaking = self._is_speaking
             if not jarvis_speaking and not self.ui.muted and not self._phone_active:
@@ -1399,10 +1428,63 @@ class JarvisLive:
                 )
                 _mic_stream = _open_mic(None)
 
-            with _mic_stream:
+            # Not a `with`: the block below may replace the stream, and a
+            # context manager would still close the object it was entered with,
+            # leaving the replacement to leak and the dead one closed twice.
+            _mic_stream.start()
+            try:
                 print("[JARVIS] 🎤 Mic stream open")
+                self._last_mic_block = time.monotonic()
+
+                # A microphone can stop delivering without anything raising:
+                # sounddevice hands audio to a callback, and when Windows
+                # rebuilds its audio graph — a device added or removed, a driver
+                # reset, power management parking the endpoint — the callback
+                # simply stops being called. The stream object stays open, this
+                # loop keeps sleeping, and the HUD keeps saying MICROPHONE
+                # ACTIVE while nothing is heard again until the app is
+                # restarted. Silence is not proof of a working microphone, so
+                # this checks that blocks are still arriving and reopens the
+                # device when they are not.
                 while True:
-                    await asyncio.sleep(0.1)
+                    await asyncio.sleep(0.5)
+
+                    if self.ui.muted:
+                        # Muting stops nothing at the device, but there is no
+                        # sense reopening hardware the user has switched off.
+                        self._last_mic_block = time.monotonic()
+                        continue
+
+                    silent_for = time.monotonic() - self._last_mic_block
+                    if silent_for < _MIC_STALL_SECONDS:
+                        continue
+
+                    print(f"[JARVIS] 🎙️  No microphone input for {silent_for:.0f}s "
+                          f"— reopening the device", flush=True)
+                    self.ui.write_log("SYS: Microphone stopped responding — reopening it.")
+                    try:
+                        _mic_stream.stop()
+                        _mic_stream.close()
+                    except Exception:
+                        pass
+                    try:
+                        _mic_stream = _open_mic(_mic_dev)
+                        _mic_stream.start()
+                    except Exception as _e:
+                        # The saved device may be the thing that went away.
+                        # The system default is better than staying deaf.
+                        print(f"[JARVIS] ⚠️  Reopening '{_mic_name}' failed: {_e} — using default")
+                        _mic_stream = _open_mic(None)
+                        _mic_stream.start()
+                    self._last_mic_block = time.monotonic()
+                    print("[JARVIS] 🎤 Mic stream reopened", flush=True)
+                    self.ui.write_log("SYS: Microphone back online.")
+            finally:
+                try:
+                    _mic_stream.stop()
+                    _mic_stream.close()
+                except Exception:
+                    pass
         except Exception as e:
             print(f"[JARVIS] ❌ Mic: {e}")
             raise
@@ -2144,18 +2226,36 @@ class JarvisLive:
                 print(f"[JARVIS] Error ({type(e).__name__}): {e}")
                 traceback.print_exc()
 
-                # Enhanced audio features rejected by the server (preview API
-                # drift) — drop them and reconnect with the plain config.
-                if self._enhanced_live and (
+                # An enhanced audio feature rejected by the server. Give up one
+                # at a time, and only the one that was named: dropping both on a
+                # single refusal is how a model that merely lacks affective
+                # dialog also loses proactive audio, which is the feature that
+                # keeps the assistant from answering a conversation it was never
+                # part of. A refusal that names neither is attributed to
+                # affective dialog first, since it is the rarer of the two.
+                lowered = err_str.lower()
+                generic = (
                     "INVALID_ARGUMENT" in err_str
-                    or "affective" in err_str.lower()
-                    or "proactiv" in err_str.lower()
+                    or "invalid argument" in lowered
                     or "Unknown name" in err_str
                     or "unexpected keyword" in err_str
-                ):
-                    self._enhanced_live = False
+                )
+                if self._proactive_live and "proactiv" in lowered:
+                    self._proactive_live = False
                     self.ui.write_log(
-                        "SYS: Advanced audio features unavailable — reconnecting without them."
+                        "SYS: Proactive audio unavailable on this model — reconnecting without it."
+                    )
+                    continue
+                if self._affective_live and ("affective" in lowered or generic):
+                    self._affective_live = False
+                    self.ui.write_log(
+                        "SYS: Affective dialog unavailable on this model — reconnecting without it."
+                    )
+                    continue
+                if self._proactive_live and generic:
+                    self._proactive_live = False
+                    self.ui.write_log(
+                        "SYS: Proactive audio unavailable on this model — reconnecting without it."
                     )
                     continue
 
