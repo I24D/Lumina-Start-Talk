@@ -33,6 +33,7 @@ from __future__ import annotations
 import platform
 import re
 import subprocess
+import threading
 import time
 
 _IMPORT_ERROR = ""
@@ -399,10 +400,41 @@ def _say(player, instruction: str) -> None:
         pass
 
 
+# One question at a time. _ask_copilot blocks for up to ninety seconds while
+# Copilot streams its answer, and the user keeps talking the whole time — a
+# stray remark, a cough the transcriber turns into words, the assistant's own
+# voice returning through the speakers. Every one of those reaches the model as
+# a fresh turn, and this plugin's description is emphatic enough that the model
+# routes them straight back here. Measured in a real session: one question sent
+# to Copilot three times and three answers spoken over each other, which is
+# also what "I cannot hear you properly" sounds like from the other side.
+#
+# The model cannot know the bridge is busy. The bridge can.
+_ask_lock = threading.Lock()
+_asking = ""
+
+
 def _act_ask(question: str, timeout: int, player=None) -> str:
+    global _asking
     if not question:
         return "What would you like me to ask Copilot, sir?"
 
+    with _ask_lock:
+        if _asking:
+            return (
+                f"I am still waiting for Copilot to answer '{_asking[:80]}', sir. "
+                "I will read the answer out as soon as it arrives."
+            )
+        _asking = question
+
+    try:
+        return _ask_copilot(question, timeout, player)
+    finally:
+        with _ask_lock:
+            _asking = ""
+
+
+def _ask_copilot(question: str, timeout: int, player=None) -> str:
     window = _window()
     if window is None:
         return "I could not open Copilot, sir. It may not be installed on this machine."

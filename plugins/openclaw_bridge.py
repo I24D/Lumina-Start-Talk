@@ -31,6 +31,7 @@ import platform
 import shutil
 import socket
 import subprocess
+import threading
 import time
 from typing import Any
 
@@ -39,7 +40,11 @@ PLUGIN = {
     "name": "openclaw_bridge",
     "description": (
         "Talks directly to OpenClaw through its official CLI: connects to or starts its gateway, "
-        "sends a question, waits for OpenClaw's answer, and returns that answer to be read aloud. "
+        "sends a question and reads OpenClaw's answer aloud when it arrives. The answer does NOT "
+        "come back with this tool call: OpenClaw can take several minutes on a real task, so the "
+        "call returns straight away and Lumina speaks the answer by herself later. Never send the "
+        "same question twice because nothing came back yet, and never tell the user it failed or "
+        "timed out — it is still working. "
         "Use this for ANY request involving OpenClaw or Open Claw. Do NOT use open_app or "
         "computer_control for these requests; those tools cannot communicate with the gateway or "
         "read its reply. "
@@ -77,13 +82,42 @@ _GATEWAY_PORT = 18789
 _GATEWAY_START_TIMEOUT = 180
 _GATEWAY_OWNERSHIP_WAIT = 90
 _DEFAULT_ANSWER_TIMEOUT = 180
-_SPOKEN_LIMIT = 1500
+
+# A runaway guard, not an editorial limit: a real OpenClaw answer that got cut
+# at 1500 characters was the user asking a question and receiving its first
+# page.
+_SPOKEN_LIMIT = 12_000
+
+# Recognised by the "Answering in depth" rule in core/prompt.txt: cover every
+# substantial point rather than reducing the answer to a headline.
+_ANSWER_IN_DEPTH = "[ANSWER_IN_DEPTH]\n"
+
 _ACTIONS = {"ask", "connect", "open", "read", "close", "disconnect"}
 
 _bridge_connected = False
 _gateway_started_by_bridge = False
 _transport = ""
 _last_answer = ""
+
+# ── waiting without blocking ─────────────────────────────────────────────────
+# OpenClaw takes minutes on a real task, and this bridge used to wait for it
+# inside the tool call itself: the turn stayed open, the model received nothing
+# until the CLI returned, and anything slower than the timeout was thrown away.
+# The user asked a long question and simply never got an answer.
+#
+# But nothing about a tool response requires the work to be finished. The
+# question goes to a background thread and the tool returns at once; when the
+# answer finally lands it is pushed into the live session the same way
+# phone_notifications announces an arriving message, and Lumina reads it out
+# unprompted however long it took. The answer is also kept, so it survives a
+# session that dropped while OpenClaw was thinking — action='read' still has it.
+_job_lock = threading.Lock()
+_job_question = ""            # non-empty while an answer is still being waited for
+_job_started = 0.0
+
+# Nothing blocks on this any more, so it guards against a hung CLI rather than
+# rationing the user's patience.
+_BACKGROUND_TIMEOUT = 1800
 
 
 def _cli_path() -> str | None:
@@ -331,14 +365,13 @@ def _act_connect(player=None) -> str:
     return "Connected to OpenClaw through its local CLI fallback."
 
 
-def _act_ask(question: str, timeout: int, player=None) -> str:
-    global _last_answer, _transport
-    if not question:
-        return "What would you like me to ask OpenClaw?"
+def _wait_for_answer(question: str, timeout: int, player=None) -> tuple[str, str]:
+    """Ask OpenClaw and wait for it, on a thread nothing is blocked on."""
+    global _transport
 
     connected, error = _ensure_connection(player)
     if not connected:
-        return f"I could not connect to OpenClaw: {error}"
+        return "", f"I could not connect to OpenClaw: {error}"
 
     if _transport == "local" and _gateway_health()[0]:
         _transport = "gateway"
@@ -359,17 +392,106 @@ def _act_ask(question: str, timeout: int, player=None) -> str:
         _transport = "local"
         answer, error = _agent_answer(question, timeout, local=True)
 
-    if not answer:
-        return f"OpenClaw could not answer: {error}"
+    return answer, error
 
+
+def _deliver(question: str, answer: str, player=None) -> None:
+    """Speak an answer that arrived long after its tool call returned."""
+    global _last_answer
     _last_answer = answer
-    return answer
+
+    spoken = answer
+    if len(spoken) > _SPOKEN_LIMIT:
+        spoken = spoken[:_SPOKEN_LIMIT].rsplit(" ", 1)[0] + "…"
+
+    print(f"[OpenClaw] answered after the fact: {len(answer)} chars")
+    if player:
+        try:
+            player.write_log(f"[OpenClaw] answer received ({len(answer)} chars)")
+        except Exception:
+            pass
+
+    _say(
+        player,
+        "OpenClaw has just answered the question you sent it a while ago "
+        f"('{question[:120]}'). Tell the user its answer has arrived, then give "
+        "it to them.\n\n" + _ANSWER_IN_DEPTH + spoken,
+    )
+
+
+def _run_job(question: str, timeout: int, player=None) -> None:
+    """Background worker: wait for OpenClaw, then speak whatever came back."""
+    global _job_question
+    try:
+        answer, error = _wait_for_answer(question, timeout, player)
+    except Exception as exc:
+        answer, error = "", f"{type(exc).__name__}: {exc}"
+    finally:
+        with _job_lock:
+            _job_question = ""
+
+    if answer:
+        _deliver(question, answer, player)
+        return
+
+    print(f"[OpenClaw] ask failed: {error}")
+    _say(
+        player,
+        "OpenClaw could not answer the question you sent it earlier. Tell the "
+        f"user so in one sentence. The reason it gave was: {error}",
+    )
+
+
+def _act_ask(question: str, timeout: int, player=None) -> str:
+    global _job_question, _job_started
+    if not question:
+        return "What would you like me to ask OpenClaw?"
+
+    with _job_lock:
+        if _job_question:
+            waited = int(time.monotonic() - _job_started)
+            return (
+                f"I am still waiting on OpenClaw for '{_job_question[:80]}' — "
+                f"{waited} seconds so far. I will read that answer out the moment "
+                "it arrives; ask me again afterwards and I will send the new one."
+            )
+        _job_question = question
+        _job_started = time.monotonic()
+
+    # The caller's timeout was sized for a wait someone was sitting through.
+    # Nobody is sitting through this one, so it only has to be long enough that
+    # a hung CLI is eventually given up on.
+    threading.Thread(
+        target=_run_job,
+        args=(question, max(timeout, _BACKGROUND_TIMEOUT), player),
+        name="lumina-openclaw-ask",
+        daemon=True,
+    ).start()
+
+    return (
+        "I have put the question to OpenClaw. A real task can take it several "
+        "minutes, so I will not keep you waiting — carry on, and I will read the "
+        "answer out loud the moment it arrives."
+    )
 
 
 def _act_read() -> str:
+    with _job_lock:
+        pending = _job_question
+        waited = int(time.monotonic() - _job_started) if pending else 0
+
+    if pending:
+        note = (
+            f"OpenClaw is still working on '{pending[:80]}' — {waited} seconds so "
+            "far. I will read that answer out the moment it arrives."
+        )
+        if not _last_answer:
+            return note
+        return note + " The previous answer was:\n" + _ANSWER_IN_DEPTH + _last_answer
+
     if not _last_answer:
         return "OpenClaw has not answered a question in this Lumina session yet."
-    return _last_answer
+    return _ANSWER_IN_DEPTH + _last_answer
 
 
 def _act_close() -> str:
