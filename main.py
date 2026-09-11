@@ -33,6 +33,7 @@ if _platform.system() == "Windows":
 # ─────────────────────────────────────────────────────────────────────────────
 
 import asyncio
+import concurrent.futures
 import re
 import threading
 import time
@@ -1752,14 +1753,13 @@ class JarvisLive:
                 dtype="int16",
                 blocksize=CHUNK_SIZE,
                 device=dev,
-                # The transport probe in core/audio_devices rules out every host
-                # API that only pretends to play, and on this machine the one
-                # left standing is MME — the oldest and least forgiving. A
-                # blocksize of 1024 is 43 ms of cushion, and speech that arrives
-                # over a network does not arrive that evenly: the card runs dry
-                # between packets and the voice comes out chopped. Asking for a
-                # high-latency buffer costs a fraction of a second before she
-                # starts and buys the slack that keeps her continuous.
+                # Asked for, and on this machine ignored: measured against the
+                # output the probe in core/audio_devices settles on, MME reports
+                # 213.3 ms of latency whether this is set or not. It is kept
+                # because a host API that does honour it gives the same cushion
+                # for free, and _open_spk falls back when a device refuses it —
+                # but the thing that actually stopped the stutter here was
+                # priming the first write, not this.
                 latency="high",
             )
             st.start()
@@ -1776,6 +1776,18 @@ class JarvisLive:
             print(f"[JARVIS] ⚠️  Output device '{_spk_name}' failed: {_e} — using default")
             self.ui.write_log(f"SYS: Speaker '{_spk_name}' unavailable — using system default.")
             stream = _open_spk(None)
+
+        # The sound card gets a thread of its own. Every tool in this app runs
+        # through run_in_executor(None, ...) and asyncio.to_thread uses that same
+        # default pool, so a write to the speaker was queueing behind whatever
+        # the assistant happened to be doing — the Copilot bridge holds a worker
+        # for up to ninety seconds, the VS Code one for about five. Measured over
+        # one turn: fifteen gaps totalling 1912 ms, every one of them with audio
+        # already waiting in the queue. The card cannot wait; a plugin can.
+        _writer = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="lumina-audio-out"
+        )
+        loop = asyncio.get_running_loop()
 
         _spoken = 0          # bytes written to the sound card this turn
 
@@ -1796,6 +1808,13 @@ class JarvisLive:
         # she was thinking, not stuttering.
         _CHOP_MAX = 1.5
         _pauses = 0
+
+        # Two very different faults sound identical. If the sound card ran dry
+        # while audio was already sitting in the queue, this loop starved it and
+        # the fix is here. If the queue was empty, the audio had simply not
+        # arrived from the model yet, and no amount of local buffering invents
+        # sound that does not exist. Counting the first tells them apart.
+        _ours = 0
 
         # Speech starts the moment the first 50 ms slice lands, which leaves the
         # card with 50 ms of cushion against a network that delivers in bursts.
@@ -1824,6 +1843,7 @@ class JarvisLive:
                         # and I could not hear it".
                         if _spoken:
                             _chop = (f", chopped {_gaps}× for {_gap_ms:.0f} ms"
+                                     f" ({_ours} ours, {_gaps - _ours} waiting on the model)"
                                      if _gaps else "")
                             _paused = f", paused {_pauses}×" if _pauses else ""
                             print(f"[JARVIS] 🔈 Spoke {_spoken} bytes "
@@ -1831,11 +1851,15 @@ class JarvisLive:
                         _spoken = 0
                         _gaps = 0
                         _gap_ms = 0.0
+                        _ours = 0
                         _pauses = 0
                         _dry_at = 0.0
                         self.set_speaking(False)
                         self._turn_done_event.clear()
                     continue
+
+                # Sampled before the batching below empties it.
+                _waiting = self.audio_in_queue.qsize()
 
                 self.set_speaking(True)
 
@@ -1870,6 +1894,8 @@ class JarvisLive:
                     if _silence <= _CHOP_MAX:
                         _gaps += 1
                         _gap_ms += _silence * 1000
+                        if _waiting:
+                            _ours += 1
                     else:
                         _pauses += 1
                 _dry_at = max(_now, _dry_at) + len(batch) / 48000.0
@@ -1882,7 +1908,7 @@ class JarvisLive:
                     pass
 
                 try:
-                    await asyncio.to_thread(stream.write, bytes(batch))
+                    await loop.run_in_executor(_writer, stream.write, bytes(batch))
                     _spoken += len(batch)
                 except (RuntimeError, asyncio.CancelledError):
                     # Playback ending here is invisible otherwise: the assistant
@@ -1897,6 +1923,7 @@ class JarvisLive:
             self.set_speaking(False)
             stream.stop()
             stream.close()
+            _writer.shutdown(wait=False)
 
     # ── Morning briefing ────────────────────────────────────────────────────────
 
