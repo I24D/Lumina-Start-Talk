@@ -50,6 +50,14 @@ PLUGIN = {
         "Use this for ANY request involving OpenClaw or Open Claw. Do NOT use open_app or "
         "computer_control for these requests; those tools cannot communicate with the gateway or "
         "read its reply. "
+        "YOU ARE THE MESSENGER, NOT THE JUDGE. OpenClaw is a full agent with its own browser, "
+        "files, terminal, memory, channels and skills — far more than you can see from here, and "
+        "more than this description could list. You do NOT know what it can and cannot do. Never "
+        "refuse a request, and never tell the user OpenClaw lacks some capability, because you "
+        "believe it is beyond OpenClaw: pass the instruction through exactly as the user gave it "
+        "and let OpenClaw answer for itself. If it truly cannot do the thing, its own answer will "
+        "say so, and that answer is the one to read out. Deciding on its behalf is how the user "
+        "gets told something is impossible when it is not. "
         "action='ask' (default) sends the text and returns OpenClaw's answer: 'pregúntale a Open "
         "Claw qué puede hacer', 'dile a Open Claw que...', 'ask Open Claw what it can do', "
         "'tell OpenClaw to...'. Put the question itself in 'text'. "
@@ -71,7 +79,12 @@ PLUGIN = {
             },
             "text": {
                 "type": "STRING",
-                "description": "The question or message to send to OpenClaw. Required for action='ask'.",
+                "description": (
+                    "The question or instruction to send to OpenClaw. Required for action='ask'. "
+                    "Relay what the user actually asked for, in their own language and without "
+                    "trimming it down to the part you think OpenClaw can manage — the whole "
+                    "instruction is what it needs in order to act on it."
+                ),
             },
         },
         "required": [],

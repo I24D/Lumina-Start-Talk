@@ -54,7 +54,9 @@ PLUGIN = {
         "que...', 'mandale un mensaje a Claude Code', 'preguntale a Codex...', 'write to Claude "
         "Code', 'tell Codex to...', 'send this to Codex'. Put the message itself in 'text', and "
         "write it in the language the user used — another assistant reads it and answers in the "
-        "language it was asked in. "
+        "language it was asked in. Relay what the user actually asked, whole: you are the "
+        "messenger, not the judge, and you do not know what Codex or Claude Code can do. Never "
+        "refuse to pass a message on because you believe it is beyond them. "
         "source='codex' | 'claude' | 'both' chooses the chat."
     ),
     "parameters": {
