@@ -145,11 +145,24 @@ Storage and prompt budget are now separate problems:
 
 * **Nothing is deleted.** The cap is a runaway guard normal use never approaches, and if it is ever hit it says so in the activity log instead of on stdout.
 * **The prompt carries a core, not a dump.** Identity in full, then the most recently updated facts, budgeted — measured at **under 1,000 characters on a memory holding 61 stored facts.** That is *smaller* than the old whole-store cap, so sessions now connect with fewer tokens than before.
-* **The rest is fetched on demand.** A `recall_memory` tool searches the full store locally — no network, no second model, well under a millisecond.
+* **The rest is fetched on demand.** A `recall_memory` tool searches the full local cache — no network, no second model, well under a millisecond.
+* **Supabase adds recovery without becoming a dependency.** When configured, the local JSON document is mirrored to a private Supabase row. Startup resolves the newest copy, while saves are queued in one background thread so audio stays responsive. If Supabase or the network is unavailable, the local memory continues to work normally.
 
 The part that is easy to get wrong: **a model cannot look something up if it doesn't know the thing exists.** So the prompt also carries an **index of the keys** it had no room for. Without it, "who is Lucía?" gets "I don't know" while `lucia_sister` sits on disk unread. That index interleaves categories rather than sorting by recency — sorted like the core, a memory with forty preferences pushed the one entry the index existed for off the end.
 
-⚙ → **🧠 MEMORY** shows every stored fact, when it was learned, and a ✕ to forget it. Everything stays in `memory/long_term.json` on your machine.
+⚙ → **🧠 MEMORY** shows every stored fact, when it was learned, and a ✕ to forget it. The fast offline copy stays in `memory/long_term.json` on your machine.
+
+Optional Supabase persistence reads these values from the repository `.env` file:
+
+```dotenv
+SUPABASE_URL=https://your-project.supabase.co
+SUPABASE_SERVICE_ROLE_KEY=your-local-service-role-key
+LUMINA_SUPABASE_SCHEMA=public
+LUMINA_SUPABASE_ALLOW_WRITES=true
+```
+
+The service-role key is only for a trusted local installation. Never commit `.env`, embed the key in a public build, or expose it to browser code.
+Apply `memory/supabase_schema.sql` once when connecting a new Supabase project.
 
 ### ↩️ Undo — it can take back what it did
 
@@ -283,7 +296,9 @@ Lumina Start talk/
 │   ├── dev_agent.py          # Developer task agent
 │   └── desktop.py            # Desktop and taskbar control
 ├── memory/
-│   ├── memory_manager.py     # Load/save long_term.json — sessions, monitors, identity
+│   ├── memory_manager.py     # Offline-first memory, recall, sessions, and remote reconciliation
+│   ├── supabase_store.py     # Private Supabase JSONB persistence through PostgREST
+│   ├── supabase_schema.sql   # Idempotent table, RLS policy, and least-privilege grants
 │   ├── config_manager.py     # api_keys.json access — key, OS, name, voice, colour, plugin toggles
 │   └── long_term.json        # Persistent store: identity, preferences, projects, sessions, monitors
 ├── core/

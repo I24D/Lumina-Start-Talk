@@ -1,9 +1,16 @@
 import json
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from threading import Lock
 from pathlib import Path
 import sys
+
+from memory.supabase_store import (
+    SupabaseStoreError,
+    document_hash,
+    get_store,
+    queue_upsert,
+)
 
 
 def get_base_dir() -> Path:
@@ -15,6 +22,8 @@ def get_base_dir() -> Path:
 BASE_DIR         = get_base_dir()
 MEMORY_PATH      = BASE_DIR / "memory" / "long_term.json"
 _lock            = Lock()
+_remote_lock     = Lock()
+_remote_loaded   = False
 MAX_VALUE_LENGTH = 380
 
 # ── Why there are two very different numbers here ────────────────────────────
@@ -54,22 +63,100 @@ def _empty_memory() -> dict:
         "notes":         {},
     }
 
-def load_memory() -> dict:
+
+def _normalize_memory(data) -> dict:
+    if not isinstance(data, dict):
+        return _empty_memory()
+    normalized = dict(data)
+    for key, default_value in _empty_memory().items():
+        if not isinstance(normalized.get(key), type(default_value)):
+            normalized[key] = default_value
+    return normalized
+
+
+def _read_local_memory() -> dict:
     if not MEMORY_PATH.exists():
         return _empty_memory()
     with _lock:
         try:
-            data = json.loads(MEMORY_PATH.read_text(encoding="utf-8"))
-            if isinstance(data, dict):
-                base = _empty_memory()
-                for key in base:
-                    if key not in data:
-                        data[key] = {}
-                return data
+            return _normalize_memory(
+                json.loads(MEMORY_PATH.read_text(encoding="utf-8"))
+            )
+        except Exception as exc:
+            print(f"[Memory] Local load warning: {exc}")
             return _empty_memory()
-        except Exception as e:
-            print(f"[Memory] ⚠️ Load error: {e}")
-            return _empty_memory()
+
+
+def _write_local_memory(memory: dict) -> None:
+    MEMORY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with _lock:
+        MEMORY_PATH.write_text(
+            json.dumps(memory, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+
+def _remote_is_newer(updated_at: str) -> bool:
+    if not MEMORY_PATH.exists() or not updated_at:
+        return True
+    try:
+        remote_time = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
+        if remote_time.tzinfo is None:
+            remote_time = remote_time.replace(tzinfo=timezone.utc)
+        local_time = datetime.fromtimestamp(MEMORY_PATH.stat().st_mtime, timezone.utc)
+        return remote_time >= local_time
+    except (OSError, ValueError):
+        return True
+
+
+def _load_with_remote_fallback(local_memory: dict) -> dict:
+    """Resolve the first process read against Supabase, then stay local and fast."""
+    global _remote_loaded
+    if _remote_loaded:
+        return local_memory
+
+    with _remote_lock:
+        if _remote_loaded:
+            return _read_local_memory()
+        _remote_loaded = True
+
+        store = get_store(BASE_DIR)
+        if not store.configured:
+            return local_memory
+        try:
+            remote = store.fetch()
+        except SupabaseStoreError as exc:
+            print(f"[Memory] Supabase startup warning: {exc}")
+            return local_memory
+
+        if remote is None:
+            future = queue_upsert(BASE_DIR, local_memory)
+            if future is None:
+                print("[Memory] Supabase connected in read-only mode.")
+            else:
+                print("[Memory] Supabase connected; initial memory upload queued.")
+            return local_memory
+
+        remote_memory = _normalize_memory(remote.payload)
+        if document_hash(remote_memory) == document_hash(local_memory):
+            print("[Memory] Supabase connected; local memory is current.")
+            return local_memory
+
+        if _remote_is_newer(remote.updated_at):
+            _write_local_memory(remote_memory)
+            print("[Memory] Restored newer memory from Supabase.")
+            return remote_memory
+
+        future = queue_upsert(BASE_DIR, local_memory)
+        if future is None:
+            print("[Memory] Local memory is newer; Supabase is read-only.")
+        else:
+            print("[Memory] Local memory is newer; Supabase update queued.")
+        return local_memory
+
+
+def load_memory() -> dict:
+    return _load_with_remote_fallback(_read_local_memory())
 
 def _all_entries(memory: dict) -> list[tuple]:
     entries = []
@@ -104,7 +191,7 @@ def _trim_to_limit(memory: dict) -> dict:
             break
         del memory[cat][key]
         dropped.append(f"{cat}/{key}")
-        print(f"[Memory] 🗑️  Trimmed {cat}/{key}")
+        print(f"[Memory] Trimmed {cat}/{key}")
     if dropped and _trim_notifier:
         try:
             _trim_notifier(
@@ -119,12 +206,8 @@ def save_memory(memory: dict) -> None:
     if not isinstance(memory, dict):
         return
     memory = _trim_to_limit(memory)
-    MEMORY_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with _lock:
-        MEMORY_PATH.write_text(
-            json.dumps(memory, indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
+    _write_local_memory(memory)
+    queue_upsert(BASE_DIR, memory)
 
 
 def _truncate_value(val: str) -> str:
@@ -162,7 +245,7 @@ def update_memory(memory_update: dict) -> dict:
     memory = load_memory()
     if _recursive_update(memory, memory_update):
         save_memory(memory)
-        print(f"[Memory] 💾 Saved: {list(memory_update.keys())}")
+        print(f"[Memory] Saved categories: {list(memory_update.keys())}")
     return memory
 
 def _entry_value(entry) -> str:
@@ -445,13 +528,8 @@ def save_session_summary(summary: str, language: str = "") -> None:
         entry["language"] = language
     sessions.append(entry)
     memory["sessions"] = sessions[-_SESSION_MAX:]
-    with _lock:
-        MEMORY_PATH.parent.mkdir(parents=True, exist_ok=True)
-        MEMORY_PATH.write_text(
-            json.dumps(memory, indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
-    print(f"[Memory] 📝 Session saved ({entry['date']}): {summary[:60]}…")
+    save_memory(memory)
+    print(f"[Memory] Session saved ({entry['date']}): {summary[:60]}...")
 
 
 def pop_last_session() -> dict | None:
@@ -459,6 +537,7 @@ def pop_last_session() -> dict | None:
     Return AND remove the most recent session entry.
     Calling this consumes the entry so it is never repeated in future briefings.
     """
+    updated_memory = None
     with _lock:
         if not MEMORY_PATH.exists():
             return None
@@ -473,7 +552,10 @@ def pop_last_session() -> dict | None:
                 json.dumps(memory, indent=2, ensure_ascii=False),
                 encoding="utf-8",
             )
-            return entry
+            updated_memory = memory
         except Exception as e:
-            print(f"[Memory] ⚠️ pop_last_session error: {e}")
+            print(f"[Memory] Session pop warning: {e}")
             return None
+    if updated_memory is not None:
+        queue_upsert(BASE_DIR, updated_memory)
+    return entry
