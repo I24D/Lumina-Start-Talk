@@ -13,10 +13,10 @@ from pathlib import Path
 # ── Blocked categories (never monitor regardless of what user says) ────────────
 
 _BLOCKED = {
-    # Marka / varlık adları — her dilde aynı yazılır
+    # Brand and asset names — spelled the same in every language
     "bitcoin", "ethereum", "dogecoin", "solana", "binance",
     "nft", "blockchain", "defi", "altcoin", "memecoin", "coin", "token",
-    # "kripto" kökünün farklı dillerdeki yazılışları
+    # How the "crypto" root is spelled across languages
     "crypto", "kripto", "cripto", "krypto", "крипто", "仮想通貨", "暗号資産",
     "cryptocurrency",
 }

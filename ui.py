@@ -97,7 +97,7 @@ class C:
     BAR_BG    = "#23070b"
 
 
-# Ana renge (accent) bağlı anahtarlar — durum renkleri (ACC, GREEN, RED…) sabit kalır
+# Keys tied to the accent colour — status colours (ACC, GREEN, RED…) stay fixed
 _HUE_LINKED = (
     "BG", "PANEL", "PANEL2", "BORDER", "BORDER_B", "BORDER_A",
     "PRI", "PRI_DIM", "PRI_GHO", "TEXT", "TEXT_DIM", "TEXT_MED",
@@ -136,10 +136,10 @@ def apply_night_palette(enabled: bool) -> None:
 
 def apply_ui_accent(accent_hex: str) -> bool:
     """
-    Seçilen accent rengine göre tüm turkuaz-ailesi paleti yeniden türetir
-    (hue kaydırma — parlaklık/doygunluk oranları korunur, tasarım bozulmaz).
-    Boyanan öğeler (HUD, dalga formu, metrikler) bir sonraki karede yeni
-    rengi alır; stylesheet tabanlı paneller yeniden kurulduklarında alır.
+    Re-derives the whole turquoise-family palette from the chosen accent
+    colour (a hue shift — brightness and saturation ratios are preserved, so
+    the design survives intact). Painted elements (HUD, waveform, metrics)
+    pick it up next frame; stylesheet panels on their next rebuild.
     """
     import colorsys
 
@@ -160,7 +160,7 @@ def apply_ui_accent(accent_hex: str) -> bool:
     base_h            = _hsv(_PALETTE_DEFAULTS["PRI"])[0]
     acc_h, acc_s, _av = _hsv(accent_hex)
     dh   = acc_h - base_h
-    grey = acc_s < 0.08   # griye yakın accent → tüm tema desaturize edilir
+    grey = acc_s < 0.08   # near-grey accent → the whole theme desaturates
 
     for key, hex0 in _PALETTE_DEFAULTS.items():
         h, s, v = _hsv(hex0)
@@ -173,16 +173,16 @@ def apply_ui_accent(accent_hex: str) -> bool:
 
 
 def current_palette() -> dict[str, str]:
-    """C sınıfındaki accent'e bağlı renklerin anlık kopyası."""
+    """A snapshot of the accent-linked colours held on class C."""
     return {k: getattr(C, k) for k in _HUE_LINKED}
 
 
 def retheme_all_widgets(old: dict[str, str], new: dict[str, str]) -> None:
     """
-    CANLI tam tema değişimi. Uygulamadaki HER widget'ın stylesheet'inde eski
-    palet renklerini yenileriyle değiştirir ve yeniden çizdirir. Böylece renk
-    değişimi yalnızca boyanan öğelerde değil, panel/buton/kenarlık dahil tüm
-    arayüzde ANINDA uygulanır — yeniden başlatma gerekmez.
+    A LIVE, complete theme swap. Replaces the old palette colours with the
+    new ones in EVERY widget's stylesheet and repaints them, so the change
+    lands INSTANTLY across the whole interface — panels, buttons and borders
+    included, not only the painted elements — with no restart.
     """
     mapping = {old[k].lower(): new[k].lower()
                for k in old if old[k].lower() != new.get(k, old[k]).lower()}
@@ -1256,15 +1256,15 @@ class SetupOverlay(QWidget):
 
 class HueWheel(QWidget):
     """
-    Dairesel renk seçici. Kullanıcı tutamacı (küçük beyaz daire) çarkın
-    çevresinde sürükleyerek TÜM renk tonları arasından seçim yapar.
-    Merkezdeki dolu daire seçilen rengin canlı önizlemesidir.
+    Circular colour picker. The user drags the handle (the small white
+    circle) around the wheel to choose from EVERY hue.
+    The filled circle at the centre live-previews the selected colour.
     """
 
-    hue_picked    = pyqtSignal(str)   # sürükleme sırasında (canlı)
-    hue_committed = pyqtSignal(str)   # tutamaç bırakıldığında
+    hue_picked    = pyqtSignal(str)   # while dragging (live)
+    hue_committed = pyqtSignal(str)   # when the handle is released
 
-    _RING = 16   # halka kalınlığı (px)
+    _RING = 16   # ring thickness (px)
 
     def __init__(self, initial_hex: str = DEFAULT_UI_COLOR, parent=None):
         super().__init__(parent)
@@ -1284,7 +1284,7 @@ class HueWheel(QWidget):
             self._hue = c.hsvHueF()
             self.update()
 
-    # ── geometri yardımcıları ────────────────────────────────────────────────
+    # ── geometry helpers ─────────────────────────────────────────────────────
     def _ring_rect(self) -> QRectF:
         m = self._RING / 2 + 3
         return QRectF(self.rect()).adjusted(m, m, -m, -m)
@@ -1292,8 +1292,8 @@ class HueWheel(QWidget):
     def _hue_from_pos(self, pos: QPointF) -> float:
         c  = QRectF(self.rect()).center()
         dx = pos.x() - c.x()
-        dy = c.y() - pos.y()          # ekran y'si aşağı — matematiksel eksene çevir
-        ang = math.atan2(dy, dx)      # [-π, π], saat yönünün tersi
+        dy = c.y() - pos.y()          # screen y grows down — flip to maths axis
+        ang = math.atan2(dy, dx)      # [-π, π], counter-clockwise
         return (ang / (2 * math.pi)) % 1.0
 
     # ── çizim ────────────────────────────────────────────────────────────────
@@ -1427,7 +1427,7 @@ class CustomizeOverlay(QWidget):
         lay.addLayout(voice_row)
         self._refresh_voice_btns()
 
-        # ── UI colour — renk çarkı ───────────────────────────────────────────
+        # ── UI colour — hue wheel ────────────────────────────────────────────
         lay.addSpacing(4)
         clr_hdr = QHBoxLayout()
         clr_hdr.addWidget(_lbl("UI COLOUR  —  drag the handle", 8,
@@ -1450,7 +1450,7 @@ class CustomizeOverlay(QWidget):
 
         self._initial_color = (ui_color or DEFAULT_UI_COLOR).strip().lower()
         self._sel_color     = self._initial_color
-        self.on_preview     = None   # callable(hex) — canlı önizleme; MainWindow bağlar
+        self.on_preview     = None   # callable(hex) — live preview; MainWindow binds it
 
         self._wheel = HueWheel(self._sel_color)
         wheel_row = QHBoxLayout()
@@ -1521,9 +1521,9 @@ class CustomizeOverlay(QWidget):
                     QPushButton:hover {{ color: {C.TEXT}; border-color: {C.BORDER_B}; }}
                 """)
 
-    # ── renk akışı ───────────────────────────────────────────────────────────
+    # ── colour flow ──────────────────────────────────────────────────────────
     def _set_color(self, hx: str, update_wheel: bool = True, preview: bool = True):
-        """Seçili rengi günceller; hex kutusu + çark senkron kalır, tema canlı önizlenir."""
+        """Updates the colour; hex box and wheel stay in sync, theme previews live."""
         self._sel_color = hx.strip().lower()
         self._hex_input.blockSignals(True)
         self._hex_input.setText(self._sel_color)
@@ -1534,14 +1534,14 @@ class CustomizeOverlay(QWidget):
             self.on_preview(self._sel_color)
 
     def _on_wheel_pick(self, hx: str):
-        # Sürükleme sırasında: hex kutusunu güncelle, temayı henüz uygulama
+        # While dragging: update the hex box, do not apply the theme yet
         self._sel_color = hx
         self._hex_input.blockSignals(True)
         self._hex_input.setText(hx)
         self._hex_input.blockSignals(False)
 
     def _on_wheel_commit(self, hx: str):
-        # Tutamaç bırakıldı → tüm arayüzü canlı önizle
+        # Handle released → live-preview the whole interface
         self._set_color(hx, update_wheel=False)
 
     def _on_hex_edited(self, text: str):
@@ -1554,7 +1554,7 @@ class CustomizeOverlay(QWidget):
             self._set_color(t, update_wheel=True, preview=True)
 
     def _cancel(self):
-        # Önizleme uygulandıysa açılıştaki renge geri dön
+        # If a preview was applied, go back to the colour we opened with
         if self.on_preview and self._sel_color != self._initial_color:
             self.on_preview(self._initial_color)
         self.hide()
@@ -2725,7 +2725,7 @@ class MainWindow(QMainWindow):
         self._clock_tmr.start(1000)
         self._tick_clock()
 
-        # Metrik güncelleme timer'ı
+        # Metrics refresh timer
         self._metric_tmr = QTimer(self)
         self._metric_tmr.timeout.connect(self._update_metrics)
         self._metric_tmr.start(2000)
@@ -3983,7 +3983,7 @@ class MainWindow(QMainWindow):
         self._customize_overlay = ov
 
     def _preview_ui_color(self, hex_color: str):
-        """Canlı önizleme — tüm arayüzü yeni renge boyar (config'e YAZMAZ)."""
+        """Live preview — paints the interface in the new colour (does NOT write config)."""
         old = current_palette()
         if apply_ui_accent(hex_color):
             apply_night_palette(self._night_mode)
@@ -4005,7 +4005,7 @@ class MainWindow(QMainWindow):
             old = current_palette()
             if apply_ui_accent(ui_color):
                 apply_night_palette(self._night_mode)
-                # Tüm arayüzü (paneller, butonlar, kenarlıklar, HUD) canlı boya
+                # Live-paint the whole interface (panels, buttons, borders, HUD)
                 retheme_all_widgets(old, current_palette())
                 color_changed = old["PRI"] != C.PRI
 

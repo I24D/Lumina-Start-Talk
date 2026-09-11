@@ -115,10 +115,10 @@ _VALID_INTENTS = {"write", "edit", "explain", "run", "build", "screen_debug", "o
 
 def _detect_intent(description: str, file_path: str, code: str) -> str:
     """
-    Dil bağımsız niyet tespiti — sabit anahtar kelime listesi YOK.
-    Kullanıcı hangi dilde konuşursa konuşsun, açıklama Gemini'ye
-    sınıflandırtılır. API'ye ulaşılamazsa dile bakmayan yapısal
-    ipuçlarına (dosya diskte var mı, kod verilmiş mi) düşülür.
+    Language-independent intent detection — there is NO fixed keyword list.
+    Whatever language the user speaks in, the description is handed to
+    Gemini to classify. When the API cannot be reached it falls back to
+    structural clues (does the file exist on disk, was code supplied).
     """
     desc        = (description or "").strip()
     file_exists = bool(file_path) and Path(file_path).exists()
@@ -152,7 +152,7 @@ def _detect_intent(description: str, file_path: str, code: str) -> str:
         except Exception as e:
             print(f"[Code] Intent classification failed ({e}) — structural fallback")
 
-    # Yapısal geri dönüş — hiçbir dile bağlı değil
+    # Structural fallback — bound to no language at all
     if file_exists:
         return "edit" if desc else "explain"
     if code:

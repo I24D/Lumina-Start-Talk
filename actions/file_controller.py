@@ -95,7 +95,7 @@ _SAFE_ROOTS: list[Path] = [
 ]
 
 def _is_safe_path(target: Path) -> bool:
-    """Verilen path _SAFE_ROOTS içinde mi? Değilse işlemi reddet."""
+    """Is the given path inside _SAFE_ROOTS? If not, refuse the operation."""
     try:
         resolved = target.resolve()
         return any(
@@ -275,7 +275,7 @@ def delete_file(path: str, name: str = "") -> str:
         if not target.exists():
             return f"Not found: {target.name}"
 
-        # Güvenli dizin kontrolü — kritik kullanıcı klasörlerini koru
+        # Safe-directory check — protect the user's critical folders
         protected = {
             _get_desktop(), _get_downloads(), _get_documents(),
             _get_pictures(), _get_music(), _get_videos(), Path.home()

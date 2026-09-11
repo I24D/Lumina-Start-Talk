@@ -369,12 +369,12 @@ _WIN_EXE_HINTS: dict[str, str] = {"chrome": "chrome", "edge": "msedge"}
 
 def _open_native(url: str, browser_name: Optional[str]) -> str:
     """
-    Kullanıcının GERÇEK tarayıcısını normal şekilde açar — kendi profili,
-    giriş yapılmış hesapları ve eklentileriyle. Otomasyon bağlanmaz, bu yüzden
-    about:blank sekmesi veya boş profil ASLA görünmez.
-    url boş ise tarayıcı URL'siz başlatılır (kendi açılış sayfası /
-    oturum geri yükleme ile) — tıpkı kullanıcının kendisi açmış gibi.
-    Windows / macOS / Linux üçünde de çalışır.
+    Opens the user's REAL browser the normal way — their own profile, their
+    signed-in accounts and their extensions. No automation attaches, so an
+    about:blank tab or an empty profile NEVER appears.
+    When url is empty the browser starts with no URL at all (its own start
+    page / session restore) — exactly as if the user had opened it.
+    Works on Windows, macOS and Linux alike.
     """
     url = _normalize_url(url) if url and url.strip() else ""
     if url == "about:blank":
@@ -384,7 +384,7 @@ def _open_native(url: str, browser_name: Optional[str]) -> str:
     if browser_name:
         name = _ALIASES.get(browser_name.lower().strip(), browser_name.lower().strip())
     elif not url:
-        # URL yok → sadece pencere açılacak; varsayılan tarayıcının exe'si gerekir
+        # No URL → only a window opens; this needs the default browser's exe
         name = _detect_default_browser()
 
     # Specific browser → launch its own executable, exactly like the user would.
@@ -443,8 +443,8 @@ def _open_native(url: str, browser_name: Optional[str]) -> str:
 
 class _BrowserSession:
     """
-    Bir tarayıcı örneği için tam oturum.
-    Tüm tarayıcılar launch_persistent_context ile gerçek profil üzerinde açılır.
+    A full session for one browser instance.
+    Every browser opens on its real profile via launch_persistent_context.
     """
 
     def __init__(self, browser_name: str):
@@ -505,9 +505,9 @@ class _BrowserSession:
 
     async def _adopt_page(self) -> Page:
         """
-        launch_persistent_context zaten bir başlangıç sekmesi açar.
-        Yeni bir boş sekme (about:blank) açmak yerine o sekmeyi devralır —
-        böylece kullanıcı fazladan boş sekme görmez.
+        launch_persistent_context already opens a starting tab. Adopting that
+        tab rather than opening a fresh blank one (about:blank) is what keeps
+        a stray empty tab from appearing in front of the user.
         """
         await asyncio.sleep(0.3)
         pages = self._context.pages
@@ -515,8 +515,8 @@ class _BrowserSession:
 
     async def _launch(self):
         """
-        Tarayıcıyı gerçek kullanıcı profiliyle başlatır.
-        Context zaten açıksa hiçbir şey yapmaz.
+        Starts the browser on the user's real profile.
+        Does nothing when the context is already open.
         """
         if self._context is not None:
             return
@@ -607,10 +607,10 @@ class _BrowserSession:
         except Exception as e:
             print(f"[Browser] ⚠️  Real profile failed for {label}: {e}")
 
-        # Gerçek profil açılamadı (tarayıcı zaten açık / kilitli profil / yeni
-        # Chrome sürümleri otomasyonla gerçek profili engelliyor). Kalıcı
-        # JARVIS otomasyon profiline geçilir — buraya bir kez giriş yapılan
-        # hesaplar sonraki oturumlarda da açık kalır.
+        # The real profile would not open (browser already running / locked
+        # profile / recent Chrome versions block automation on it). Fall back
+        # to the persistent JARVIS automation profile — accounts signed into
+        # it once stay signed in on every later session.
         jarvis_profile = str(Path.home() / ".jarvis_profiles" / self.browser_name)
         Path(jarvis_profile).mkdir(parents=True, exist_ok=True)
         print(f"[Browser] Retrying with JARVIS profile: {jarvis_profile}")
@@ -840,7 +840,7 @@ class _BrowserSession:
         return f"{self.browser_name} closed."
 
 class _SessionRegistry:
-    """Tüm aktif tarayıcı oturumlarını yönetir."""
+    """Manages every active browser session."""
 
     def __init__(self):
         self._sessions:        dict[str, _BrowserSession] = {}
@@ -849,7 +849,7 @@ class _SessionRegistry:
         self._last_native_url: str                        = ""
 
     def has(self, browser_name: str | None = None) -> bool:
-        """Bu tarayıcı için (veya hiç) aktif bir otomasyon oturumu var mı?"""
+        """Is there an active automation session for this browser (or any)?"""
         with self._lock:
             if not browser_name:
                 return bool(self._sessions)
@@ -860,7 +860,7 @@ class _SessionRegistry:
         self._last_native_url = url
 
     def pop_native_url(self) -> str:
-        """Son native açılan URL'yi bir kez döndürür (tekrarı önlemek için tüketilir)."""
+        """Returns the last natively opened URL once — consumed to avoid repeats."""
         url, self._last_native_url = self._last_native_url, ""
         return url
 
@@ -956,12 +956,12 @@ def browser_control(
         _log(player, result)
         return result
 
-    # ── Gezinme HER ZAMAN native ─────────────────────────────────────────────
-    # go_to / search / new_tab siteyi kullanıcının kendi tarayıcısında açar —
-    # kendi profili, giriş yapılmış hesapları ve açılış sayfasıyla; tıpkı
-    # kullanıcının kendisi açmış gibi. about:blank'li kontrollü pencere burada
-    # asla açılmaz. Tek istisna: hâlihazırda süren bir otomasyon akışı varsa
-    # gezinme o pencerede devam eder (çok adımlı görevler bölünmesin diye).
+    # ── Navigation is ALWAYS native ──────────────────────────────────────────
+    # go_to / search / new_tab open the site in the user's own browser — their
+    # profile, their signed-in accounts, their start page; exactly as if they
+    # had opened it themselves. A controlled about:blank window never opens
+    # here. The one exception: when an automation flow is already running,
+    # navigation continues in that window so multi-step tasks stay whole.
     if action in ("go_to", "search", "new_tab"):
         if _registry.has(browser):
             sess = _registry.get(browser)
@@ -993,10 +993,10 @@ def browser_control(
         _log(player, result)
         return result
 
-    # ── Etkileşimli aksiyonlar (tıklama/yazma/okuma…) ────────────────────────
-    # Bunlar fiziksel olarak kontrol edilebilir bir tarayıcı gerektirir;
-    # yalnızca burada otomasyon penceresi açılır ve açılır açılmaz kullanıcının
-    # son gezindiği sayfaya gider — boş sayfada beklemez.
+    # ── Interactive actions (click / type / read…) ───────────────────────────
+    # These need a browser that can be physically controlled; the automation
+    # window opens only here, and the moment it does it goes to the page the
+    # user last visited — it never sits waiting on a blank one.
     try:
         sess = _registry.get(browser)
     except Exception as e:
