@@ -14,16 +14,24 @@ records whose message has ``role=assistant`` and ``stop_reason=end_turn``.
 Thinking blocks, tool-use blocks, metadata, and sidechain agent messages are
 ignored.
 
-This plugin reads those structured, append-only history files directly. It does
-not automate either application's window, take screenshots, use the clipboard,
-or steal keyboard focus. A partially written JSONL line is skipped safely.
+Reading those structured, append-only history files is done directly: no window
+automation, no screenshots, no clipboard, no stolen focus, and a partially
+written JSONL line is skipped safely.
+
+Sending cannot work that way. Neither extension exposes an API or a CLI that
+posts into the panel on screen, so writing goes through VS Code's own command
+palette and the keyboard — see the section further down, which is the only part
+of this plugin that touches the editor's window.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import platform
 import re
+import threading
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -33,23 +41,39 @@ from typing import Any, Iterable
 PLUGIN = {
     "name": "developer_chat_reader",
     "description": (
-        "Reads the latest completed assistant response from local Codex and Claude Code chat "
-        "history and returns it to be spoken aloud. Use this whenever the user asks what Codex "
-        "or Claude Code answered, even if the chat application is already open. Do NOT use "
-        "open_app, computer_control, or copilot_bridge; those tools cannot reliably read these "
-        "structured developer chats, and Copilot is a different product. "
-        "Set source='codex' for 'lee la respuesta de Codex', 'qué respondió Codex', 'léeme el "
-        "chat de Codex', 'read the latest Codex response', or 'what did Codex say'. "
-        "Set source='claude' for 'lee la respuesta de Claude Code', 'qué respondió Claude Code', "
-        "'léeme el chat de Claude Code', 'read the latest Claude Code response', or 'what did "
-        "Claude Code say'. Set source='both' when the user explicitly asks for both responses."
+        "Reads and writes the local Codex and Claude Code developer chats in VS Code. "
+        "action='read' (the default) returns the latest completed assistant response to be "
+        "spoken aloud. Use it whenever the user asks what Codex or Claude Code answered, even "
+        "if the chat application is already open. Do NOT use open_app, computer_control or "
+        "copilot_bridge for these; they cannot read these structured developer chats, and "
+        "Copilot is a different product. "
+        "Read triggers: 'lee la respuesta de Codex', 'que respondio Claude Code', "
+        "'leeme el chat de Codex', 'read the latest Claude Code response', 'what did Codex say'. "
+        "action='send' writes a message into that chat and sends it, which is how the user talks "
+        "to Codex or Claude Code through you: 'escribele a Claude Code que...', 'dile a Codex "
+        "que...', 'mandale un mensaje a Claude Code', 'preguntale a Codex...', 'write to Claude "
+        "Code', 'tell Codex to...', 'send this to Codex'. Put the message itself in 'text', and "
+        "write it in the language the user used — another assistant reads it and answers in the "
+        "language it was asked in. "
+        "source='codex' | 'claude' | 'both' chooses the chat."
     ),
     "parameters": {
         "type": "OBJECT",
         "properties": {
+            "action": {
+                "type": "STRING",
+                "description": "read (default) | send",
+            },
             "source": {
                 "type": "STRING",
-                "description": "Chat history to read: codex | claude | both",
+                "description": "Chat to read from or write to: codex | claude | both",
+            },
+            "text": {
+                "type": "STRING",
+                "description": (
+                    "The message to write into the chat. Required for action='send'. "
+                    "Write it in the language the user spoke in."
+                ),
             },
         },
         "required": [],
@@ -274,10 +298,201 @@ def _read_source(source: str) -> str:
     return "\n\n".join(parts)
 
 
+# ── writing into the chats ───────────────────────────────────────────────────
+#
+# Reading is done from files; sending cannot be. Neither extension exposes an
+# API, a port or a CLI that posts into the panel you are looking at, so the only
+# way in is the way a person uses: focus the window, run the command, type.
+#
+# The Copilot approach — find the composer as a UIA element and write to it —
+# was tried first and does not apply here. VS Code's accessibility tree was
+# probed after the usual WM_GETOBJECT wake-up and exposes 117 nodes with not one
+# Edit control in them; the chat panels are webviews whose insides never surface.
+#
+# What VS Code does expose is its command palette, and both extensions register
+# commands for exactly this. Those command titles are the contract:
+#
+#     claude-vscode.focus   "Claude Code: Focus input"
+#     chatgpt.openSidebar   "Open Codex Sidebar"
+#
+# Everything below was measured against the installed extensions
+# (anthropic.claude-code 2.1.268, openai.chatgpt 26.908) rather than assumed.
+
+_WINDOW_TITLE = "Visual Studio Code"
+
+_PALETTE_COMMANDS = {
+    "claude": "Claude Code: Focus input",
+    "codex": "Open Codex Sidebar",
+}
+
+# Codex's sidebar has no composer at all until a chat exists in the window —
+# the panel comes up empty and a paste goes nowhere. This opens one.
+_CODEX_NEW_CHAT = "New Chat in ChatGPT Sidebar"
+
+# Typing into a window is global state: there is one keyboard and one focused
+# control. Two sends at once interleave their keystrokes into one garbled
+# message, so they queue instead.
+_send_lock = threading.Lock()
+
+_SEND_ERROR = ""
+if platform.system() == "Windows":
+    try:
+        import pyautogui
+        import pyperclip
+        import win32con
+        import win32gui
+        from pywinauto import Desktop
+    except Exception as exc:        # a missing optional dep must not break reading
+        _SEND_ERROR = f"{type(exc).__name__}: {exc}"
+else:
+    _SEND_ERROR = f"Writing into VS Code is Windows-only; this machine runs {platform.system()}."
+
+
+def _vscode_window():
+    """The VS Code window handle, or None when the editor is not running."""
+    found = []
+
+    def visit(handle, _):
+        try:
+            if win32gui.IsWindowVisible(handle) and _WINDOW_TITLE in win32gui.GetWindowText(handle):
+                found.append(handle)
+        except Exception:
+            pass
+        return True
+
+    try:
+        win32gui.EnumWindows(visit, None)
+    except Exception:
+        return None
+    return found[0] if found else None
+
+
+def _focus_window(handle) -> None:
+    """Bring VS Code forward.
+
+    SetForegroundWindow on its own fails with "Element not found" (error 1168):
+    Windows refuses to let a process that does not already own the foreground
+    take it. pywinauto performs the AttachThreadInput dance that makes the
+    request legal, which is why this does not call win32gui directly.
+    """
+    if win32gui.IsIconic(handle):
+        win32gui.ShowWindow(handle, win32con.SW_RESTORE)
+    Desktop(backend="uia").window(handle=handle).set_focus()
+    time.sleep(0.7)
+
+
+def _run_palette_command(title: str) -> None:
+    """Run a VS Code command by its title through the command palette."""
+    pyautogui.hotkey("ctrl", "shift", "p")
+    time.sleep(0.7)
+    # Pasted rather than typed: the palette filters on every keystroke, and a
+    # typed title races its own filtering.
+    pyperclip.copy(">" + title)
+    pyautogui.hotkey("ctrl", "v")
+    time.sleep(0.9)
+    pyautogui.press("enter")
+    time.sleep(1.3)
+
+
+def _type_and_send(text: str) -> None:
+    """Replace whatever the composer holds, then send.
+
+    Ctrl+A first is not defensive tidiness. Both composers keep a draft, and a
+    paste without it appends: a test message landed in Codex as "Create an
+    image ofPRUEBA de Lumina", which is what the model would then have been
+    asked.
+
+    The text arrives by clipboard because pyautogui's scancode typing drops
+    every non-ASCII character — it would quietly mangle 'é', 'ñ' and '¿', the
+    characters a Spanish instruction is made of.
+    """
+    pyperclip.copy(text)
+    time.sleep(0.2)
+    pyautogui.hotkey("ctrl", "a")
+    time.sleep(0.2)
+    pyautogui.hotkey("ctrl", "v")
+    time.sleep(0.6)
+    pyautogui.press("enter")
+    time.sleep(0.4)
+
+
+def _send_to_chat(source: str, text: str) -> str:
+    """Put one message into Codex's or Claude Code's chat and send it."""
+    if _SEND_ERROR:
+        return f"I cannot write into VS Code: {_SEND_ERROR}"
+    if not text:
+        return "What would you like me to write to them?"
+
+    handle = _vscode_window()
+    if handle is None:
+        return "VS Code is not open, so there is no chat to write into."
+
+    label = "Claude Code" if source == "claude" else "Codex"
+    saved = ""
+    try:
+        saved = pyperclip.paste()
+    except Exception:
+        pass
+
+    with _send_lock:
+        try:
+            _focus_window(handle)
+            _run_palette_command(_PALETTE_COMMANDS[source])
+            if source == "codex":
+                # Harmless when a chat is already open, and the difference
+                # between working and silently typing into nothing when one
+                # is not.
+                _run_palette_command(_CODEX_NEW_CHAT)
+            _type_and_send(text)
+        except Exception as exc:
+            print(f"[DeveloperChat] send failed: {type(exc).__name__}: {exc}")
+            return f"I could not write to {label}: {exc}"
+        finally:
+            try:
+                pyperclip.copy(saved)
+            except Exception:
+                pass
+
+    print(f"[DeveloperChat] sent to {label}: {text[:100]}")
+    return (
+        f"I have written that to {label} and sent it. Ask me to read their "
+        "answer once they have had a moment to reply."
+    )
+
+
 def run(parameters: dict, player=None, session_memory=None) -> str:
-    """Read a completed developer-chat response and never raise to the caller."""
+    """Read from or write to a developer chat, and never raise to the caller."""
     parameters = parameters or {}
+    action = str(parameters.get("action") or "").strip().lower()
+    text = str(parameters.get("text") or "").strip()
     source = _normalize_source(parameters.get("source"))
+
+    # Supplying text only makes sense for a message being sent, so text with no
+    # action named is a send. Everything else defaults to reading, which is what
+    # this plugin did before it could write and what it must keep doing when the
+    # model is vague.
+    if action not in {"read", "send"}:
+        action = "send" if text else "read"
+
+    if action == "send":
+        if not source:
+            return "Should I write that to Codex or to Claude Code?"
+        targets = ("codex", "claude") if source == "both" else (source,)
+        replies = []
+        for target in targets:
+            try:
+                replies.append(_send_to_chat(target, text))
+            except Exception as exc:
+                print(f"[DeveloperChat] {type(exc).__name__}: {exc}")
+                replies.append(f"I could not write to {target}: {exc}")
+        result = " ".join(replies)
+        if player:
+            try:
+                player.write_log(f"[Developer chats] Sent to {source}: {text[:120]}")
+            except Exception:
+                pass
+        return result
+
     if not source:
         return "Would you like me to read the latest response from Codex or Claude Code?"
 
