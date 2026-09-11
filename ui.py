@@ -1353,7 +1353,7 @@ class HueWheel(QWidget):
         ang = math.atan2(dy, dx)      # [-π, π], counter-clockwise
         return (ang / (2 * math.pi)) % 1.0
 
-    # ── çizim ────────────────────────────────────────────────────────────────
+    # ── Drawing ──────────────────────────────────────────────────────────────
     def paintEvent(self, _):
         p = QPainter(self)
         if not p.isActive():
@@ -1369,14 +1369,14 @@ class HueWheel(QWidget):
         p.setBrush(Qt.BrushStyle.NoBrush)
         p.drawEllipse(rect)
 
-        # merkez önizleme dairesi
+        # Center preview circle
         preview = QColor.fromHsvF(self._hue, 1.0, 1.0)
         inner   = rect.adjusted(30, 30, -30, -30)
         p.setPen(QPen(qcol(C.BORDER_B), 1))
         p.setBrush(QBrush(preview))
         p.drawEllipse(inner)
 
-        # sürüklenen tutamaç
+        # Dragged handle
         r   = rect.width() / 2
         ang = self._hue * 2 * math.pi
         hx  = center.x() + r * math.cos(ang)
@@ -1556,7 +1556,7 @@ class CustomizeOverlay(QWidget):
         btn_row.addWidget(cancel_btn)
         lay.addLayout(btn_row)
 
-    # ── ses seçimi ───────────────────────────────────────────────────────────
+    # ── Voice selection ──────────────────────────────────────────────────────
     def _on_voice_pick(self, name: str):
         self._sel_voice = name
         self._refresh_voice_btns()
@@ -2790,7 +2790,7 @@ class MainWindow(QMainWindow):
         self._update_metrics()
 
         self._log_sig.connect(self._log.append_log)
-        self._live_sig.connect(self._log.set_live)
+        self._live_sig.connect(self._apply_live_transcript)
         self._state_sig.connect(self._apply_state)
         self._content_sig.connect(self._show_content)
         self._reconfig_sig.connect(self._show_setup)
@@ -3444,6 +3444,22 @@ class MainWindow(QMainWindow):
         sep2.setStyleSheet(f"color: {C.BORDER}; margin: 2px 0;")
         lay.addWidget(sep2)
 
+        self._live_caption = QLabel()
+        self._live_caption.setObjectName("LiveTranscript")
+        self._live_caption.setWordWrap(True)
+        self._live_caption.setMinimumHeight(44)
+        self._live_caption.setMaximumHeight(72)
+        self._live_caption.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
+        self._live_caption.setStyleSheet(f"""
+            QLabel#LiveTranscript {{
+                color: {C.WHITE}; background: {C.PRI_GHO};
+                border: 1px solid {C.PRI}; border-radius: 4px;
+                padding: 5px 7px;
+            }}
+        """)
+        self._live_caption.hide()
+        lay.addWidget(self._live_caption)
+
         lay.addWidget(_sec("COMMAND INPUT"))
         lay.addLayout(self._build_input_row())
 
@@ -3741,6 +3757,23 @@ class MainWindow(QMainWindow):
         lay.addWidget(self._content_display)
 
         return w
+
+    def _apply_live_transcript(self, text: str) -> None:
+        """Render partial speech immediately, independent of log animation."""
+        self._log.set_live(text)
+        spoken = (text or "").strip()
+        if spoken.lower().startswith("you:"):
+            spoken = spoken[4:].lstrip()
+        if not spoken:
+            self._live_caption.clear()
+            self._live_caption.hide()
+            return
+
+        # Keep the newest words visible when a long utterance exceeds the
+        # compact panel. The activity log still retains the complete preview.
+        visible = spoken if len(spoken) <= 240 else f"...{spoken[-237:]}"
+        self._live_caption.setText(f"● LIVE TRANSCRIPT\n{visible}")
+        self._live_caption.show()
 
     def _show_content(self, title: str, text: str):
         """Slot — runs on Qt main thread. Updates and shows the content panel."""
