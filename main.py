@@ -938,6 +938,7 @@ class JarvisLive:
         # talking and it is not arriving" is invisible without this.
         self._voice_blocks_unheard = 0
         self._last_deaf_rebuild = 0.0
+        self._tool_running = 0
 
         # Tracked apart because models support them apart: gemini-3.1-flash-live
         # takes proactive audio and refuses affective dialog. Bundled together,
@@ -1248,6 +1249,21 @@ class JarvisLive:
         return self._affective_live or self._proactive_live
 
     async def _execute_tool(self, fc) -> types.FunctionResponse:
+        # A running tool is a legitimate reason for the session to transcribe
+        # nothing: the model is inside the call and not listening. The deafness
+        # watchdog cannot tell that apart from a session that has stopped
+        # hearing, and it tore one down in the middle of a Copilot query that
+        # had another twenty seconds to run — losing the answer. So it is told.
+        self._tool_running += 1
+        try:
+            return await self._dispatch_tool(fc)
+        finally:
+            self._tool_running -= 1
+            # Speech from while the tool was busy is not evidence of anything.
+            self._voice_blocks_unheard = 0
+            self._last_user_speech = time.monotonic()
+
+    async def _dispatch_tool(self, fc) -> types.FunctionResponse:
         name = fc.name
         args = dict(fc.args or {})
 
@@ -1595,6 +1611,11 @@ class JarvisLive:
                     # is left talking to something that looks like it works.
                     # Rebuilding the session is the only cure; the context is
                     # kept so the conversation survives it.
+                    if self._tool_running:
+                        # Nothing said while a tool runs counts towards deafness.
+                        self._voice_blocks_unheard = 0
+                        self._last_user_speech = time.monotonic()
+
                     _spoke_seconds = self._voice_blocks_unheard * CHUNK_SIZE / SEND_SAMPLE_RATE
                     if (
                         _spoke_seconds > _DEAF_VOICE_SECONDS
