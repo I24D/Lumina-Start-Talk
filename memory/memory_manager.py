@@ -205,7 +205,7 @@ def format_memory_for_prompt(memory: dict | None) -> str:
 
     Point 3 is what makes recall work at all. A model cannot decide to look
     something up if it does not know the thing exists: with only points 1 and 2,
-    "who is Ayse?" would get "I don't know" while ayse_sister sat on disk
+    "who is Lucia?" would get "I don't know" while lucia_sister sat on disk
     unread. The index costs a few hundred characters and turns recall from a
     gamble into a lookup.
 

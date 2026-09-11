@@ -22,20 +22,28 @@ def _get_api_key() -> str:
     with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
         return json.load(f)["gemini_api_key"]
 
+# Month names in the two languages Lumina is spoken to in. Matching is done by
+# substring, so any name that contains a shorter one has to be tested first —
+# that is what _longest_first() guarantees.
 _MONTH_MAP: dict[str, int] = {
+    "january":   1,  "february":  2,  "march":     3,  "april":     4,
+    "may":       5,  "june":      6,  "july":      7,  "august":    8,
+    "september": 9,  "october":  10,  "november": 11,  "december": 12,
 
-    "january": 1, "february": 2, "march": 3,     "april": 4,
-    "may": 5,     "june": 6,     "july": 7,       "august": 8,
-    "september": 9, "october": 10, "november": 11, "december": 12,
-    "ocak": 1,  "şubat": 2,  "mart": 3,   "nisan": 4,
-    "mayıs": 5, "haziran": 6, "temmuz": 7, "ağustos": 8,
-    "eylül": 9, "ekim": 10,  "kasım": 11, "aralık": 12,
+    "enero":      1, "febrero":   2,  "marzo":     3,  "abril":     4,
+    "mayo":       5, "junio":     6,  "julio":     7,  "agosto":    8,
+    "septiembre": 9, "octubre":  10,  "noviembre": 11, "diciembre": 12,
 }
 
-_RELATIVE_MAP_KEYS = {
-    "today", "bugün",
-    "tomorrow", "yarın",
-}
+
+def _longest_first(mapping: dict) -> list:
+    """Longest key first.
+
+    Every lookup here is a substring test, and the first hit wins. Without this
+    ordering 'mañana' would swallow 'pasado mañana' and book the flight a day
+    early — the same trap English sets with 'tomorrow' inside 'day after
+    tomorrow'."""
+    return sorted(mapping.items(), key=lambda kv: -len(kv[0]))
 
 
 def _parse_date(raw: str) -> str:
@@ -53,11 +61,14 @@ def _parse_date(raw: str) -> str:
             pass
 
     relative = {
-        "today": today, "bugün": today,
-        "tomorrow": today + timedelta(days=1),
-        "yarın":    today + timedelta(days=1),
+        "day after tomorrow": today + timedelta(days=2),
+        "pasado mañana":      today + timedelta(days=2),
+        "tomorrow":           today + timedelta(days=1),
+        "mañana":             today + timedelta(days=1),
+        "today":              today,
+        "hoy":                today,
     }
-    for key, val in relative.items():
+    for key, val in _longest_first(relative):
         if key in lower:
             return val.strftime("%Y-%m-%d")
 
@@ -78,7 +89,7 @@ def _parse_date(raw: str) -> str:
     except Exception as e:
         print(f"[FlightFinder] ⚠️ Gemini date parse failed: {e}")
 
-    for month_name, month_num in _MONTH_MAP.items():
+    for month_name, month_num in _longest_first(_MONTH_MAP):
         if month_name in lower:
             day_match = re.search(r"\d{1,2}", raw)
             if day_match:

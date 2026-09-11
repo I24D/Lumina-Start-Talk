@@ -272,7 +272,7 @@ TOOL_DECLARATIONS = [
         "description": (
             "Closes the live camera view shown on screen. "
             "Call when user says: close camera, stop camera, turn off camera, "
-            "kamerayı kapat, kapat, creepy, etc."
+            "cierra la cámara, apaga la cámara, quita la cámara, creepy, etc."
         ),
         "parameters": {"type": "OBJECT", "properties": {}, "required": []}
     },
@@ -644,7 +644,7 @@ TOOL_DECLARATIONS = [
                     "type": "STRING",
                     "description": (
                         "Keyword to search for — a name, a topic, a category "
-                        "(e.g. 'ayse', 'coffee', 'projects'). "
+                        "(e.g. 'lucia', 'coffee', 'projects'). "
                         "Leave empty to list everything stored."
                     ),
                 },
@@ -1974,8 +1974,8 @@ class JarvisLive:
                     _conn_backoff = min(getattr(self, "_conn_backoff", 3) * 2, 60)
                     self._conn_backoff = _conn_backoff
                     self.ui.write_log(
-                        f"NET: Bağlantı kurulamadı — {_conn_backoff}s sonra tekrar deneniyor. "
-                        "(VPN gerekiyor olabilir)"
+                        f"NET: Connection failed — retrying in {_conn_backoff}s. "
+                        "(a VPN may be required)"
                     )
                 else:
                     self._conn_backoff = 3
