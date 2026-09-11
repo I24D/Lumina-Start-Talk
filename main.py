@@ -1621,6 +1621,7 @@ class JarvisLive:
             self.ui.write_log(f"SYS: Speaker '{_spk_name}' unavailable — using system default.")
             stream = _open_spk(None)
 
+        _spoken = 0          # bytes written to the sound card this turn
         try:
             while True:
                 try:
@@ -1634,6 +1635,14 @@ class JarvisLive:
                         and self._turn_done_event.is_set()
                         and self.audio_in_queue.empty()
                     ):
+                        # How much voice actually reached the sound card this
+                        # turn. Zero here, with a reply in the log, is the whole
+                        # difference between "it ignored me" and "it answered
+                        # and I could not hear it".
+                        if _spoken:
+                            print(f"[JARVIS] 🔈 Spoke {_spoken} bytes "
+                                  f"({_spoken / 48000:.1f}s)", flush=True)
+                        _spoken = 0
                         self.set_speaking(False)
                         self._turn_done_event.clear()
                     continue
@@ -1659,8 +1668,13 @@ class JarvisLive:
 
                 try:
                     await asyncio.to_thread(stream.write, bytes(batch))
+                    _spoken += len(batch)
                 except (RuntimeError, asyncio.CancelledError):
-                    break   # executor shutting down — exit cleanly
+                    # Playback ending here is invisible otherwise: the assistant
+                    # goes on answering, the log fills up, and not a sound comes
+                    # out — which is indistinguishable from it ignoring the user.
+                    print(f"[JARVIS] 🔇 Playback stopped after {_spoken} bytes", flush=True)
+                    break
         except Exception as e:
             print(f"[JARVIS] ❌ Play: {e}")
             raise
@@ -2207,6 +2221,11 @@ class JarvisLive:
 
             delay = getattr(self, "_conn_backoff", 3)
             print(f"[JARVIS] Reconnecting in {delay}s...")
+            # Say so on screen, not only on a console nobody has open. A dropped
+            # session is several seconds during which speech reaches no one, and
+            # until now it looked exactly like being ignored — the user keeps
+            # talking to something that is not there.
+            self.ui.write_log(f"SYS: Connection lost — reconnecting in {delay}s.")
             await asyncio.sleep(delay)
 
 def main():
