@@ -105,6 +105,27 @@ _LEVEL_FLOOR = 60.0
 _LEVEL_FULL  = 2600.0
 
 
+# ── Voice-path diagnostics ───────────────────────────────────────────────────
+# Set LUMINA_DIAG=1 to trace the whole voice path: what the microphone captures,
+# whether that audio is actually being forwarded, what Gemini transcribes back,
+# and when a turn closes. "She does not answer me" has several very different
+# causes — a muted or wrong microphone, audio dropped because the assistant was
+# still speaking, or the model hearing perfectly well and choosing to stay quiet
+# — and they are indistinguishable from the outside. Off by default: it prints
+# a line a second while listening.
+_DIAG = _os_environ_get = False
+try:
+    import os as _os_diag
+    _DIAG = _os_diag.environ.get("LUMINA_DIAG", "").lower() not in ("", "0", "false", "no")
+except Exception:
+    _DIAG = False
+
+
+def _diag(msg: str) -> None:
+    if _DIAG:
+        print(f"[DIAG {time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
 def _pcm_level(samples) -> float:
     """Map a block of int16 PCM samples to a 0.0–1.0 loudness level for the HUD
     waveform. Returns 0.0 on empty/invalid input so it can never raise."""
@@ -1406,6 +1427,13 @@ class JarvisLive:
                         if sc.output_transcription and sc.output_transcription.text:
                             txt = _clean_transcript(sc.output_transcription.text)
                             if txt and txt != (out_buf[-1] if out_buf else ""):
+                                # First fragment of this turn: the moment the
+                                # assistant actually starts answering. Paired
+                                # with the 🎧 lines above it gives the real
+                                # speech-to-reply latency, instead of guessing
+                                # from when the log finished drawing.
+                                if not out_buf:
+                                    print("[JARVIS] 💬 replying...", flush=True)
                                 out_buf.append(txt)
 
                         if sc.input_transcription and sc.input_transcription.text:
@@ -1413,6 +1441,26 @@ class JarvisLive:
                             if txt:
                                 in_buf.append(txt)
                                 self._last_user_speech = time.monotonic()
+
+                                # Also on the console, fragment by fragment.
+                                # "Heard:" below prints at turn_complete, which
+                                # is after the assistant has already answered —
+                                # useless for telling whether speech is arriving
+                                # while it is being spoken.
+                                print(f"[JARVIS] 🎧 {txt}", flush=True)
+
+                                # Show the words as they are recognised. The
+                                # finished line is still written at
+                                # turn_complete; until then this is the only
+                                # sign the microphone is being heard at all,
+                                # and its absence is indistinguishable from the
+                                # assistant ignoring the user.
+                                try:
+                                    self.ui.set_live_transcript(
+                                        f"You: {' '.join(in_buf)}"
+                                    )
+                                except Exception:
+                                    pass
 
                                 # Checked here rather than at turn_complete: if
                                 # the model has gone quiet there may never be a
@@ -1429,6 +1477,17 @@ class JarvisLive:
                             if self._turn_done_event:
                                 self._turn_done_event.set()
 
+                            # The turn is over, so the preview has nothing left
+                            # to preview. Writing the finished "You:" line takes
+                            # it down too, but a turn that produced no speech
+                            # writes no line — and the stale preview would sit
+                            # there looking like the assistant was still hearing
+                            # something.
+                            try:
+                                self.ui.set_live_transcript("")
+                            except Exception:
+                                pass
+
                             # If this turn_complete ends an interrupted response, clear the
                             # flag and skip all further processing for that turn.
                             if self._interrupted:
@@ -1439,6 +1498,11 @@ class JarvisLive:
 
                             full_in = " ".join(in_buf).strip()
                             if full_in:
+                                # Also on the console: when the assistant seems
+                                # not to hear, the first thing worth knowing is
+                                # whether the words ever arrived, and the HUD
+                                # alone cannot be read from a log.
+                                print(f"[JARVIS] 🗣  Heard: {full_in}")
                                 self.ui.write_log(f"You: {full_in}")
                                 self._session_log.append(f"User: {full_in}")
                                 if self._dashboard:

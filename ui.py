@@ -750,6 +750,12 @@ class MetricBar(QWidget):
 
         p.end()
 
+# Backlog, in characters, that still gets the character-by-character animation.
+# Roughly one spoken sentence: short enough that a reply never has to queue
+# behind a long one, generous enough that ordinary lines still type out.
+_TYPE_SMOOTH_CHARS = 160
+
+
 class LogWidget(QTextEdit):
     _sig = pyqtSignal(str)
 
@@ -783,6 +789,11 @@ class LogWidget(QTextEdit):
         self._pos     = 0
         self._tag     = "sys"
         self._ai_name_lc = APP_NAME.lower()   # updated when assistant name changes
+        # The provisional line showing what the user is saying right now.
+        # _live_len is how many characters of it are currently drawn, so the
+        # next update knows exactly how much to take back off the end.
+        self._live_len     = 0
+        self._live_pending = ""
         self._tmr = QTimer(self)
         self._tmr.timeout.connect(self._step)
         self._sig.connect(self._enqueue)
@@ -790,7 +801,38 @@ class LogWidget(QTextEdit):
     def append_log(self, text: str):
         self._sig.emit(text)
 
+    def set_live(self, text: str):
+        """Show what the user is saying before their turn has closed.
+
+        Written straight into the document instead of through the typewriter
+        queue. This line is rewritten several times a second as the transcript
+        grows, and animating it character by character would put it further
+        behind the speaker with every update — the opposite of the point."""
+        if self._typing:
+            # The typewriter owns the end of the document while it runs; show
+            # this the moment it lets go.
+            self._live_pending = text
+            return
+        self._render_live(text)
+
+    def _render_live(self, text: str):
+        cur = self.textCursor()
+        cur.movePosition(cur.MoveOperation.End)
+        for _ in range(self._live_len):
+            cur.deletePreviousChar()
+        self._live_len = 0
+        if text:
+            fmt = cur.charFormat()
+            fmt.setForeground(QBrush(qcol(C.TEXT_DIM)))
+            cur.insertText(text, fmt)
+            self._live_len = len(text)
+        self.setTextCursor(cur)
+        self.ensureCursorVisible()
+
     def _enqueue(self, text: str):
+        # A real log line supersedes the provisional one it was previewing.
+        self._live_pending = ""
+        self._render_live("")
         self._queue.append(text)
         if not self._typing:
             self._next()
@@ -798,6 +840,9 @@ class LogWidget(QTextEdit):
     def _next(self):
         if not self._queue:
             self._typing = False
+            if self._live_pending:
+                self._render_live(self._live_pending)
+                self._live_pending = ""
             return
         self._typing = True
         self._text   = self._queue.pop(0)
@@ -813,7 +858,19 @@ class LogWidget(QTextEdit):
 
     def _step(self):
         if self._pos < len(self._text):
-            ch  = self._text[self._pos]
+            # How far behind the log is: what is left of this line plus
+            # everything still queued behind it.
+            backlog = (len(self._text) - self._pos) + sum(len(t) for t in self._queue)
+
+            # One character per tick is 6 ms per character, which is a pleasant
+            # 0.3 s for a short line and over half a minute once a news briefing
+            # is queued. Everything after it waits — including the user's own
+            # words, so speaking appears to do nothing at all and the assistant
+            # looks deaf. Past a line's worth of backlog, the animation gives
+            # way to catching up.
+            span = 1 if backlog <= _TYPE_SMOOTH_CHARS else max(2, backlog // 40)
+            chunk = self._text[self._pos : self._pos + span]
+
             cur = self.textCursor()
             fmt = cur.charFormat()
             col = {
@@ -825,10 +882,10 @@ class LogWidget(QTextEdit):
             }.get(self._tag, qcol(C.TEXT))
             fmt.setForeground(QBrush(col))
             cur.movePosition(cur.MoveOperation.End)
-            cur.insertText(ch, fmt)
+            cur.insertText(chunk, fmt)
             self.setTextCursor(cur)
             self.ensureCursorVisible()
-            self._pos += 1
+            self._pos += len(chunk)
         else:
             self._tmr.stop()
             cur = self.textCursor()
@@ -2581,6 +2638,7 @@ class RemoteKeyOverlay(QWidget):
 
 class MainWindow(QMainWindow):
     _log_sig        = pyqtSignal(str)
+    _live_sig       = pyqtSignal(str)   # partial transcript, replaced as it grows
     _state_sig      = pyqtSignal(str)
     _content_sig    = pyqtSignal(str, str)   # (title, text) — thread-safe content display
     _reconfig_sig   = pyqtSignal()           # trigger setup overlay from any thread
@@ -2732,6 +2790,7 @@ class MainWindow(QMainWindow):
         self._update_metrics()
 
         self._log_sig.connect(self._log.append_log)
+        self._live_sig.connect(self._log.set_live)
         self._state_sig.connect(self._apply_state)
         self._content_sig.connect(self._show_content)
         self._reconfig_sig.connect(self._show_setup)
@@ -4347,6 +4406,13 @@ class JarvisUI:
 
     def write_log(self, text: str):
         self._win._log_sig.emit(text)
+
+    def set_live_transcript(self, text: str):
+        """Thread-safe: show the user's speech as it is being transcribed.
+
+        Pass "" to take the provisional line down. Writing a real log line
+        clears it too, so the finished turn replaces the preview by itself."""
+        self._win._live_sig.emit(text)
 
     def wait_for_api_key(self):
         while not self._win._ready:
