@@ -105,6 +105,13 @@ LIVE_MODEL          = "models/gemini-2.5-flash-native-audio-preview-12-2025"
 # the device stopped, not that nobody spoke. Long enough that a brief hiccup
 # does not trigger a needless reopen.
 _MIC_STALL_SECONDS  = 6.0
+
+# How much real speech has to go unheard before the session is treated as deaf.
+# Generous on purpose: a false alarm costs a reconnect in the middle of a
+# conversation, and several seconds of speech with no transcription at all is
+# already well outside anything normal.
+_DEAF_VOICE_SECONDS   = 4.0
+_DEAF_SILENCE_SECONDS = 20.0
 CHANNELS            = 1
 SEND_SAMPLE_RATE    = 16000
 RECEIVE_SAMPLE_RATE = 24000
@@ -202,6 +209,38 @@ def _normalise_for_wake(text: str) -> str:
     """Lowercase, unaccented, punctuation-free — so 'Lumina, ¡activate!' matches."""
     text = text.lower().translate(_WAKE_ACCENTS)
     return re.sub(r"\s+", " ", _WAKE_STRIP_RE.sub(" ", text)).strip()
+
+
+# ── Closing the session ──────────────────────────────────────────────────────
+# Shutting down is the one action with no undo: the window goes, and whatever
+# the user was in the middle of goes with it. Left to the model's judgement it
+# fired on "muchas gracias" and ended a working session, so judgement is no
+# longer what decides it. One phrase does, checked here against the transcript
+# exactly the way the wake phrases are — because a rule the code enforces
+# cannot be talked out of.
+#
+# Both languages, and the article is optional because speech transcription is
+# not reliable about small words. Nothing else counts: not goodbye, not thanks,
+# not "that's all".
+_CLOSE_TEMPLATES = (
+    "cierra sesion",
+    "cierra la sesion",
+    "cerrar sesion",
+    "close session",
+    "close the session",
+)
+
+# How long a heard close phrase stays valid. The model often takes a turn to
+# act on it, and requiring the same turn would make a deliberate instruction
+# fail at random. Long enough to survive that, short enough that a phrase from
+# earlier in the day can never close anything.
+_CLOSE_PHRASE_SECONDS = 90
+
+
+def _is_close_phrase(text: str) -> bool:
+    """Did the user actually ask to close the session, in either language?"""
+    haystack = _normalise_for_wake(text)
+    return any(phrase in haystack for phrase in _CLOSE_TEMPLATES)
 
 
 def _is_wake_phrase(text: str, assistant_name: str) -> bool:
@@ -593,17 +632,15 @@ TOOL_DECLARATIONS = [
         "description": (
             "Shuts the assistant down completely: everything stops, the window closes, and the "
             "session is over. There is no undo. "
-            "Call it ONLY when the user unmistakably asks for exactly that, in any language: "
-            "'apagate', 'cierrate', 'apaga a Lumina', 'shut down', 'close Lumina', 'turn "
-            "yourself off', 'stop the assistant'. "
-            "COURTESY IS NOT A SHUTDOWN REQUEST. 'Muchas gracias', 'gracias', 'thank you', "
-            "'perfecto', 'ok', 'listo', 'bye', 'hasta luego', 'good night' and anything else "
-            "that merely sounds like the end of a topic must NEVER call this. Someone who "
-            "thanks you expects you to still be there afterwards. "
-            "This is not hypothetical: a 'muchas gracias' closed the assistant in the middle of "
-            "a working session and the user lost what they were doing. "
-            "If there is any doubt at all, do not call it — ask. Being wrong here costs the user "
-            "everything they had open; being right one turn later costs nothing."
+            "There is exactly ONE trigger, and it is a phrase, not an intention: the user says "
+            "'cierra sesion' (Spanish) or 'close session' (English). Nothing else closes Lumina. "
+            "Not 'gracias', not 'muchas gracias', not 'thank you', not 'adios', not 'bye', not "
+            "'hasta luego', not 'good night', not 'apagate', not 'ya terminamos' — none of these, "
+            "however final they sound. Someone who thanks you expects you to still be there. "
+            "This is enforced in code as well: the transcript is checked for the phrase, and if it "
+            "is not there the shutdown is refused no matter how sure you are. Calling it without "
+            "the phrase wastes a turn and tells the user you tried to close on them. "
+            "If they seem to want to finish, say the phrase they need rather than guessing."
         ),
         "parameters": {
             "type": "OBJECT",
@@ -884,6 +921,15 @@ class JarvisLive:
         self._proactive        = ProactiveEngine()
         self._last_user_speech = time.monotonic()  # updated on every user utterance
         self._session_log: list[str] = []          # conversation turns for end-of-session summary
+        # When the close-session phrase was last actually heard. shutdown_jarvis
+        # refuses unless this is recent, so no amount of model confidence can
+        # end the session on its own.
+        self._close_heard_at = 0.0
+        self._session_started = time.monotonic()
+        # Blocks of real speech forwarded since the session last transcribed
+        # anything. The difference between "nobody is talking" and "they are
+        # talking and it is not arriving" is invisible without this.
+        self._voice_blocks_unheard = 0
 
         # Tracked apart because models support them apart: gemini-3.1-flash-live
         # takes proactive audio and refuses affective dialog. Bundled together,
@@ -1045,6 +1091,10 @@ class JarvisLive:
 
         if not self._loop or not self.session:
             return
+
+        if _is_close_phrase(text):
+            self._close_heard_at = time.monotonic()
+            print("[JARVIS] 🔒 Close-session phrase typed", flush=True)
 
         # Recorded here rather than at turn_complete. Typed text never reaches
         # input_transcription, and holding it until the next completed turn
@@ -1368,6 +1418,23 @@ class JarvisLive:
                     result = "Specify action (add/remove/list) and a topic."
 
             elif name == "shutdown_jarvis":
+                # The model asks; the transcript decides. This tool used to fire
+                # on "muchas gracias" and end a working session, and a shutdown
+                # cannot be taken back — so nothing closes unless the user
+                # actually said the phrase, checked locally on what was heard.
+                _since = time.monotonic() - self._close_heard_at
+                if self._close_heard_at <= 0 or _since > _CLOSE_PHRASE_SECONDS:
+                    print("[JARVIS] 🔒 Shutdown refused — close phrase not heard", flush=True)
+                    result = (
+                        "I am not closing. Shutting down ends the session and cannot be undone, "
+                        "so I only do it when the user says 'cierra sesión' or 'close session'. "
+                        "Tell them that is the phrase, and carry on."
+                    )
+                    if not self.ui.muted:
+                        self.ui.set_state("LISTENING")
+                    print(f"[JARVIS] 📤 {name} → {str(result)[:80]}")
+                    return types.FunctionResponse(id=fc.id, name=name, response={"result": result})
+
                 self.ui.write_log("SYS: Shutdown requested.")
                 async def _do_shutdown():
                     await self._save_session_summary()
@@ -1433,6 +1500,14 @@ class JarvisLive:
                     self.out_queue.put_nowait,
                     {"data": data, "mime_type": "audio/pcm"}
                 )
+                # Counted here rather than at the top of the callback: only
+                # audio that was actually sent can be evidence that sending is
+                # not working.
+                try:
+                    if _pcm_level(indata) > 0.02:
+                        self._voice_blocks_unheard += 1
+                except Exception:
+                    pass
                 # Feed the live mic level to the HUD so the waveform reacts to
                 # the user's actual voice while listening. Purely cosmetic — any
                 # failure here must never disturb the mic.
@@ -1500,6 +1575,29 @@ class JarvisLive:
                         # Muting stops nothing at the device, but there is no
                         # sense reopening hardware the user has switched off.
                         self._last_mic_block = time.monotonic()
+                        continue
+
+                    # A second, different deafness. The check below reopens a
+                    # device that stopped delivering. This one is for the case
+                    # that keeps happening instead: the device delivers, the
+                    # HUD says LISTENING, the level meter moves — and the
+                    # session transcribes nothing, because the connection is
+                    # alive enough to answer typed text and no longer hears
+                    # audio. Nothing raises, so nothing recovers, and the user
+                    # is left talking to something that looks like it works.
+                    # Rebuilding the session is the only cure; the context is
+                    # kept so the conversation survives it.
+                    _spoke_seconds = self._voice_blocks_unheard * CHUNK_SIZE / SEND_SAMPLE_RATE
+                    if (
+                        _spoke_seconds > _DEAF_VOICE_SECONDS
+                        and (time.monotonic() - self._last_user_speech) > _DEAF_SILENCE_SECONDS
+                    ):
+                        self._voice_blocks_unheard = 0
+                        print(f"[JARVIS] 🙉 {_spoke_seconds:.0f}s of speech sent and nothing "
+                              f"transcribed — rebuilding the session", flush=True)
+                        self.ui.write_log("SYS: I stopped hearing you — reconnecting.")
+                        self.request_reconnect(keep_context=True,
+                                               reason="microphone not reaching the model")
                         continue
 
                     silent_for = time.monotonic() - self._last_mic_block
@@ -1582,7 +1680,32 @@ class JarvisLive:
                                 # speech-to-reply latency, instead of guessing
                                 # from when the log finished drawing.
                                 if not out_buf:
-                                    print("[JARVIS] 💬 replying...", flush=True)
+                                    # How long the user actually waited, and how
+                                    # much audio is still queued behind this
+                                    # reply. "It takes a while after talking for
+                                    # a bit" is a claim about a number that was
+                                    # never printed: the console had no clock,
+                                    # so a session that got slower over an hour
+                                    # looked exactly like one that did not.
+                                    _backlog = self.audio_in_queue.qsize() if self.audio_in_queue else 0
+                                    _held = f", {_backlog} chunks still queued" if _backlog else ""
+                                    _age = (time.monotonic() - self._session_started) / 60.0
+
+                                    # Only a turn the user actually spoke in has
+                                    # a wait worth reporting. _last_user_speech
+                                    # is stamped at startup, so on a briefing —
+                                    # which nobody asked for — it measures time
+                                    # since the app opened and reads as a
+                                    # twenty-second delay that never happened.
+                                    if in_buf:
+                                        _lag = time.monotonic() - self._last_user_speech
+                                        _when = f"{_lag:.1f}s after you stopped"
+                                    else:
+                                        _when = "unprompted"
+
+                                    print(f"[JARVIS] 💬 replying... ({_when}, "
+                                          f"{_age:.0f} min into the session"
+                                          f"{_held})", flush=True)
                                 out_buf.append(txt)
 
                         if sc.input_transcription and sc.input_transcription.text:
@@ -1590,6 +1713,7 @@ class JarvisLive:
                             if txt:
                                 in_buf.append(txt)
                                 self._last_user_speech = time.monotonic()
+                                self._voice_blocks_unheard = 0
 
                                 # Also on the console, fragment by fragment.
                                 # "Heard:" below prints at turn_complete, which
@@ -1597,6 +1721,10 @@ class JarvisLive:
                                 # useless for telling whether speech is arriving
                                 # while it is being spoken.
                                 print(f"[JARVIS] 🎧 {txt}", flush=True)
+
+                                if _is_close_phrase(" ".join(in_buf)):
+                                    self._close_heard_at = time.monotonic()
+                                    print("[JARVIS] 🔒 Close-session phrase heard", flush=True)
 
                                 # Show the words as they are recognised. The
                                 # finished line is still written at
@@ -1818,6 +1946,15 @@ class JarvisLive:
         _CHOP_MAX = 1.5
         _pauses = 0
 
+        # Knowing the gaps are ours is not the same as knowing where they come
+        # from. Giving the writes a thread of their own removed some and left
+        # twelve of fourteen in a later turn, so the remaining time is being
+        # spent somewhere else in this loop. These three cover everywhere it
+        # can go: waiting on the queue, drawing the HUD, and the write itself.
+        _t_wait = 0.0
+        _t_level = 0.0
+        _t_write = 0.0
+
         # Two very different faults sound identical. If the sound card ran dry
         # while audio was already sitting in the queue, this loop starved it and
         # the fix is here. If the queue was empty, the audio had simply not
@@ -1835,11 +1972,13 @@ class JarvisLive:
 
         try:
             while True:
+                _t0 = time.monotonic()
                 try:
                     chunk = await asyncio.wait_for(
                         self.audio_in_queue.get(),
                         timeout=0.1
                     )
+                    _t_wait += time.monotonic() - _t0
                 except asyncio.TimeoutError:
                     if (
                         self._turn_done_event
@@ -1855,6 +1994,9 @@ class JarvisLive:
                                      f" ({_ours} ours, {_gaps - _ours} waiting on the model)"
                                      if _gaps else "")
                             _paused = f", paused {_pauses}×" if _pauses else ""
+                            if _gaps:
+                                _paused += (f" [wait {_t_wait:.1f}s, hud {_t_level:.1f}s, "
+                                            f"write {_t_write:.1f}s]")
                             print(f"[JARVIS] 🔈 Spoke {_spoken} bytes "
                                   f"({_spoken / 48000:.1f}s){_chop}{_paused}", flush=True)
                         _spoken = 0
@@ -1862,6 +2004,7 @@ class JarvisLive:
                         _gap_ms = 0.0
                         _ours = 0
                         _pauses = 0
+                        _t_wait = _t_level = _t_write = 0.0
                         _dry_at = 0.0
                         self.set_speaking(False)
                         self._turn_done_event.clear()
@@ -1910,14 +2053,18 @@ class JarvisLive:
                 _dry_at = max(_now, _dry_at) + len(batch) / 48000.0
 
                 # Drive the HUD waveform from JARVIS's own voice while speaking.
+                _t0 = time.monotonic()
                 try:
                     self.ui.set_audio_level(_pcm_level(
                         np.frombuffer(bytes(batch), dtype=np.int16)))
                 except Exception:
                     pass
+                _t_level += time.monotonic() - _t0
 
                 try:
+                    _t0 = time.monotonic()
                     await loop.run_in_executor(_writer, stream.write, bytes(batch))
+                    _t_write += time.monotonic() - _t0
                     _spoken += len(batch)
                 except (RuntimeError, asyncio.CancelledError):
                     # Playback ending here is invisible otherwise: the assistant
@@ -2323,6 +2470,11 @@ class JarvisLive:
                     self._vision_last_time     = 0.0
                     self._interrupted          = False
 
+                    # Stamped so the reply-latency line can say how old this
+                    # session was when it answered. A session that slows down
+                    # the longer it runs and one that is simply slow today look
+                    # identical without it.
+                    self._session_started = time.monotonic()
                     print("[JARVIS] Connected.")
                     if _resumed_with:
                         # Say it plainly: the difference between "it reconnected"
