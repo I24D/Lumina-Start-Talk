@@ -110,8 +110,15 @@ _MIC_STALL_SECONDS  = 6.0
 # Generous on purpose: a false alarm costs a reconnect in the middle of a
 # conversation, and several seconds of speech with no transcription at all is
 # already well outside anything normal.
-_DEAF_VOICE_SECONDS   = 4.0
-_DEAF_SILENCE_SECONDS = 20.0
+# Deliberately conservative, because the first version was not and turned one
+# fault into a worse one: it reset the voice counter when it fired but not the
+# silence clock, so the condition was still true the instant the new session
+# came up and it reconnected in a loop. A level of 0.02 also counts a quiet
+# room as somebody talking.
+_DEAF_VOICE_SECONDS   = 8.0     # this much *clear* speech, not this much sound
+_DEAF_SILENCE_SECONDS = 25.0
+_DEAF_VOICE_LEVEL     = 0.15    # well above a room; a person talking clears it
+_DEAF_COOLDOWN        = 120.0   # never rebuild more often than this
 CHANNELS            = 1
 SEND_SAMPLE_RATE    = 16000
 RECEIVE_SAMPLE_RATE = 24000
@@ -930,6 +937,7 @@ class JarvisLive:
         # anything. The difference between "nobody is talking" and "they are
         # talking and it is not arriving" is invisible without this.
         self._voice_blocks_unheard = 0
+        self._last_deaf_rebuild = 0.0
 
         # Tracked apart because models support them apart: gemini-3.1-flash-live
         # takes proactive audio and refuses affective dialog. Bundled together,
@@ -1504,7 +1512,7 @@ class JarvisLive:
                 # audio that was actually sent can be evidence that sending is
                 # not working.
                 try:
-                    if _pcm_level(indata) > 0.02:
+                    if _pcm_level(indata) > _DEAF_VOICE_LEVEL:
                         self._voice_blocks_unheard += 1
                 except Exception:
                     pass
@@ -1591,8 +1599,13 @@ class JarvisLive:
                     if (
                         _spoke_seconds > _DEAF_VOICE_SECONDS
                         and (time.monotonic() - self._last_user_speech) > _DEAF_SILENCE_SECONDS
+                        and (time.monotonic() - self._last_deaf_rebuild) > _DEAF_COOLDOWN
                     ):
                         self._voice_blocks_unheard = 0
+                        self._last_deaf_rebuild = time.monotonic()
+                        # Both clocks restart, not just the counter. Leaving
+                        # this one stale is exactly what caused the loop.
+                        self._last_user_speech = time.monotonic()
                         print(f"[JARVIS] 🙉 {_spoke_seconds:.0f}s of speech sent and nothing "
                               f"transcribed — rebuilding the session", flush=True)
                         self.ui.write_log("SYS: I stopped hearing you — reconnecting.")
