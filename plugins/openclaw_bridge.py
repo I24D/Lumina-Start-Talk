@@ -29,7 +29,9 @@ import json
 import os
 import platform
 import shutil
+import pathlib
 import socket
+import sqlite3
 import subprocess
 import threading
 import time
@@ -53,7 +55,9 @@ PLUGIN = {
         "'tell OpenClaw to...'. Put the question itself in 'text'. "
         "action='connect' prepares the connection without asking anything: 'conéctate con Open "
         "Claw', 'conéctate a Open Claw', 'connect to Open Claw', 'connect to OpenClaw'. "
-        "action='read' repeats the most recent answer: 'léeme la respuesta de Open Claw', "
+        "action='read' repeats the most recent answer, and recovers it from OpenClaw's own "
+        "stored conversation when Lumina has been restarted since — so it is the right tool "
+        "for 'what did Open Claw answer?' even at the start of a session: 'léeme la respuesta de Open Claw', "
         "'qué respondió Open Claw', 'read Open Claw's answer', 'what did OpenClaw say'. "
         "action='close' disconnects the bridge: 'desconéctate de Open Claw', 'cierra la conexión "
         "con Open Claw', 'disconnect from Open Claw', 'close the OpenClaw connection'."
@@ -306,6 +310,38 @@ def _stop_owned_gateway() -> None:
     _gateway_started_by_bridge = False
 
 
+def _describe_parts(items: Any) -> str:
+    """Turn OpenClaw's reply parts into something that can be said out loud.
+
+    Reading only the "text" parts looked complete until OpenClaw answered with
+    a picture. A request to generate an image comes back as a part of type
+    "image" carrying no text at all, the extractor found nothing, and the run
+    fell through to the error reporter — which, finding no error either, read
+    out the last line of the CLI's pretty-printed JSON and told the user
+    "OpenClaw could not answer: }". The image had in fact been generated.
+
+    So a part with no text is still an answer; it just has to be described
+    rather than quoted.
+    """
+    if not isinstance(items, list):
+        return ""
+
+    said: list[str] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        text = str(item.get("text", "")).strip()
+        if text:
+            said.append(text)
+            continue
+        kind = str(item.get("type", "")).strip().lower()
+        if kind in ("image", "photo", "picture"):
+            said.append("OpenClaw produced an image.")
+        elif kind in ("audio", "video", "file", "document"):
+            said.append(f"OpenClaw produced {kind} content.")
+    return "\n".join(said)
+
+
 def _agent_answer(question: str, timeout: int, local: bool) -> tuple[str, str]:
     arguments = ["agent"]
     if local:
@@ -336,13 +372,9 @@ def _agent_answer(question: str, timeout: int, local: bool) -> tuple[str, str]:
             items = payload.get("payloads")
             if not isinstance(items, list):
                 continue
-            texts = [
-                str(item.get("text", "")).strip()
-                for item in items
-                if isinstance(item, dict) and str(item.get("text", "")).strip()
-            ]
-            if texts:
-                return "\n".join(texts), ""
+            spoken = _describe_parts(items)
+            if spoken:
+                return spoken, ""
     return "", _result_error(result)
 
 
@@ -411,11 +443,18 @@ def _deliver(question: str, answer: str, player=None) -> None:
         except Exception:
             pass
 
+    # The marker is not decoration. Without it this lands as an ordinary user
+    # turn, and a model handed "OpenClaw has just answered..." reads it as the
+    # user making conversation: the first attempt answered "I have already put
+    # the question to OpenClaw and am waiting for the response" — in English,
+    # because an injected English sentence had become the latest user message.
+    # core/prompt.txt recognises [DELAYED_ANSWER] the way it already recognises
+    # [SYSTEM_ALERT] and [STARTUP_BRIEFING].
     _say(
         player,
-        "OpenClaw has just answered the question you sent it a while ago "
-        f"('{question[:120]}'). Tell the user its answer has arrived, then give "
-        "it to them.\n\n" + _ANSWER_IN_DEPTH + spoken,
+        "[DELAYED_ANSWER] OpenClaw has finished the question you sent it "
+        f"earlier ('{question[:120]}'). Its answer follows.\n\n"
+        + _ANSWER_IN_DEPTH + spoken,
     )
 
 
@@ -475,6 +514,72 @@ def _act_ask(question: str, timeout: int, player=None) -> str:
     )
 
 
+def _session_store() -> pathlib.Path:
+    """Where OpenClaw keeps this agent's conversations on disk."""
+    root = os.environ.get("OPENCLAW_STATE_DIR", "").strip()
+    base = pathlib.Path(root) if root else pathlib.Path.home() / ".openclaw"
+    return base / "agents" / _AGENT_ID / "agent" / "openclaw-agent.sqlite"
+
+
+def _stored_answer() -> str:
+    """The last thing OpenClaw actually said, read back from its own session.
+
+    _last_answer only lives as long as this process, so every restart of Lumina
+    threw away an answer OpenClaw had already given — and restarts happen for
+    reasons that have nothing to do with the question: a crash, an update, a
+    change to the code. The user would ask her to read the answer and be told
+    none had ever arrived, which was false.
+
+    OpenClaw keeps the conversation itself, so that is where the answer is
+    recovered from. The database is opened read-only and never written to: it
+    belongs to OpenClaw, this is only reading the chat. If the shape of that
+    store ever changes, this returns nothing and the bridge behaves exactly as
+    it did before — a recovered answer is a bonus, never a dependency.
+    """
+    store = _session_store()
+    if not store.exists():
+        return ""
+
+    key = f"agent:{_AGENT_ID}:{_SESSION_KEY}"
+    connection = None
+    try:
+        connection = sqlite3.connect(
+            f"file:{store.as_posix()}?mode=ro", uri=True, timeout=2.0
+        )
+        row = connection.execute(
+            "select current_session_id from session_nodes where session_key = ?",
+            (key,),
+        ).fetchone()
+        if not row or not row[0]:
+            return ""
+
+        # Newest first, and only far enough back to cross a few tool events.
+        for (event_json,) in connection.execute(
+            "select event_json from transcript_events "
+            "where session_id = ? order by seq desc limit 100",
+            (row[0],),
+        ):
+            try:
+                message = (json.loads(event_json) or {}).get("message")
+            except Exception:
+                continue
+            if not isinstance(message, dict) or message.get("role") != "assistant":
+                continue
+            said = _describe_parts(message.get("content"))
+            if said:
+                return said
+        return ""
+    except Exception as exc:
+        print(f"[OpenClaw] could not read the stored session: {type(exc).__name__}: {exc}")
+        return ""
+    finally:
+        if connection is not None:
+            try:
+                connection.close()
+            except Exception:
+                pass
+
+
 def _act_read() -> str:
     with _job_lock:
         pending = _job_question
@@ -490,6 +595,12 @@ def _act_read() -> str:
         return note + " The previous answer was:\n" + _ANSWER_IN_DEPTH + _last_answer
 
     if not _last_answer:
+        recovered = _stored_answer()
+        if recovered:
+            globals()["_last_answer"] = recovered
+            print(f"[OpenClaw] recovered the last answer from its session store "
+                  f"({len(recovered)} chars)")
+            return _ANSWER_IN_DEPTH + recovered
         return "OpenClaw has not answered a question in this Lumina session yet."
     return _ANSWER_IN_DEPTH + _last_answer
 

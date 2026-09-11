@@ -1726,12 +1726,41 @@ class JarvisLive:
             print(f"[JARVIS] 🔊 Output device: {_spk_name}")
 
         def _open_spk(dev):
+            try:
+                return _open_spk_buffered(dev)
+            except Exception as _le:
+                # A device that will not grant the larger buffer still has to
+                # play. Losing the cushion is a worse voice, not no voice.
+                print(f"[Audio] output: large buffer refused ({_le}) — using the default one")
+                return _open_spk_plain(dev)
+
+        def _open_spk_plain(dev):
             st = sd.RawOutputStream(
                 samplerate=RECEIVE_SAMPLE_RATE,
                 channels=CHANNELS,
                 dtype="int16",
                 blocksize=CHUNK_SIZE,
                 device=dev,
+            )
+            st.start()
+            return st
+
+        def _open_spk_buffered(dev):
+            st = sd.RawOutputStream(
+                samplerate=RECEIVE_SAMPLE_RATE,
+                channels=CHANNELS,
+                dtype="int16",
+                blocksize=CHUNK_SIZE,
+                device=dev,
+                # The transport probe in core/audio_devices rules out every host
+                # API that only pretends to play, and on this machine the one
+                # left standing is MME — the oldest and least forgiving. A
+                # blocksize of 1024 is 43 ms of cushion, and speech that arrives
+                # over a network does not arrive that evenly: the card runs dry
+                # between packets and the voice comes out chopped. Asking for a
+                # high-latency buffer costs a fraction of a second before she
+                # starts and buys the slack that keeps her continuous.
+                latency="high",
             )
             st.start()
             return st
@@ -1749,6 +1778,33 @@ class JarvisLive:
             stream = _open_spk(None)
 
         _spoken = 0          # bytes written to the sound card this turn
+
+        # Choppy speech is not a matter of opinion, so it gets measured rather
+        # than argued about. _dry_at is when the sound card is expected to run
+        # out of the audio already handed to it; arriving later than that means
+        # it sat silent in the middle of a sentence, which is exactly what the
+        # user hears as cutting out.
+        _dry_at = 0.0
+        _gaps = 0
+        _gap_ms = 0.0
+
+        # Not every silence is a fault. A turn that stops to run a tool — a web
+        # search, a memory lookup — legitimately sends no audio for seconds, and
+        # counting that as choppy speech would point the diagnosis at the sound
+        # card every single time she looks something up. Starvation is a buffer
+        # running out: tens of milliseconds, a few hundred at worst. Past this,
+        # she was thinking, not stuttering.
+        _CHOP_MAX = 1.5
+        _pauses = 0
+
+        # Speech starts the moment the first 50 ms slice lands, which leaves the
+        # card with 50 ms of cushion against a network that delivers in bursts.
+        # Holding back a fifth of a second before the first write is inaudible
+        # as delay and is the difference between continuous speech and a stutter
+        # at the start of every answer.
+        _PRIME_BYTES = 9600          # 200 ms at 24 kHz / 16-bit mono
+        _PRIME_WAIT = 0.35           # never hold speech longer than this
+
         try:
             while True:
                 try:
@@ -1767,9 +1823,16 @@ class JarvisLive:
                         # difference between "it ignored me" and "it answered
                         # and I could not hear it".
                         if _spoken:
+                            _chop = (f", chopped {_gaps}× for {_gap_ms:.0f} ms"
+                                     if _gaps else "")
+                            _paused = f", paused {_pauses}×" if _pauses else ""
                             print(f"[JARVIS] 🔈 Spoke {_spoken} bytes "
-                                  f"({_spoken / 48000:.1f}s)", flush=True)
+                                  f"({_spoken / 48000:.1f}s){_chop}{_paused}", flush=True)
                         _spoken = 0
+                        _gaps = 0
+                        _gap_ms = 0.0
+                        _pauses = 0
+                        _dry_at = 0.0
                         self.set_speaking(False)
                         self._turn_done_event.clear()
                     continue
@@ -1785,6 +1848,31 @@ class JarvisLive:
                         batch.extend(self.audio_in_queue.get_nowait())
                     except asyncio.QueueEmpty:
                         break
+
+                # First write of a turn: wait, briefly, for a cushion. Every
+                # later write already has the card playing ahead of it.
+                if not _spoken:
+                    _prime_until = time.monotonic() + _PRIME_WAIT
+                    while len(batch) < _PRIME_BYTES and time.monotonic() < _prime_until:
+                        try:
+                            batch.extend(
+                                await asyncio.wait_for(
+                                    self.audio_in_queue.get(), timeout=0.05
+                                )
+                            )
+                        except (asyncio.TimeoutError, asyncio.CancelledError):
+                            break
+
+                # Did the card run dry before this batch reached it?
+                _now = time.monotonic()
+                if _spoken and _now > _dry_at + 0.02:
+                    _silence = _now - _dry_at
+                    if _silence <= _CHOP_MAX:
+                        _gaps += 1
+                        _gap_ms += _silence * 1000
+                    else:
+                        _pauses += 1
+                _dry_at = max(_now, _dry_at) + len(batch) / 48000.0
 
                 # Drive the HUD waveform from JARVIS's own voice while speaking.
                 try:
