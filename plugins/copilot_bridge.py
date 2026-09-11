@@ -78,7 +78,13 @@ PLUGIN = {
             },
             "text": {
                 "type": "STRING",
-                "description": "The question or message to put to Copilot. Required for action='ask'.",
+                "description": (
+                    "The question or message to put to Copilot. Required for action='ask'. "
+                    "Write it in the language the user asked in. This is not a machine parameter: "
+                    "it is a question for another assistant, and Copilot answers in whatever "
+                    "language it is asked, so an English question means the user hears an English "
+                    "answer read back to them."
+                ),
             },
         },
         "required": [],
@@ -106,9 +112,30 @@ _SETTLE_SECONDS = 2.5
 _POLL_SECONDS = 1.2
 _DEFAULT_TIMEOUT = 90
 
-# Spoken aloud, so long enough to be a real answer and short enough not to be a
-# monologue. The full text still reaches the activity log.
-_SPOKEN_LIMIT = 1500
+# A runaway guard, not an editorial limit. It was 1500, which cut a real Copilot
+# explanation off mid-sentence: the user asked for Copilot's answer, not for the
+# first page of it. Nothing legitimate comes near this; a transcript scrape that
+# went wrong does.
+_SPOKEN_LIMIT = 12_000
+
+
+class _Detailed(str):
+    """A Copilot answer, to be covered properly rather than skimmed.
+
+    Everything this plugin returns reaches Gemini as a tool result, and a model
+    handed a long tool result compresses it to a sentence or two by default —
+    which turns "ask Copilot to explain quantum computing" into a headline. The
+    opposite extreme, reading three thousand characters out word for word, is a
+    three-minute monologue nobody wants either. Marking the string lets run()
+    add the directive core/prompt.txt recognises, which asks for the middle:
+    every substantial point, in the user's language, then a pointer to the full
+    text in Copilot's own chat. The plugin's short status lines ("Copilot is
+    closed, sir.") stay unmarked and get spoken naturally.
+    """
+
+
+# Recognised by the "Answering in depth" rule in core/prompt.txt.
+_ANSWER_IN_DEPTH = "[ANSWER_IN_DEPTH]\n"
 
 
 # ── window plumbing ──────────────────────────────────────────────────────────
@@ -398,7 +425,7 @@ def _act_ask(question: str, timeout: int, player=None) -> str:
             "I put the question to Copilot, sir, but it had not answered before I "
             "stopped waiting. The question is in its chat if you want to look."
         )
-    return answer
+    return _Detailed(answer)
 
 
 def _act_read() -> str:
@@ -409,7 +436,9 @@ def _act_read() -> str:
     if not turns:
         return "Copilot has not said anything yet, sir."
     text = _turn_text(turns[-1])
-    return text or "I can see Copilot's reply, sir, but I could not read any text from it."
+    if text:
+        return _Detailed(text)
+    return "I can see Copilot's reply, sir, but I could not read any text from it."
 
 
 def _act_close() -> str:
@@ -460,12 +489,15 @@ def run(parameters: dict, player=None, session_memory=None) -> str:
         print(f"[Copilot] {type(exc).__name__}: {exc}")
         return f"Sir, the Copilot bridge failed: {exc}"
 
-    print(f"[Copilot] {action} → {result[:120]}")
+    print(f"[Copilot] {action} → {len(result)} chars → {result[:120]}")
     if player:
         try:
             player.write_log(f"LUMINA: {result[:200]}")
         except Exception:
             pass
+
+    if isinstance(result, _Detailed):
+        result = _ANSWER_IN_DEPTH + result
 
     if len(result) > _SPOKEN_LIMIT:
         return result[:_SPOKEN_LIMIT].rsplit(" ", 1)[0] + "… That is as far as I will read, sir."

@@ -52,6 +52,11 @@ from memory.memory_manager import (
     save_session_summary, pop_last_session,
     search_memory, set_trim_notifier,
 )
+from memory.conversation_log import (
+    flush as flush_conversation_log,
+    log_turn,
+    search_history,
+)
 
 from actions.file_processor import file_processor
 from actions.flight_finder     import flight_finder
@@ -702,7 +707,12 @@ TOOL_DECLARATIONS = [
             "Also call it before saying you do not know something personal, and "
             "when the user asks what you remember about them (leave query empty "
             "for everything). "
-            "This is a local file search: it is instant and costs nothing."
+            "It searches two things at once: the facts you stored, and the record "
+            "of everything the two of you have actually said to each other. So it "
+            "is also the tool for 'what did we talk about yesterday', 'do you "
+            "remember what we decided about the project', '¿te acuerdas de lo que "
+            "hablamos de X?' — call it instead of saying you cannot remember "
+            "previous conversations, because you can."
         ),
         "parameters": {
             "type": "OBJECT",
@@ -710,9 +720,15 @@ TOOL_DECLARATIONS = [
                 "query": {
                     "type": "STRING",
                     "description": (
-                        "Keyword to search for — a name, a topic, a category "
-                        "(e.g. 'lucia', 'coffee', 'projects'). "
-                        "Leave empty to list everything stored."
+                        "Keyword to search for — a name, a topic, a category, or "
+                        "a subject the two of you discussed. "
+                        "Search in the words the user themselves used: past "
+                        "conversations are stored in the language they were held "
+                        "in, so 'quantum' finds nothing in a conversation that "
+                        "happened in Spanish, while 'cuantica' finds it. "
+                        "One or two words search best; a whole sentence matches "
+                        "nothing. Accents do not matter. "
+                        "Leave empty for the most recent conversations."
                     ),
                 },
             },
@@ -1019,6 +1035,13 @@ class JarvisLive:
 
         if not self._loop or not self.session:
             return
+
+        # Recorded here rather than at turn_complete. Typed text never reaches
+        # input_transcription, and holding it until the next completed turn
+        # pairs it with whatever the model happened to be saying already — the
+        # startup briefing, most visibly. A row of its own is simply true.
+        log_turn(BASE_DIR, text, "")
+
         asyncio.run_coroutine_threadsafe(
             self.session.send_client_content(
                 turns={"parts": [{"text": text}]},
@@ -1182,11 +1205,22 @@ class JarvisLive:
 
         try:
             if name == "recall_memory":
-                # Local file search: no network, no second model. Kept out of
-                # the executor deliberately — it is a dictionary scan over a few
-                # hundred short strings, and a thread hop would cost more than
-                # the work itself.
-                result = search_memory(args.get("query", ""), limit=8)
+                # Two stores, one question. The local file holds the facts
+                # save_memory distilled out of conversations; Supabase holds the
+                # conversations themselves, which is where "what did we decide
+                # about X?" actually lives — a question the distilled facts can
+                # never answer.
+                #
+                # The file scan stays on this thread on purpose: it is a
+                # dictionary scan over a few hundred short strings, and a thread
+                # hop would cost more than the work. The network read does not,
+                # because it can take seconds and this loop also carries audio.
+                query = args.get("query", "")
+                facts = search_memory(query, limit=8)
+                history = await loop.run_in_executor(
+                    None, lambda: search_history(BASE_DIR, query, limit=12)
+                )
+                result = f"{facts}\n\n{history}"
 
             elif name == "undo":
                 if str(args.get("action", "")).lower().strip() == "list":
@@ -1336,6 +1370,9 @@ class JarvisLive:
                         except Exception:
                             pass
                     await asyncio.sleep(1.5)
+                    # _exit skips atexit handlers, so the last turns of the
+                    # conversation would never leave the queue.
+                    flush_conversation_log()
                     import os as _os
                     _os._exit(0)
                 asyncio.create_task(_do_shutdown())
@@ -1626,6 +1663,14 @@ class JarvisLive:
                                         "ts": datetime.now().isoformat(),
                                     }))
                             out_buf = []
+
+                            # One row per finished turn, so tomorrow's "do you
+                            # remember what we worked out?" has something to
+                            # read. Queued and written by a background thread —
+                            # see memory/conversation_log — so a slow or absent
+                            # Supabase never delays the next thing she says.
+                            if full_in or full_out:
+                                log_turn(BASE_DIR, full_in, full_out)
 
                             # Vision injection: model finished tool-response turn → now send the image
                             if self._pending_vision and self.session:

@@ -37,3 +37,48 @@ create policy service_role_only
     to service_role
     using (true)
     with check (true);
+
+-- ── Conversation history ─────────────────────────────────────────────────────
+-- public.interaction_log already existed and was never written to: one row per
+-- finished turn is what memory/conversation_log.py now appends, so that asking
+-- "do you remember what we worked out yesterday?" has something to read.
+--
+-- Recall has to work in Spanish, and Spanish is where a plain ILIKE gives up:
+-- the model asks about "computacion cuantica" while the stored turn says
+-- "computación cuántica", the two never meet, and Lumina reports forgetting
+-- something she is holding. unaccent() folds both sides, and it runs in the
+-- database because the rows that need folding are the ones still on the server.
+
+create extension if not exists unaccent;
+
+create or replace function public.lumina_search_interactions(
+    p_user_id text,
+    p_query   text,
+    p_limit   int default 12
+)
+returns table (user_message text, reply text, created_at timestamptz)
+language sql
+stable
+security definer
+set search_path = public, extensions
+as $$
+    select i.user_message, i.reply, i.created_at
+      from public.interaction_log i
+     where i.user_id = p_user_id
+       and (
+             p_query is null
+          or btrim(p_query) = ''
+          or unaccent(coalesce(i.user_message, '')) ilike '%' || unaccent(p_query) || '%'
+          or unaccent(coalesce(i.reply, ''))        ilike '%' || unaccent(p_query) || '%'
+       )
+     order by i.created_at desc
+     limit greatest(1, least(coalesce(p_limit, 12), 50));
+$$;
+
+comment on function public.lumina_search_interactions(text, text, int) is
+    'Accent-insensitive search over Lumina''s conversation history.';
+
+revoke all on function public.lumina_search_interactions(text, text, int)
+    from public, anon, authenticated;
+grant execute on function public.lumina_search_interactions(text, text, int)
+    to service_role;

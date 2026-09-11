@@ -104,6 +104,38 @@ def _setting(name: str, dotenv: dict[str, str], default: str = "") -> str:
     return (os.environ.get(name) or dotenv.get(name) or default).strip()
 
 
+@dataclass(frozen=True)
+class Credentials:
+    """How this machine reaches Supabase, resolved once and shared.
+
+    conversation_log needs exactly the same four answers this module already
+    works out, and two modules each deciding for themselves what "configured"
+    means is how one of them quietly stops writing.
+    """
+
+    url: str
+    key: str
+    schema: str
+    allow_writes: bool
+
+    @property
+    def configured(self) -> bool:
+        return self.url.startswith("https://") and bool(self.key)
+
+
+def credentials(base_dir: Path) -> Credentials:
+    """Read Supabase settings from the environment, then from the .env file."""
+    dotenv = _read_dotenv(base_dir / ".env")
+    schema = _setting("LUMINA_SUPABASE_SCHEMA", dotenv, DEFAULT_SCHEMA)
+    writes = _setting("LUMINA_SUPABASE_ALLOW_WRITES", dotenv, "false").lower()
+    return Credentials(
+        url=_setting("SUPABASE_URL", dotenv).rstrip("/"),
+        key=_setting("SUPABASE_SERVICE_ROLE_KEY", dotenv),
+        schema=schema if _SCHEMA_PATTERN.fullmatch(schema) else DEFAULT_SCHEMA,
+        allow_writes=writes not in _FALSE_VALUES,
+    )
+
+
 class SupabaseMemoryStore:
     """Small PostgREST client for one versioned Lumina memory document."""
 
