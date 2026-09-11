@@ -591,10 +591,19 @@ TOOL_DECLARATIONS = [
     {
         "name": "shutdown_jarvis",
         "description": (
-            "Shuts down the assistant completely. "
-            "Call this when the user expresses intent to end the conversation, "
-            "close the assistant, say goodbye, or stop Jarvis. "
-            "The user can say this in ANY language."
+            "Shuts the assistant down completely: everything stops, the window closes, and the "
+            "session is over. There is no undo. "
+            "Call it ONLY when the user unmistakably asks for exactly that, in any language: "
+            "'apagate', 'cierrate', 'apaga a Lumina', 'shut down', 'close Lumina', 'turn "
+            "yourself off', 'stop the assistant'. "
+            "COURTESY IS NOT A SHUTDOWN REQUEST. 'Muchas gracias', 'gracias', 'thank you', "
+            "'perfecto', 'ok', 'listo', 'bye', 'hasta luego', 'good night' and anything else "
+            "that merely sounds like the end of a topic must NEVER call this. Someone who "
+            "thanks you expects you to still be there afterwards. "
+            "This is not hypothetical: a 'muchas gracias' closed the assistant in the middle of "
+            "a working session and the user lost what they were doing. "
+            "If there is any doubt at all, do not call it — ask. Being wrong here costs the user "
+            "everything they had open; being right one turn later costs nothing."
         ),
         "parameters": {
             "type": "OBJECT",
