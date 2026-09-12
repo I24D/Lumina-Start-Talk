@@ -175,6 +175,7 @@ BASE_DIR        = get_base_dir()
 API_CONFIG_PATH = BASE_DIR / "config" / "api_keys.json"
 PROMPT_PATH     = BASE_DIR / "core" / "prompt.txt"
 LIVE_MODEL          = "models/gemini-2.5-flash-native-audio-preview-12-2025"
+LIVE_API_VERSION    = "v1beta"
 # How long the microphone may go without delivering a single block before it is
 # treated as dead rather than as a quiet room. Blocks arrive continuously while
 # a stream is healthy — silence still produces them — so a gap this long means
@@ -1239,14 +1240,12 @@ class JarvisLive:
         # microphone thread checks it before writing a placeholder over them.
         self._live_has_text = False
 
-        # Tracked apart because models support them apart: gemini-3.1-flash-live
-        # takes proactive audio and refuses affective dialog. Bundled together,
-        # one refusal switched off both — and proactive audio is the one that
-        # keeps the assistant quiet when the room is talking about something
-        # else, so losing it as collateral is the wrong trade.
-        # Each is dropped only if the server actually objects to it.
+        # Affective dialog is supported by the stable Live endpoint used here.
+        # Server-side proactive audio is deliberately not requested: the active
+        # backend rejects that field on v1beta, while forcing the whole session
+        # onto v1alpha produced long receive streams that never yielded or
+        # failed. The application's local proactive engine remains enabled.
         self._affective_live = True
-        self._proactive_live = True
         _core_names = {t["name"] for t in TOOL_DECLARATIONS}
         self._plugin_registry = discover_plugins(
             plugins_dir=Path(__file__).resolve().parent / "plugins",
@@ -1568,17 +1567,7 @@ class JarvisLive:
         # own voice. Asked for separately, because not every Live model has it.
         if self._affective_live:
             cfg["enable_affective_dialog"] = True
-        # Proactive audio: it stays silent when the speech was not addressed to
-        # it — background chatter, or someone else in the room being spoken to.
-        if self._proactive_live:
-            cfg["proactivity"] = types.ProactivityConfig(proactive_audio=True)
         return types.LiveConnectConfig(**cfg)
-
-    @property
-    def _enhanced_live(self) -> bool:
-        """True while either enhanced feature is still in play — both live on
-        the v1alpha endpoint, so it decides which API version to connect to."""
-        return self._affective_live or self._proactive_live
 
     async def _execute_tool(self, fc) -> types.FunctionResponse:
         # A running tool is a legitimate reason for the session to transcribe
@@ -3006,12 +2995,17 @@ class JarvisLive:
                 _resumed_with = self._resume_handle is not None
                 config = self._build_config()
 
-                # Fresh client on every reconnect — avoids stale HTTP session state
-                # v1alpha carries the enhanced audio features (affective dialog,
-                # proactive audio); if they get rejected we fall back to v1beta.
+                # A fresh client avoids stale HTTP session state on reconnect.
+                # Keep the voice session on v1beta: server-side proactive audio
+                # is intentionally absent from the configuration above.
                 client = genai.Client(
                     api_key=_get_api_key(),
-                    http_options={"api_version": "v1alpha" if self._enhanced_live else "v1beta"}
+                    http_options={"api_version": LIVE_API_VERSION},
+                )
+                print(
+                    f"[JARVIS] Live transport: {LIVE_API_VERSION}; "
+                    f"affective dialog: {'on' if self._affective_live else 'off'}; "
+                    "server proactive audio: off"
                 )
 
                 async with (
@@ -3111,13 +3105,8 @@ class JarvisLive:
                 print(f"[JARVIS] Error ({type(e).__name__}): {e}")
                 traceback.print_exc()
 
-                # An enhanced audio feature rejected by the server. Give up one
-                # at a time, and only the one that was named: dropping both on a
-                # single refusal is how a model that merely lacks affective
-                # dialog also loses proactive audio, which is the feature that
-                # keeps the assistant from answering a conversation it was never
-                # part of. A refusal that names neither is attributed to
-                # affective dialog first, since it is the rarer of the two.
+                # If this model rejects affective dialog, retry without that
+                # optional capability while preserving the stable transport.
                 lowered = err_str.lower()
                 generic = (
                     "INVALID_ARGUMENT" in err_str
@@ -3125,22 +3114,10 @@ class JarvisLive:
                     or "Unknown name" in err_str
                     or "unexpected keyword" in err_str
                 )
-                if self._proactive_live and "proactiv" in lowered:
-                    self._proactive_live = False
-                    self.ui.write_log(
-                        "SYS: Proactive audio unavailable on this model — reconnecting without it."
-                    )
-                    continue
                 if self._affective_live and ("affective" in lowered or generic):
                     self._affective_live = False
                     self.ui.write_log(
                         "SYS: Affective dialog unavailable on this model — reconnecting without it."
-                    )
-                    continue
-                if self._proactive_live and generic:
-                    self._proactive_live = False
-                    self.ui.write_log(
-                        "SYS: Proactive audio unavailable on this model — reconnecting without it."
                     )
                     continue
 
