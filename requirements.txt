@@ -27,6 +27,14 @@ win10toast; sys_platform == "win32"
 pywinauto; sys_platform == "win32"
 pywin32; sys_platform == "win32"
 qrcode[pil]
+# Live transcription independent of the model session (core/stt.py,
+# WindowsDictation). The words the user is speaking must keep appearing in the
+# chat even while the Gemini session is degraded, so they come from the
+# operating system rather than from the conversation.
+winrt-Windows.Media.SpeechRecognition; sys_platform == "win32"
+winrt-Windows.Globalization; sys_platform == "win32"
+winrt-Windows.System.UserProfile; sys_platform == "win32"
+
 # phone_notifications plugin: optional live-notification fallback. The plugin's
 # primary path reads the Windows notification store with stdlib sqlite3 only.
 winrt-Windows.UI.Notifications; sys_platform == "win32"

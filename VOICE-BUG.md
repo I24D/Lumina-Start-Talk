@@ -214,6 +214,44 @@ backlog: the seconds were arithmetic on the block count, so they read `64s` per
 1000 blocks whether the stream was live or an hour behind. It now prints the
 wall clock beside them.
 
+## The live line no longer comes from the conversation
+
+The user's question was the right one: dictation into a chat box shows his
+words as he says them, so why is this hard? It is not hard. It was wired to the
+wrong source.
+
+`input_audio_transcription` arrives on the same socket that does turn-taking,
+accumulates context, generates her voice and runs tools, so the transcript sits
+downstream of all of it. When the session degrades the transcript dies with it
+— measured, not supposed: on 2026-09-12 her speech and his transcript slowed in
+the same turn.
+
+So the live line is now driven by `WindowsDictation` (`core/stt.py`), the
+operating system's own recogniser, running beside the session. It holds no
+conversation and has nothing to degrade.
+
+- **The model still wins whenever it speaks.** `_live_has_text` is set by the
+  first fragment of a turn and cleared at `turn_complete`; the dictation writes
+  only while it is false. Its words therefore reach the screen in exactly one
+  case: the model returned nothing for this turn — which is the bug.
+- **It is muted while she talks** on open speakers, through `set_speaking`.
+  Windows will not let a recogniser be fed audio, it opens the microphone
+  itself, so it hears her echo whatever this process does with its own stream.
+  Measured: a second continuous session opens fine with Lumina already holding
+  the device, so the two coexist.
+- **It refuses rather than guess.** A recogniser for the wrong language does
+  not fail, it returns confident nonsense and writes it under the user's name,
+  so a missing pack turns the feature off and says which language is missing.
+- **It never starts per session.** Started once in `run()`, so every reconnect
+  and every rebuild leaves it running.
+
+This changes what a silence looks like, which is worth as much as the feature.
+Words appearing with no answer behind them means the model stopped; nothing
+appearing at all means the microphone did. Those used to be the same picture.
+
+**It is not a fix for the model going quiet.** It is the other half of the
+requirement, made independent of it.
+
 ## Why it never recovers: the handle is replayed into the fault
 
 This is two faults, not one, and they had been treated as one.
