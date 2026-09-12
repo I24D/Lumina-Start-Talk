@@ -202,7 +202,7 @@ _MIC_STALL_SECONDS  = 6.0
 _DEAF_MIN_SESSION     = 90.0    # younger than this is never rebuilt
 _DEAF_VOICE_SECONDS   = 20.0    # this much *clear* speech, not this much sound
 _DEAF_SILENCE_SECONDS = 25.0
-_DEAF_VOICE_LEVEL     = 0.15    # well above a room; a person talking clears it
+_DEAF_VOICE_LEVEL     = 0.40    # measured: this room idles at 0.23 and peaks at 0.33
 _DEAF_COOLDOWN        = 120.0   # never rebuild more often than this
 _DEAF_ECHO_TAIL       = 2.0     # her own voice keeps arriving after she stops
 
@@ -213,7 +213,7 @@ _DEAF_ECHO_TAIL       = 2.0     # her own voice keeps arriving after she stops
 # 275 seconds, four thousand blocks, the user speaking into it, and not one
 # message back — the receive loop parked inside a stream that had stopped
 # yielding and would never end or raise.
-_RECV_DEAD_SECONDS    = 15.0
+_RECV_DEAD_SECONDS    = 25.0
 # Its own cooldown, far shorter than the speech watchdog's. That one guesses,
 # so it must not thrash; this one measures — the user spoke and the server
 # said nothing whatsoever — and a session that dies twice in a minute should
@@ -2036,7 +2036,17 @@ class JarvisLive:
                     # session answers in about three seconds.
                     _quiet_for = time.monotonic() - self._last_recv
                     if (
-                        self._speech_since_recv
+                        # It must have been working first. Without this the
+                        # check fired on a brand-new idle session where nobody
+                        # was talking at all: the local detector armed it on
+                        # room noise, fifteen seconds of legitimate quiet
+                        # followed, and the session was rebuilt — over and
+                        # over, connect, kill, connect, kill. The failure this
+                        # exists for is a session that transcribed and then
+                        # stopped; one that has never transcribed is the other
+                        # watchdog's business, and it has far higher bars.
+                        self._heard_this_session > 0
+                        and self._speech_since_recv
                         and self._last_recv > 0
                         and _quiet_for > _RECV_DEAD_SECONDS
                         and not self._tool_running
