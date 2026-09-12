@@ -213,7 +213,13 @@ _DEAF_ECHO_TAIL       = 2.0     # her own voice keeps arriving after she stops
 # 275 seconds, four thousand blocks, the user speaking into it, and not one
 # message back — the receive loop parked inside a stream that had stopped
 # yielding and would never end or raise.
-_RECV_DEAD_SECONDS    = 30.0
+_RECV_DEAD_SECONDS    = 15.0
+# Its own cooldown, far shorter than the speech watchdog's. That one guesses,
+# so it must not thrash; this one measures — the user spoke and the server
+# said nothing whatsoever — and a session that dies twice in a minute should
+# be rebuilt twice in a minute. Sharing the 120 s cooldown is why one recovery
+# took 118 seconds when the detection itself had taken thirty.
+_RECV_REBUILD_COOLDOWN = 15.0
 
 # Full duplex: whether the microphone may stay open while she speaks.
 #
@@ -1165,6 +1171,7 @@ class JarvisLive:
         # nothing ever comes back. Nothing else in the app can see that.
         self._last_recv           = 0.0
         self._speech_since_recv   = False
+        self._last_recv_rebuild   = 0.0
         self._speaking_lock       = threading.Lock()
         self._phone_active        = False   # True while phone mic is streaming; pauses PC mic
         self._pending_vision       = None    # (img_bytes, mime_type, question, angle) to inject after tool response
@@ -2033,9 +2040,9 @@ class JarvisLive:
                         and self._last_recv > 0
                         and _quiet_for > _RECV_DEAD_SECONDS
                         and not self._tool_running
-                        and (time.monotonic() - self._last_deaf_rebuild) > _DEAF_COOLDOWN
+                        and (time.monotonic() - self._last_recv_rebuild) > _RECV_REBUILD_COOLDOWN
                     ):
-                        self._last_deaf_rebuild = time.monotonic()
+                        self._last_recv_rebuild = time.monotonic()
                         self._last_recv = time.monotonic()
                         self._speech_since_recv = False
                         print(f"[JARVIS] 💀 nothing from the server for "
@@ -2139,6 +2146,26 @@ class JarvisLive:
                             if self._resume_handle is None:
                                 print("[JARVIS] 🔗 Session resumption armed")
                             self._resume_handle = _sru.new_handle
+
+                    # The server saying it is about to end this session. It is
+                    # the one warning there is, and nothing was listening for
+                    # it: the connection would go quiet a moment later, the
+                    # receive stream would stop yielding without ending or
+                    # raising, and every local sign — socket, microphone,
+                    # audio still accepted — kept saying the session was fine.
+                    # Reconnecting here is what the message is for, and it
+                    # happens before the silence rather than half a minute
+                    # after it.
+                    _bye = getattr(response, "go_away", None)
+                    if _bye is not None:
+                        _left = getattr(_bye, "time_left", None)
+                        print(f"[JARVIS] 👋 server is ending the session"
+                              f"{f' in {_left}' if _left else ''} — reconnecting now",
+                              flush=True)
+                        self.ui.write_log("SYS: The service is rotating the session — reconnecting.")
+                        self.request_reconnect(keep_context=True,
+                                               reason="the service ended the session")
+                        break
 
                     if response.data:
                         if self._interrupted:
