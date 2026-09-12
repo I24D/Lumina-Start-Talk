@@ -191,10 +191,20 @@ _MIC_STALL_SECONDS  = 6.0
 # silence clock, so the condition was still true the instant the new session
 # came up and it reconnected in a loop. A level of 0.02 also counts a quiet
 # room as somebody talking.
-_DEAF_VOICE_SECONDS   = 8.0     # this much *clear* speech, not this much sound
+# It fired again at eight seconds old, while she was still delivering her
+# own opening briefing, and threw away the session the user was about to
+# speak into. A brand-new session has heard nothing yet — so has every
+# healthy one — which is why "has heard nothing" cannot stand on its own.
+# The real case, measured, was a session that stayed deaf for its whole
+# life while the user talked at it repeatedly. These numbers describe that
+# and nothing a working session can reach: a healthy session transcribes
+# within a second or two of the first word.
+_DEAF_MIN_SESSION     = 90.0    # younger than this is never rebuilt
+_DEAF_VOICE_SECONDS   = 20.0    # this much *clear* speech, not this much sound
 _DEAF_SILENCE_SECONDS = 25.0
 _DEAF_VOICE_LEVEL     = 0.15    # well above a room; a person talking clears it
 _DEAF_COOLDOWN        = 120.0   # never rebuild more often than this
+_DEAF_ECHO_TAIL       = 2.0     # her own voice keeps arriving after she stops
 CHANNELS            = 1
 SEND_SAMPLE_RATE    = 16000
 RECEIVE_SAMPLE_RATE = 24000
@@ -1106,6 +1116,10 @@ class JarvisLive:
         self.out_queue            = None
         self._loop                = None
         self._is_speaking         = False
+        # When her own audio last stopped. Her voice keeps reaching the
+        # microphone for a moment after the gate reopens, and that echo is
+        # not the user talking.
+        self._last_spoke_at       = 0.0
         self._speaking_lock       = threading.Lock()
         self._phone_active        = False   # True while phone mic is streaming; pauses PC mic
         self._pending_vision       = None    # (img_bytes, mime_type, question, angle) to inject after tool response
@@ -1355,6 +1369,8 @@ class JarvisLive:
     def set_speaking(self, value: bool):
         with self._speaking_lock:
             self._is_speaking = value
+        if not value:
+            self._last_spoke_at = time.monotonic()
         if value:
             self.ui.set_state("SPEAKING")
         elif not self.ui.muted:
@@ -1824,7 +1840,10 @@ class JarvisLive:
                 # audio that was actually sent can be evidence that sending is
                 # not working.
                 try:
-                    if level > _DEAF_VOICE_LEVEL:
+                    if (
+                        level > _DEAF_VOICE_LEVEL
+                        and time.monotonic() - self._last_spoke_at > _DEAF_ECHO_TAIL
+                    ):
                         self._voice_blocks_unheard += 1
                 except Exception:
                     pass
@@ -1917,6 +1936,7 @@ class JarvisLive:
                     _spoke_seconds = self._voice_blocks_unheard * CHUNK_SIZE / SEND_SAMPLE_RATE
                     if (
                         self._heard_this_session == 0
+                        and (time.monotonic() - self._session_started) > _DEAF_MIN_SESSION
                         and _spoke_seconds > _DEAF_VOICE_SECONDS
                         and (time.monotonic() - self._last_user_speech) > _DEAF_SILENCE_SECONDS
                         and (time.monotonic() - self._last_deaf_rebuild) > _DEAF_COOLDOWN
