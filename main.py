@@ -206,6 +206,15 @@ _DEAF_VOICE_LEVEL     = 0.15    # well above a room; a person talking clears it
 _DEAF_COOLDOWN        = 120.0   # never rebuild more often than this
 _DEAF_ECHO_TAIL       = 2.0     # her own voice keeps arriving after she stops
 
+# How long the server may say nothing at all, after the user has spoken,
+# before the session is treated as dead. This is not a guess about speech: a
+# working session answers within about three seconds, and sends resumption
+# handles and turn markers besides. Measured on a dead one: audio accepted for
+# 275 seconds, four thousand blocks, the user speaking into it, and not one
+# message back — the receive loop parked inside a stream that had stopped
+# yielding and would never end or raise.
+_RECV_DEAD_SECONDS    = 30.0
+
 # Full duplex: whether the microphone may stay open while she speaks.
 #
 # It normally may not. Measured in this room with the speakers on, her own
@@ -1150,6 +1159,12 @@ class JarvisLive:
         # Audio blocks that actually reached the model. Proof of the
         # one link that used to report nothing either way.
         self._sent_blocks         = 0
+        # When the server last said anything at all, and whether the user has
+        # spoken since. Together these catch a session the server has stopped
+        # serving: the socket stays open, audio keeps being accepted, and
+        # nothing ever comes back. Nothing else in the app can see that.
+        self._last_recv           = 0.0
+        self._speech_since_recv   = False
         self._speaking_lock       = threading.Lock()
         self._phone_active        = False   # True while phone mic is streaming; pauses PC mic
         self._pending_vision       = None    # (img_bytes, mime_type, question, angle) to inject after tool response
@@ -1901,6 +1916,7 @@ class JarvisLive:
                     ended_at = time.monotonic()
                     self._last_user_speech = ended_at
                     self._last_voice_end = ended_at
+                    self._speech_since_recv = True
                     _diag("local VAD: speech ended")
 
                 # Counted here rather than at the top of the callback: only
@@ -2000,6 +2016,36 @@ class JarvisLive:
                         self._voice_blocks_unheard = 0
                         self._last_user_speech = time.monotonic()
 
+                    # The session the server has stopped serving. Everything
+                    # local keeps working — the socket is open, the microphone
+                    # is captured, audio is accepted block after block, the
+                    # meters move — and not one message ever comes back. No
+                    # exception is raised and the receive stream neither ends
+                    # nor yields, so the loop that would reopen it never gets
+                    # the chance. This is the only place it can be seen.
+                    #
+                    # The test is a fact rather than a guess: the user spoke,
+                    # and the server has said nothing at all since. A healthy
+                    # session answers in about three seconds.
+                    _quiet_for = time.monotonic() - self._last_recv
+                    if (
+                        self._speech_since_recv
+                        and self._last_recv > 0
+                        and _quiet_for > _RECV_DEAD_SECONDS
+                        and not self._tool_running
+                        and (time.monotonic() - self._last_deaf_rebuild) > _DEAF_COOLDOWN
+                    ):
+                        self._last_deaf_rebuild = time.monotonic()
+                        self._last_recv = time.monotonic()
+                        self._speech_since_recv = False
+                        print(f"[JARVIS] 💀 nothing from the server for "
+                              f"{_quiet_for:.0f}s after you spoke — the session "
+                              f"is dead, rebuilding it", flush=True)
+                        self.ui.write_log("SYS: The connection went quiet — reconnecting.")
+                        self.request_reconnect(keep_context=True,
+                                               reason="the session stopped responding")
+                        continue
+
                     _spoke_seconds = self._voice_blocks_unheard * CHUNK_SIZE / SEND_SAMPLE_RATE
                     if (
                         self._heard_this_session == 0
@@ -2074,6 +2120,12 @@ class JarvisLive:
                     print(f"[JARVIS] ♻️ receive stream ended — opening #{_streams}",
                           flush=True)
                 async for response in self.session.receive():
+                    # Anything at all from the server — audio, a transcript, a
+                    # turn ending, a resumption handle. A live session is never
+                    # quiet for long; one that is, is dead. See the receive
+                    # watchdog, which is the only thing that can tell.
+                    self._last_recv = time.monotonic()
+                    self._speech_since_recv = False
 
                     # ── Session resumption ───────────────────────────────────
                     # The server sends this periodically. `resumable` goes false
@@ -2948,6 +3000,8 @@ class JarvisLive:
                     # identical without it.
                     self._session_started = time.monotonic()
                     self._heard_this_session = 0
+                    self._last_recv = time.monotonic()
+                    self._speech_since_recv = False
                     print("[JARVIS] Connected.")
                     if _resumed_with:
                         # Say it plainly: the difference between "it reconnected"
