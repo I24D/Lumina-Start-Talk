@@ -1219,12 +1219,10 @@ class JarvisLive:
         # microphone thread checks it before writing a placeholder over them.
         self._live_has_text = False
 
-        # Affective dialog is supported by the stable Live endpoint used here.
-        # Server-side proactive audio is deliberately not requested: the active
-        # backend rejects that field on v1beta, while forcing the whole session
-        # onto v1alpha produced long receive streams that never yielded or
-        # failed. The application's local proactive engine remains enabled.
-        self._affective_live = True
+        # Keep the server audio configuration at its proven baseline. Optional
+        # affective and proactive fields have both produced sessions that accept
+        # microphone audio but never return a transcription. The application's
+        # local proactive engine remains enabled and is independent of them.
         _core_names = {t["name"] for t in TOOL_DECLARATIONS}
         self._plugin_registry = discover_plugins(
             plugins_dir=Path(__file__).resolve().parent / "plugins",
@@ -1543,10 +1541,6 @@ class JarvisLive:
                 )
             ),
         )
-        # Affective dialog: the assistant hears tone and emotion and adapts its
-        # own voice. Asked for separately, because not every Live model has it.
-        if self._affective_live:
-            cfg["enable_affective_dialog"] = True
         return types.LiveConnectConfig(**cfg)
 
     async def _execute_tool(self, fc) -> types.FunctionResponse:
@@ -1808,9 +1802,9 @@ class JarvisLive:
     async def _send_realtime(self):
         while True:
             msg = await self.out_queue.get()
-            # The 2.5 native-audio configuration with proactive and affective
-            # audio requires the legacy media transport. The newer audio=
-            # field is rejected when those features are on.
+            # This project's proven 2.5 native-audio path uses the legacy media
+            # dictionary. Changing it to audio=Blob produced accepted calls but
+            # no input transcriptions in a measured session.
             #
             # Nothing else goes down this channel. A client-side detector used
             # to send audio_stream_end after every pause of 640 ms, to hurry
@@ -1819,8 +1813,7 @@ class JarvisLive:
             # is over, the room's own noise floor measured 0.23 against the
             # detector's 0.20 threshold, and one session announced the end of
             # its audio thirty-one times while transcribing nothing at all.
-            # The server's own activity detection is configured and enabled a
-            # few hundred lines up; it does not need the help.
+            # The service's default activity detection does not need the help.
             try:
                 await self.session.send_realtime_input(media=msg)
             except Exception as exc:
@@ -2948,8 +2941,7 @@ class JarvisLive:
                 )
                 print(
                     f"[JARVIS] Live transport: {LIVE_API_VERSION}; "
-                    f"affective dialog: {'on' if self._affective_live else 'off'}; "
-                    "server proactive audio: off"
+                    "optional server audio features: off"
                 )
 
                 async with (
@@ -3046,22 +3038,6 @@ class JarvisLive:
                 err_str = _flatten_error(e)
                 print(f"[JARVIS] Error ({type(e).__name__}): {e}")
                 traceback.print_exc()
-
-                # If this model rejects affective dialog, retry without that
-                # optional capability while preserving the stable transport.
-                lowered = err_str.lower()
-                generic = (
-                    "INVALID_ARGUMENT" in err_str
-                    or "invalid argument" in lowered
-                    or "Unknown name" in err_str
-                    or "unexpected keyword" in err_str
-                )
-                if self._affective_live and ("affective" in lowered or generic):
-                    self._affective_live = False
-                    self.ui.write_log(
-                        "SYS: Affective dialog unavailable on this model — reconnecting without it."
-                    )
-                    continue
 
                 # The server refused the audio we were sending. Seen mid-session
                 # after a long tool call, and fatal if it is resumed into: the
