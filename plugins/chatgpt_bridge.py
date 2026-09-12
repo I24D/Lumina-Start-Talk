@@ -118,6 +118,7 @@ _HELPER_TITLES = {"default ime", "msctfime ui"}
 _REPLY_MARKERS = {"chatgpt said:", "chatgpt dijo:"}
 _COMPOSER_HINTS = ("chatgpt",)
 _DEFAULT_TIMEOUT = 120
+_BACKGROUND_TIMEOUT = 900
 _POLL_SECONDS = 0.8
 _SETTLE_SECONDS = 1.8
 _SPOKEN_LIMIT = 12_000
@@ -551,20 +552,47 @@ def _await_reply(window, baseline: str, baseline_count: int, timeout: int) -> st
     return last
 
 
-def _focus_verified(window) -> None:
-    """Bring ChatGPT forward, unhiding it first when it sits in the tray.
+def _activate(hwnd: int) -> None:
+    """Bring the app back the way its own tray icon does.
 
-    set_focus alone cannot raise a window that Windows considers hidden
-    rather than minimised, which is the state the app is left in whenever the
-    user closes it with the X.
+    ShowWindow makes a tray-hidden window render again, and that turns out not
+    to be the same thing as making it usable. Measured on this app: UIA still
+    read the whole conversation and a screenshot still showed it, while every
+    click and keystroke was dropped and the composer reported
+    ``has_keyboard_focus`` False. A message pasted into a window revived that
+    way lands nowhere, and the ask that follows spends its entire timeout
+    waiting for an answer to something that was never sent — two of those in a
+    row is what left Lumina silent for four minutes and cost her the session.
+
+    The shell activation verb is what the tray icon and the Start menu use.
+    After it, the same click focuses the composer and the same paste arrives.
     """
+    if win32gui.IsIconic(hwnd):
+        win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+        time.sleep(0.4)
+    if win32gui.IsWindowVisible(hwnd):
+        return
+
+    for app_id in _APP_IDS:
+        try:
+            subprocess.Popen(
+                ["explorer.exe", f"shell:AppsFolder\\{app_id}"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            continue
+        for _ in range(20):
+            time.sleep(0.3)
+            if win32gui.IsWindowVisible(hwnd):
+                time.sleep(1.0)     # up, but still painting
+                return
+
+
+def _focus_verified(window) -> None:
+    """Put ChatGPT in front, fetching it out of the tray first when it is there."""
     try:
-        if not win32gui.IsWindowVisible(window.handle):
-            win32gui.ShowWindow(window.handle, win32con.SW_SHOW)
-            time.sleep(0.4)
-        if win32gui.IsIconic(window.handle):
-            win32gui.ShowWindow(window.handle, win32con.SW_RESTORE)
-            time.sleep(0.4)
+        _activate(window.handle)
     except Exception:
         pass
 
@@ -576,11 +604,44 @@ def _focus_verified(window) -> None:
         raise RuntimeError("Windows did not give keyboard focus to ChatGPT")
 
 
+def _focus_composer(window, composer):
+    """Click into the message box and prove the app took the keyboard.
+
+    ``has_keyboard_focus`` is the difference between a window that is merely
+    painted and one that can be typed into, and it is the only warning
+    available before a paste disappears without a sound. The element is
+    re-located between attempts because the app re-renders as it comes
+    forward, and the handle found a moment earlier can describe a layout that
+    no longer exists.
+    """
+    for attempt in range(3):
+        try:
+            composer.click_input()
+        except Exception:
+            pass
+        time.sleep(0.4 + 0.3 * attempt)
+        try:
+            if composer.has_keyboard_focus():
+                return composer
+        except Exception:
+            pass
+        replacement = _composer(window)
+        if replacement is not None:
+            composer = replacement
+    return None
+
+
 def _send(window, composer, text: str) -> None:
     """Paste and submit only after focus is verified as belonging to ChatGPT."""
     _focus_verified(window)
-    composer.click_input()
-    time.sleep(0.25)
+
+    focused = _focus_composer(window, composer)
+    if focused is None:
+        raise RuntimeError(
+            "ChatGPT is on screen but its message box would not take the "
+            "keyboard, so nothing was typed"
+        )
+
     foreground = win32gui.GetForegroundWindow()
     _, pid = win32process.GetWindowThreadProcessId(foreground)
     if _process_name(pid) != _PROCESS:
@@ -649,41 +710,114 @@ def _act_new() -> str:
     return "I selected New chat, but its message box did not become ready."
 
 
-_ask_lock = threading.Lock()
-_asking = ""
+_job_lock = threading.Lock()
+_job_question = ""            # non-empty while an answer is still being waited for
+_job_started = 0.0
 
 
-def _act_ask(text: str, timeout: int, player=None) -> str:
-    global _asking
-    if not text:
-        return "What would you like me to ask ChatGPT?"
-    with _ask_lock:
-        if _asking:
-            return f"I am still waiting for ChatGPT to answer '{_asking[:80]}'."
-        _asking = text
+def _deliver(question: str, answer: str, player=None) -> None:
+    """Speak an answer that arrived long after its tool call returned."""
+    spoken = _speech_text(answer)
+    if len(spoken) > _SPOKEN_LIMIT:
+        spoken = spoken[:_SPOKEN_LIMIT].rsplit(" ", 1)[0] + "…"
+
+    print(f"[ChatGPT] answered after the fact: {len(answer)} chars")
+    if player:
+        try:
+            player.write_log(f"[ChatGPT] answer received ({len(answer)} chars)")
+        except Exception:
+            pass
+
+    # The marker is not decoration. Without it this lands as an ordinary user
+    # turn and the model reads it as the user making conversation, which is
+    # how OpenClaw's first delayed answer came back as "I have already put the
+    # question to it and am waiting". core/prompt.txt recognises
+    # [DELAYED_ANSWER] the way it recognises [SYSTEM_ALERT].
+    _say(
+        player,
+        "[DELAYED_ANSWER] ChatGPT has finished the message you sent it earlier "
+        f"('{question[:120]}'). Its answer follows.\n\n"
+        + _ANSWER_IN_DEPTH + spoken,
+    )
+
+
+def _run_job(question: str, timeout: int, player=None) -> None:
+    """Background worker: send, wait for ChatGPT, then speak what came back."""
+    global _job_question
+    answer, error = "", ""
     try:
         window = _window()
         if window is None:
-            return "I could not open the ChatGPT desktop app. It may not be installed."
-        if not _ensure_chatgpt_mode(window):
-            return "ChatGPT is open, but I could not verify ChatGPT mode before sending the message."
-        composer = _composer(window)
-        if composer is None:
-            return "ChatGPT is open, but I could not find its message box."
-        snapshots = _reply_snapshots(window)
-        baseline = snapshots[-1][0] if snapshots else ""
-        _send(window, composer, text)
-        _say(player, "Tell the user briefly that the message was sent to ChatGPT and you are waiting.")
-        answer = _await_reply(window, baseline, len(snapshots), timeout)
-        if not answer:
-            return (
-                "I sent the message to ChatGPT, but it did not finish answering before the "
-                "waiting period ended. The message remains in its chat."
-            )
-        return _Detailed(answer)
+            error = "the desktop app would not open"
+        elif not _ensure_chatgpt_mode(window):
+            error = "the app would not leave Codex mode"
+        else:
+            composer = _composer(window)
+            if composer is None:
+                error = "its message box was not there"
+            else:
+                snapshots = _reply_snapshots(window)
+                baseline = snapshots[-1][0] if snapshots else ""
+                _send(window, composer, question)
+                answer = _await_reply(window, baseline, len(snapshots), timeout)
+                if not answer:
+                    error = "it did not finish answering in time"
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
     finally:
-        with _ask_lock:
-            _asking = ""
+        with _job_lock:
+            _job_question = ""
+
+    if answer:
+        _deliver(question, answer, player)
+        return
+
+    print(f"[ChatGPT] ask failed: {error}")
+    _say(
+        player,
+        "The message you sent to ChatGPT earlier did not go through. Tell the "
+        f"user so in one sentence, and say what went wrong: {error}",
+    )
+
+
+def _act_ask(text: str, timeout: int, player=None) -> str:
+    """Hand the message over and return at once.
+
+    Waiting here is what froze her. The call blocked for its whole timeout,
+    twice in a row, and by the end of it the live session had dropped its
+    resumption handle because she had not spoken in four minutes. ChatGPT is
+    quick when it is quick and slow when it is not, and neither is a reason
+    for her to go silent — OpenClaw is answered the same way.
+    """
+    global _job_question, _job_started
+    if not text:
+        return "What would you like me to say to ChatGPT?"
+
+    with _job_lock:
+        if _job_question:
+            waited = int(time.monotonic() - _job_started)
+            return (
+                f"I am still waiting for ChatGPT to answer '{_job_question[:80]}' — "
+                f"{waited} seconds so far. I will read that answer out the moment "
+                "it arrives; ask me again afterwards and I will send the new one."
+            )
+        _job_question = text
+        _job_started = time.monotonic()
+
+    # The caller's timeout was sized for a wait someone was sitting through.
+    # Nobody is sitting through this one, so it only has to be long enough
+    # that a stuck app is eventually given up on.
+    threading.Thread(
+        target=_run_job,
+        args=(text, max(timeout, _BACKGROUND_TIMEOUT), player),
+        name="lumina-chatgpt-ask",
+        daemon=True,
+    ).start()
+
+    return (
+        "I have sent that to ChatGPT. I will not keep you waiting for it — "
+        "carry on, and I will read the answer out loud the moment it arrives."
+    )
 
 
 def _act_read(timeout: int) -> str:
