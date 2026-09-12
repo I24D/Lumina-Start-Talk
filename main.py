@@ -1163,6 +1163,12 @@ class JarvisLive:
         self._voice_blocks_unheard = 0
         self._last_deaf_rebuild = 0.0
         self._tool_running = 0
+        # Transcriptions this session has produced since it connected. The
+        # failure the watchdog below exists for is a session born deaf: it
+        # connects, answers typed text, and never transcribes one word of
+        # audio for its whole life. A session that has transcribed even once
+        # is listening, and must never be torn down on suspicion.
+        self._heard_this_session = 0
 
         # Tracked apart because models support them apart: gemini-3.1-flash-live
         # takes proactive audio and refuses affective dialog. Bundled together,
@@ -1900,7 +1906,8 @@ class JarvisLive:
 
                     _spoke_seconds = self._voice_blocks_unheard * CHUNK_SIZE / SEND_SAMPLE_RATE
                     if (
-                        _spoke_seconds > _DEAF_VOICE_SECONDS
+                        self._heard_this_session == 0
+                        and _spoke_seconds > _DEAF_VOICE_SECONDS
                         and (time.monotonic() - self._last_user_speech) > _DEAF_SILENCE_SECONDS
                         and (time.monotonic() - self._last_deaf_rebuild) > _DEAF_COOLDOWN
                     ):
@@ -2030,6 +2037,7 @@ class JarvisLive:
                         if interim and interim.text and in_buf.set_interim(interim.text):
                             self._last_user_speech = time.monotonic()
                             self._voice_blocks_unheard = 0
+                            self._heard_this_session += 1
                             preview = in_buf.text
                             if preview:
                                 self.ui.set_live_transcript(f"You: {preview}")
@@ -2041,6 +2049,7 @@ class JarvisLive:
                             if txt and in_buf.add_final(raw_text):
                                 self._last_user_speech = time.monotonic()
                                 self._voice_blocks_unheard = 0
+                                self._heard_this_session += 1
 
                                 # Also on the console, fragment by fragment.
                                 # "Heard:" below prints at turn_complete, which
@@ -2800,6 +2809,7 @@ class JarvisLive:
                     # the longer it runs and one that is simply slow today look
                     # identical without it.
                     self._session_started = time.monotonic()
+                    self._heard_this_session = 0
                     print("[JARVIS] Connected.")
                     if _resumed_with:
                         # Say it plainly: the difference between "it reconnected"
