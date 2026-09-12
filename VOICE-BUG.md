@@ -214,6 +214,37 @@ backlog: the seconds were arithmetic on the block count, so they read `64s` per
 1000 blocks whether the stream was live or an hour behind. It now prints the
 wall clock beside them.
 
+## Why it never recovers: the handle is replayed into the fault
+
+This is two faults, not one, and they had been treated as one.
+
+The same process, left running to 01:44, logged **six connects, four deafness
+rebuilds, and not one word transcribed after the first of them**. Every rebuild
+went through `request_reconnect(keep_context=True)`, which replays the stored
+resumption handle — so every rebuilt session resumed the state it was being
+rebuilt to escape. The watchdog was not wrong to fire; 43 s of clear speech had
+gone out with nothing coming back. It simply could not win.
+
+That is the missing half of "restarting the app fixes it, reconnecting does
+not". Killing the process is the only thing that has ever thrown the handle
+away, because `_resume_handle` lives on the instance.
+
+So the watchdog now escalates. The first rebuild keeps the conversation, as
+before. A **second one in a row** drops the handle and starts clean, and says
+so (`rebuilding the session, without resuming it`). The counter resets the
+moment any session transcribes a single word, so a working assistant never
+reaches the second step.
+
+It costs little: that branch only runs when the session has transcribed nothing
+at all, so there is no conversation of its own to lose — only the older one it
+resumed. An assistant that can hear and has forgotten the last few minutes
+beats one that remembers everything and is deaf.
+
+**This fixes recovery, not onset.** Something still makes the first session go
+bad, and that is what the section below is about. Do not let a session that
+recovers cleanly be mistaken for a session that never broke — the `[VOICE REC]`
+lines and the `🙉` count say which happened.
+
 ## Where the evidence points
 
 Against the first commit, which the user reports streamed reliably, the whole

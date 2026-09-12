@@ -1234,6 +1234,11 @@ class JarvisLive:
         # talking and it is not arriving" is invisible without this.
         self._voice_blocks_unheard = 0
         self._last_deaf_rebuild = 0.0
+        # Deaf rebuilds in a row, reset the moment a session hears one word.
+        # The first rebuild keeps the conversation; a second one in a row means
+        # keeping it is what is being rebuilt into, and drops it. See the
+        # deafness watchdog for why.
+        self._deaf_rebuilds = 0
         self._tool_running = 0
         # Transcriptions this session has produced since it connected. The
         # failure the watchdog below exists for is a session born deaf: it
@@ -2078,10 +2083,37 @@ class JarvisLive:
                         # Both clocks restart, not just the counter. Leaving
                         # this one stale is exactly what caused the loop.
                         self._last_user_speech = time.monotonic()
+                        self._deaf_rebuilds += 1
+
+                        # The first rebuild keeps the conversation. A second
+                        # one in a row does not, because by then the
+                        # conversation is the suspect.
+                        #
+                        # Measured on 2026-09-12: four rebuilds, six connects,
+                        # and not one word transcribed after the first of them.
+                        # Every rebuild replayed the same resumption handle, so
+                        # every rebuilt session resumed the state it was being
+                        # rebuilt to escape. That is why this fault has never
+                        # once recovered on its own while restarting the
+                        # process always cured it — killing the process is the
+                        # only thing that has ever thrown the handle away.
+                        #
+                        # It costs little here: this branch only runs when the
+                        # session has transcribed nothing at all, so there is
+                        # no conversation from it to lose, only the older one
+                        # it resumed. An assistant that can hear and has
+                        # forgotten the last few minutes beats one that
+                        # remembers everything and is deaf.
+                        _keep = self._deaf_rebuilds < 2
                         print(f"[JARVIS] 🙉 {_spoke_seconds:.0f}s of speech sent and nothing "
-                              f"transcribed — rebuilding the session", flush=True)
-                        self.ui.write_log("SYS: I stopped hearing you — reconnecting.")
-                        self.request_reconnect(keep_context=True,
+                              f"transcribed — rebuilding the session"
+                              f"{'' if _keep else ', without resuming it'}", flush=True)
+                        self.ui.write_log(
+                            "SYS: I stopped hearing you — reconnecting."
+                            if _keep else
+                            "SYS: Still not hearing you — starting a clean session."
+                        )
+                        self.request_reconnect(keep_context=_keep,
                                                reason="microphone not reaching the model")
                         continue
 
@@ -2384,6 +2416,9 @@ class JarvisLive:
                             self._last_user_speech = time.monotonic()
                             self._voice_blocks_unheard = 0
                             self._heard_this_session += 1
+                            # It heard. Whatever the last rebuild did, it
+                            # worked, and the next one starts from one again.
+                            self._deaf_rebuilds = 0
                             preview = in_buf.text
                             if preview:
                                 self._live_has_text = True
@@ -2399,6 +2434,7 @@ class JarvisLive:
                                 self._last_user_speech = time.monotonic()
                                 self._voice_blocks_unheard = 0
                                 self._heard_this_session += 1
+                                self._deaf_rebuilds = 0
 
                                 # Also on the console, fragment by fragment.
                                 # "Heard:" below prints at turn_complete, which
