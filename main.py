@@ -1169,6 +1169,9 @@ class JarvisLive:
         # audio for its whole life. A session that has transcribed even once
         # is listening, and must never be torn down on suspicion.
         self._heard_this_session = 0
+        # Whether the live "You:" line already holds words from this turn. The
+        # microphone thread checks it before writing a placeholder over them.
+        self._live_has_text = False
 
         # Tracked apart because models support them apart: gemini-3.1-flash-live
         # takes proactive audio and refuses affective dialog. Bundled together,
@@ -1799,7 +1802,14 @@ class JarvisLive:
                 vad_event = local_vad.process(level)
                 if vad_event == "start":
                     self._last_voice_end = 0.0
-                    self.ui.set_live_transcript("You: Listening...")
+                    # Only when the line is still empty. This fires again after
+                    # every pause longer than 640 ms — which is every gap
+                    # between two phrases — and writing the placeholder each
+                    # time wiped the words as fast as they were transcribed,
+                    # leaving "Listening..." on screen for a user who could
+                    # see the assistant answering them perfectly well.
+                    if not self._live_has_text:
+                        self.ui.set_live_transcript("You: Listening...")
                     _diag("local VAD: speech started")
                 elif vad_event == "end":
                     ended_at = time.monotonic()
@@ -2040,6 +2050,7 @@ class JarvisLive:
                             self._heard_this_session += 1
                             preview = in_buf.text
                             if preview:
+                                self._live_has_text = True
                                 self.ui.set_live_transcript(f"You: {preview}")
                                 _diag(f"interim transcript={preview!r}")
 
@@ -2069,6 +2080,7 @@ class JarvisLive:
                                 # and its absence is indistinguishable from the
                                 # assistant ignoring the user.
                                 try:
+                                    self._live_has_text = True
                                     self.ui.set_live_transcript(f"You: {in_buf.text}")
                                 except Exception:
                                     pass
@@ -2085,6 +2097,7 @@ class JarvisLive:
                                     self.wake(txt)
 
                         if sc.turn_complete:
+                            self._live_has_text = False
                             if self._turn_done_event:
                                 self._turn_done_event.set()
 
