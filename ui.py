@@ -809,11 +809,50 @@ class LogWidget(QTextEdit):
         grows, and animating it character by character would put it further
         behind the speaker with every update — the opposite of the point."""
         if self._typing:
-            # The typewriter owns the end of the document while it runs; show
-            # this the moment it lets go.
-            self._live_pending = text
-            return
+            # The typewriter owns the end of the document while it runs, and
+            # this used to be stashed until it let go. That is what made live
+            # transcription look broken: one reply is several hundred
+            # characters at six milliseconds each, so the user spoke, saw
+            # nothing, spoke again, and then watched every sentence they had
+            # said arrive at once and out of order with the conversation.
+            # Their own words appearing as they say them is the feature; the
+            # animation is decoration, so the animation gives way.
+            self._flush_typing()
         self._render_live(text)
+
+    def _tag_colour(self) -> QColor:
+        return {
+            "you":  qcol(C.WHITE),
+            "ai":   qcol(C.PRI),
+            "err":  qcol(C.RED),
+            "file": qcol(C.GREEN),
+            "sys":  qcol(C.ACC2),
+        }.get(self._tag, qcol(C.TEXT))
+
+    def _flush_typing(self) -> None:
+        """Land every line that is still being typed out, immediately.
+
+        The guard is not defensive tidiness: _next() refills _text from the
+        queue, so this drains lines that arrive while it runs, and a log that
+        somehow never empties must not take the interface with it.
+        """
+        guard = 0
+        while self._typing and guard < 500:
+            guard += 1
+            cur = self.textCursor()
+            cur.movePosition(cur.MoveOperation.End)
+            if self._pos < len(self._text):
+                fmt = cur.charFormat()
+                fmt.setForeground(QBrush(self._tag_colour()))
+                cur.insertText(self._text[self._pos:], fmt)
+                self._pos = len(self._text)
+                self.setTextCursor(cur)
+            else:
+                self._tmr.stop()
+                cur.insertText("\n")
+                self.setTextCursor(cur)
+                self._next()          # straight on, without the 20 ms hop
+        self.ensureCursorVisible()
 
     def _render_live(self, text: str):
         cur = self.textCursor()
@@ -873,14 +912,7 @@ class LogWidget(QTextEdit):
 
             cur = self.textCursor()
             fmt = cur.charFormat()
-            col = {
-                "you":  qcol(C.WHITE),
-                "ai":   qcol(C.PRI),
-                "err":  qcol(C.RED),
-                "file": qcol(C.GREEN),
-                "sys":  qcol(C.ACC2),
-            }.get(self._tag, qcol(C.TEXT))
-            fmt.setForeground(QBrush(col))
+            fmt.setForeground(QBrush(self._tag_colour()))
             cur.movePosition(cur.MoveOperation.End)
             cur.insertText(chunk, fmt)
             self.setTextCursor(cur)
@@ -2793,6 +2825,24 @@ class MainWindow(QMainWindow):
         self._metric_tmr.timeout.connect(self._update_metrics)
         self._metric_tmr.start(2000)
         self._update_metrics()
+
+        # Is the interface thread actually running? A slot can be entered and
+        # its text still not reach the screen, because painting only happens
+        # when the event loop gets a turn. This ticks twice a second and says
+        # so whenever it did not — which is the difference between "the words
+        # never arrived" and "the window was frozen when they did".
+        self._beat_at = time.time()
+
+        def _beat():
+            now = time.time()
+            late = now - self._beat_at - 0.5
+            self._beat_at = now
+            if late > 1.0:
+                print(f"[UI] main thread stalled {late:.1f}s", flush=True)
+
+        self._beat_tmr = QTimer(self)
+        self._beat_tmr.timeout.connect(_beat)
+        self._beat_tmr.start(500)
 
         self._log_sig.connect(self._log.append_log)
         self._live_sig.connect(self._apply_live_transcript)

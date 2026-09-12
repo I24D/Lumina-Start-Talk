@@ -231,11 +231,15 @@ SEND_SAMPLE_RATE    = 16000
 RECEIVE_SAMPLE_RATE = 24000
 CHUNK_SIZE          = 1024
 
-# Client-side VAD complements Gemini's automatic detector. The server still
-# detects speech starts (and remains the fallback for speech ends), while this
-# detector flushes the stream after a natural pause so the model can begin its
-# response without waiting on a delayed remote timeout.
-_LOCAL_VAD_MIN_START_LEVEL   = 0.20
+# A client-side detector, used now only to light the "Listening..." hint and
+# to time the reply-latency line. It no longer touches the audio stream: it
+# used to end the stream after every pause, which deafened whole sessions.
+#
+# The floor is measured, not guessed. This room reads 0.231 on average with
+# nobody talking and peaks at 0.334, so the old 0.20 start threshold fired
+# continuously on an empty room — thirty-one times in one session. Speech from
+# the same microphone clears 0.5 comfortably.
+_LOCAL_VAD_MIN_START_LEVEL   = 0.40
 _LOCAL_VAD_MIN_END_LEVEL     = 0.08
 _LOCAL_VAD_START_BLOCKS      = 3
 _LOCAL_VAD_SILENCE_BLOCKS    = 10  # 640 ms at 16 kHz / 1024 samples
@@ -1143,6 +1147,9 @@ class JarvisLive:
         self._last_spoke_at       = 0.0
         # Set once the speaker is open, from the name of the device it opened.
         self._full_duplex         = False
+        # Audio blocks that actually reached the model. Proof of the
+        # one link that used to report nothing either way.
+        self._sent_blocks         = 0
         self._speaking_lock       = threading.Lock()
         self._phone_active        = False   # True while phone mic is streaming; pauses PC mic
         self._pending_vision       = None    # (img_bytes, mime_type, question, angle) to inject after tool response
@@ -1505,26 +1512,15 @@ class JarvisLive:
             response_modalities=["AUDIO"],
             output_audio_transcription={},
             input_audio_transcription={},
-            # End the user's turn promptly instead of relying on the service's
-            # more conservative defaults. Five hundred milliseconds preserves
-            # natural clause pauses while removing the long wait after speech.
-            realtime_input_config=types.RealtimeInputConfig(
-                automatic_activity_detection=types.AutomaticActivityDetection(
-                    disabled=False,
-                    start_of_speech_sensitivity=(
-                        types.StartSensitivity.START_SENSITIVITY_HIGH
-                    ),
-                    end_of_speech_sensitivity=(
-                        types.EndSensitivity.END_SENSITIVITY_HIGH
-                    ),
-                    prefix_padding_ms=80,
-                    silence_duration_ms=500,
-                ),
-                activity_handling=(
-                    types.ActivityHandling.START_OF_ACTIVITY_INTERRUPTS
-                ),
-                turn_coverage=types.TurnCoverage.TURN_INCLUDES_ONLY_ACTIVITY,
-            ),
+            # No realtime_input_config. The upstream project this is forked
+            # from does not set one, and setting one is what stopped her
+            # hearing: turn_coverage=TURN_INCLUDES_ONLY_ACTIVITY admits only
+            # the audio the server's own detector marks as activity and
+            # discards the rest, so a detection that misfires throws the
+            # user's whole sentence away — no transcript, no answer, for the
+            # life of the session. Measured on one such session: thirty-one
+            # utterances captured and sent, zero transcriptions returned.
+            # The service's defaults handle turn-taking perfectly well.
             system_instruction="\n".join(parts),
             tools=[{"function_declarations": TOOL_DECLARATIONS + self._plugin_registry.get_tool_declarations()}],
             # Hand back the handle captured from the last session_resumption
@@ -1821,13 +1817,35 @@ class JarvisLive:
     async def _send_realtime(self):
         while True:
             msg = await self.out_queue.get()
-            if msg.get("audio_stream_end"):
-                await self.session.send_realtime_input(audio_stream_end=True)
-            else:
-                # The 2.5 native-audio configuration with proactive and
-                # affective audio requires the legacy media transport. The
-                # newer audio= field is rejected when those features are on.
+            # The 2.5 native-audio configuration with proactive and affective
+            # audio requires the legacy media transport. The newer audio=
+            # field is rejected when those features are on.
+            #
+            # Nothing else goes down this channel. A client-side detector used
+            # to send audio_stream_end after every pause of 640 ms, to hurry
+            # the turn along, and that is what left sessions deaf for their
+            # whole life: audio_stream_end tells the server the audio stream
+            # is over, the room's own noise floor measured 0.23 against the
+            # detector's 0.20 threshold, and one session announced the end of
+            # its audio thirty-one times while transcribing nothing at all.
+            # The server's own activity detection is configured and enabled a
+            # few hundred lines up; it does not need the help.
+            try:
                 await self.session.send_realtime_input(media=msg)
+            except Exception as exc:
+                # This task is the only path audio has to the model. If it
+                # dies the microphone keeps working, the meters keep moving
+                # and nothing is ever transcribed again — the exact shape of
+                # the failure being chased, and until now the one link in the
+                # chain that reported nothing at all.
+                print(f"[JARVIS] ⛔ audio send failed: {type(exc).__name__}: {exc}",
+                      flush=True)
+                raise
+            self._sent_blocks += 1
+            if self._sent_blocks % 1000 == 0:      # about once a minute
+                print(f"[JARVIS] ⇢ {self._sent_blocks} audio blocks sent "
+                      f"({self._sent_blocks * CHUNK_SIZE / SEND_SAMPLE_RATE:.0f}s)",
+                      flush=True)
 
     async def _listen_audio(self):
         print("[JARVIS] 🎤 Mic started")
@@ -1839,13 +1857,10 @@ class JarvisLive:
             try:
                 self.out_queue.put_nowait(message)
             except asyncio.QueueFull:
-                # A delayed stream end is preferable to losing it completely.
-                # Normal audio remains best effort because blocking PortAudio's
-                # callback would cause larger gaps in the captured stream.
-                if message.get("audio_stream_end"):
-                    asyncio.create_task(self.out_queue.put(message))
-                else:
-                    _diag("microphone queue full; dropping one audio block")
+                # Best effort: blocking PortAudio's callback to wait for room
+                # would tear a hole in the captured stream, which is worse
+                # than losing the block that would not fit.
+                _diag("microphone queue full; dropping one audio block")
 
         def callback(indata, frames, time_info, status):
             # Stamped on every block, before any gate: this is proof the device
@@ -1864,7 +1879,7 @@ class JarvisLive:
                 level = _pcm_level(indata)
                 loop.call_soon_threadsafe(enqueue_realtime, {
                     "data": data,
-                    "mime_type": "audio/pcm;rate=16000",
+                    "mime_type": "audio/pcm",       # exactly what upstream sends
                 })
 
                 vad_event = local_vad.process(level)
@@ -1880,13 +1895,13 @@ class JarvisLive:
                         self.ui.set_live_transcript("You: Listening...")
                     _diag("local VAD: speech started")
                 elif vad_event == "end":
+                    # Noted for the latency line, and nothing more. This used
+                    # to tell the server the audio stream had ended, which is
+                    # what deafened whole sessions — see _send_realtime.
                     ended_at = time.monotonic()
                     self._last_user_speech = ended_at
                     self._last_voice_end = ended_at
-                    loop.call_soon_threadsafe(
-                        enqueue_realtime, {"audio_stream_end": True}
-                    )
-                    _diag("local VAD: speech ended; flushing audio stream")
+                    _diag("local VAD: speech ended")
 
                 # Counted here rather than at the top of the callback: only
                 # audio that was actually sent can be evidence that sending is
@@ -2044,8 +2059,20 @@ class JarvisLive:
         out_buf = _TranscriptAccumulator()
         in_buf = _TranscriptAccumulator()
 
+        _streams = 0
         try:
             while True:
+                # Each pass opens a fresh receive stream. The loop exists so a
+                # stream that finishes normally is replaced instead of ending
+                # the task — but a finished stream on a session the server has
+                # given up on yields nothing, forever, without raising. That
+                # is silence with no error anywhere while audio keeps being
+                # sent, which is exactly the failure being chased, so every
+                # pass after the first is worth knowing about.
+                _streams += 1
+                if _streams > 1:
+                    print(f"[JARVIS] ♻️ receive stream ended — opening #{_streams}",
+                          flush=True)
                 async for response in self.session.receive():
 
                     # ── Session resumption ───────────────────────────────────
@@ -2139,7 +2166,13 @@ class JarvisLive:
                                 # is after the assistant has already answered —
                                 # useless for telling whether speech is arriving
                                 # while it is being spoken.
-                                print(f"[JARVIS] 🎧 {txt}", flush=True)
+                                # Timestamped because "the fragments arrive as
+                                # you speak" and "they all arrive at once when
+                                # you stop" print identically, and only the
+                                # first of those is real-time transcription.
+                                print(f"[JARVIS] 🎧 {time.strftime('%H:%M:%S')}"
+                                      f".{int(time.time() % 1 * 1000):03d} {txt}",
+                                      flush=True)
 
                                 if _is_close_phrase(in_buf.text):
                                     self._close_heard_at = time.monotonic()

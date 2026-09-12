@@ -56,6 +56,32 @@ problem, a quota problem or a microphone problem. It is none of those.
 Measured under `media=`: live fragments in the console and answers 1.1–3.9 s
 after the user stops speaking. Broken in `137714b`, restored in `3eb8a12`.
 
+### 1b. Do not set `realtime_input_config`. The upstream project does not
+
+This one cost a day. `_build_config` must not pass a `RealtimeInputConfig`, and
+in particular not `turn_coverage=TURN_INCLUDES_ONLY_ACTIVITY`, which admits
+only the audio the server's own detector marks as activity and discards the
+rest. When that detection misfires the user's whole sentence is thrown away
+before the model sees it.
+
+**Symptom when broken:** a session that is born deaf and stays deaf. It
+connects, answers typed text, moves its meters, detects speech locally — one
+session logged thirty-one utterances captured and sent — and returns zero
+transcriptions for its entire life. Intermittent, because it depends on how
+the server's detector happens to behave that session, which is why it survived
+so many attempted fixes: every one of them was aimed at something that was
+working.
+
+The same applies to the client sending `audio_stream_end` after each pause.
+That tells the server the audio stream is over; the local detector was firing
+on the room's own noise floor (measured 0.23 against its 0.20 threshold) and
+announcing the end of the audio dozens of times a minute. Neither is needed:
+the service's own turn-taking has handled this since the first commit.
+
+Compare against `git show $(git rev-list --max-parents=0 HEAD):main.py` before
+adding anything to that config. Upstream sends `{"data": ..., "mime_type":
+"audio/pcm"}` and nothing else.
+
 ### 2. The deafness watchdog may only rebuild a session that has never heard anything
 
 `self._heard_this_session` counts transcriptions since the session connected.
