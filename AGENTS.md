@@ -83,6 +83,22 @@ Compare against `git show $(git rev-list --max-parents=0 HEAD):main.py` before
 adding anything to that config. Upstream sends `{"data": ..., "mime_type":
 "audio/pcm"}` and nothing else.
 
+### 1c. Nothing else may open this microphone
+
+Windows speech recognition was run beside the session to show the user his
+words while he spoke. It opens the capture device itself, turns the device
+volume down with its own gain control, and every other stream on that device —
+including the one the model is fed — reads a flat 0.5 RMS for as long as it
+runs. Measured median 88.7 RMS without it and 1.0 with it, in either start
+order.
+
+**Symptom when broken:** the assistant goes nearly deaf and nothing notices.
+The local detector and the deafness watchdog read the same level, so a whole
+session logs a peak of 0.00, no speech detected and no rebuild, while the odd
+sentence still gets through between recogniser restarts — which makes it look
+intermittent. `_DICTATION_ON` is off for this reason. Anything that wants the
+audio takes it from `_listen_audio`, never from the device.
+
 ### 2. The deafness watchdog may only rebuild a session that has never heard anything
 
 `self._heard_this_session` counts transcriptions since the session connected.

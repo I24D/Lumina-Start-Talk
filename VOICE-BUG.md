@@ -214,43 +214,49 @@ backlog: the seconds were arithmetic on the block count, so they read `64s` per
 1000 blocks whether the stream was live or an hour behind. It now prints the
 wall clock beside them.
 
-## The live line no longer comes from the conversation
+## Windows dictation: built, measured, and turned off
 
-The user's question was the right one: dictation into a chat box shows his
-words as he says them, so why is this hard? It is not hard. It was wired to the
-wrong source.
+The user asked why dictation into a chat box shows his words as he says them
+and this does not. The diagnosis still stands: `input_audio_transcription`
+arrives on the conversation socket, so the live line dies whenever the session
+does. The first remedy did not survive measurement.
 
-`input_audio_transcription` arrives on the same socket that does turn-taking,
-accumulates context, generates her voice and runs tools, so the transcript sits
-downstream of all of it. When the session degrades the transcript dies with it
-— measured, not supposed: on 2026-09-12 her speech and his transcript slowed in
-the same turn.
+`WindowsDictation` (`core/stt.py`) ran the operating system recogniser beside
+the session. Windows will not accept audio for it; it opens the microphone
+itself. On this machine that silences every other client of the same device.
 
-So the live line is now driven by `WindowsDictation` (`core/stt.py`), the
-operating system's own recogniser, running beside the session. It holds no
-conversation and has nothing to degrade.
+Measured 2026-09-12, Lumina closed, one arm per process, raw int16 RMS of a
+16 kHz stream opened the way `_listen_audio` opens it:
 
-- **The model still wins whenever it speaks.** `_live_has_text` is set by the
-  first fragment of a turn and cleared at `turn_complete`; the dictation writes
-  only while it is false. Its words therefore reach the screen in exactly one
-  case: the model returned nothing for this turn — which is the bug.
-- **It is muted while she talks** on open speakers, through `set_speaking`.
-  Windows will not let a recogniser be fed audio, it opens the microphone
-  itself, so it hears her echo whatever this process does with its own stream.
-  Measured: a second continuous session opens fine with Lumina already holding
-  the device, so the two coexist.
-- **It refuses rather than guess.** A recogniser for the wrong language does
-  not fail, it returns confident nonsense and writes it under the user's name,
-  so a missing pack turns the feature off and says which language is missing.
-- **It never starts per session.** Started once in `run()`, so every reconnect
-  and every rebuild leaves it running.
+| arm | stream median | CPU of the process |
+|---|---|---|
+| no recogniser | 88.7 | 0.6% |
+| recogniser running, then stream opened | 1.0 | 1.5% |
+| stream open, before the recogniser starts | 75.0 | 0.9% |
+| the same stream, after it starts | 1.0 | 1.4% |
 
-This changes what a silence looks like, which is worth as much as the feature.
-Words appearing with no answer behind them means the model stopped; nothing
-appearing at all means the microphone did. Those used to be the same picture.
+Sampled once a second, the mechanism has two parts. Within two seconds of the
+recogniser starting, the capture endpoint master volume drops from 0.941 to
+0.550 — its own gain control, applied to the whole device — and the other
+stream then reads a flat 0.5 RMS, which is not a quieter signal but silence.
+Both undo themselves when the recogniser process exits: a fresh process read
+0.941 again.
 
-**It is not a fix for the model going quiet.** It is the other half of the
-requirement, made independent of it.
+What that did in practice: the 2.5 h session run with it on logged a normal
+microphone level on connection 1, then a peak of 0.00 on every one of the next
+sixteen connections, zero local speech detections and zero deafness rebuilds.
+The watchdog reads the same level, so it could not see anything wrong. The
+model was being fed that stream the whole time.
+
+So `_DICTATION_ON` defaults to off, and `LUMINA_DICTATION=on` brings it back for
+a machine where the same A/B says it is harmless. The class is kept for that.
+
+**The remedy that fits** is a recogniser fed from the stream this process
+already captures — one that accepts PCM, such as Vosk — so that no second
+client ever opens the device. Not built yet.
+
+The recogniser costs about 1.5% of one core. It is not what held that session
+at roughly 1.4 cores, which is still unexplained.
 
 ## Why it never recovers: the handle is replayed into the fault
 

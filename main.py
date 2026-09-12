@@ -203,6 +203,29 @@ try:
     ).strip().lower() not in ("0", "off", "false", "no")
 except Exception:
     pass
+
+# Windows dictation beside the live session (core/stt.py). OFF by default,
+# because on this machine it silences the microphone Lumina itself reads.
+#
+# Measured 2026-09-12 with a standalone A/B, Lumina closed, one arm per process:
+# the stream median fell from 88.7 RMS with no recogniser to 1.0 RMS with one
+# running, and an already-open stream fell from 75.0 to 1.0 the moment the
+# recogniser started. The model is fed that stream, so for as long as the
+# recogniser runs the assistant is close to deaf — and neither the local speech
+# detector nor the deafness watchdog can notice, because both read that same
+# level. A 2.5 h session with it on logged zero local speech detections and a
+# peak of 0.00 across sixteen connections.
+#
+# The recogniser itself costs about 1.5% of one core, so it is not what held the
+# process at 1.4 cores. LUMINA_DICTATION=on brings it back, for a machine where
+# the same A/B says it is harmless.
+_DICTATION_ON = False
+try:
+    _DICTATION_ON = _os_cfg.environ.get(
+        "LUMINA_DICTATION", "off"
+    ).strip().lower() in ("1", "on", "true", "yes")
+except Exception:
+    pass
 # How long the microphone may go without delivering a single block before it is
 # treated as dead rather than as a quiet room. Blocks arrive continuously while
 # a stream is healthy — silence still produces them — so a gap this long means
@@ -3236,9 +3259,14 @@ class JarvisLive:
         # rebuild and every quiet stretch below leaves it running, so the words
         # keep appearing while the part that answers them is being rebuilt.
         try:
-            self._dictation = WindowsDictation(self._on_dictation)
-            if not self._dictation.start():
-                self._dictation = None
+            if not _DICTATION_ON:
+                print("[Dictation] off - it silences this microphone on this "
+                      "machine (see _DICTATION_ON); LUMINA_DICTATION=on to "
+                      "re-enable", flush=True)
+            else:
+                self._dictation = WindowsDictation(self._on_dictation)
+                if not self._dictation.start():
+                    self._dictation = None
         except Exception as exc:
             # Never fatal. An assistant with no live line still hears and still
             # answers; one that will not start because of a speech pack is
