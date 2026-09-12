@@ -205,6 +205,27 @@ _DEAF_SILENCE_SECONDS = 25.0
 _DEAF_VOICE_LEVEL     = 0.15    # well above a room; a person talking clears it
 _DEAF_COOLDOWN        = 120.0   # never rebuild more often than this
 _DEAF_ECHO_TAIL       = 2.0     # her own voice keeps arriving after she stops
+
+# Full duplex: whether the microphone may stay open while she speaks.
+#
+# It normally may not. Measured in this room with the speakers on, her own
+# voice comes back into the microphone at up to full scale — louder than the
+# level a person talking reaches — so no threshold can separate her from the
+# user, and forwarding it means she transcribes herself, interrupts herself,
+# and acts on her own words. That is what once had her open Facebook and
+# query Copilot three times over.
+#
+# Headphones remove the path entirely: nothing she says reaches the
+# microphone, so it can stay open permanently and the user can cut her off by
+# speaking, the way they would interrupt a person. Windows renames the
+# endpoint when they are plugged in, which is the whole detection.
+_HEADPHONE_WORDS = ("headphone", "headset", "earphone", "earbud",
+                    "auricular", "audifono", "audífono")
+
+
+def _is_headphones(device_name: str) -> bool:
+    name = (device_name or "").casefold()
+    return any(word in name for word in _HEADPHONE_WORDS)
 CHANNELS            = 1
 SEND_SAMPLE_RATE    = 16000
 RECEIVE_SAMPLE_RATE = 24000
@@ -1120,6 +1141,8 @@ class JarvisLive:
         # microphone for a moment after the gate reopens, and that echo is
         # not the user talking.
         self._last_spoke_at       = 0.0
+        # Set once the speaker is open, from the name of the device it opened.
+        self._full_duplex         = False
         self._speaking_lock       = threading.Lock()
         self._phone_active        = False   # True while phone mic is streaming; pauses PC mic
         self._pending_vision       = None    # (img_bytes, mime_type, question, angle) to inject after tool response
@@ -1807,7 +1830,12 @@ class JarvisLive:
             self._last_mic_block = time.monotonic()
             with self._speaking_lock:
                 jarvis_speaking = self._is_speaking
-            if not jarvis_speaking and not self.ui.muted and not self._phone_active:
+            # Her own speech only has to close the microphone when it can come
+            # back through it. On headphones it cannot, so it stays open and
+            # the user can talk over her at any point — which is the whole
+            # difference between a voice assistant and a monologue.
+            if ((not jarvis_speaking or self._full_duplex)
+                    and not self.ui.muted and not self._phone_active):
                 data = indata.tobytes()
                 level = _pcm_level(indata)
                 loop.call_soon_threadsafe(enqueue_realtime, {
@@ -2229,6 +2257,26 @@ class JarvisLive:
         _spk_dev  = audio_devices.resolve(_spk_name, "output")
         if _spk_dev is not None:
             print(f"[JARVIS] 🔊 Output device: {_spk_name}")
+
+        # get_output_device() returns "" for "whatever Windows is using", which
+        # is the common case and is also the case where the user has just
+        # plugged headphones in. Ask the sound card what that resolves to.
+        _spk_actual = _spk_name
+        if not _spk_actual:
+            try:
+                _spk_actual = str(sd.query_devices(kind="output")["name"])
+            except Exception:
+                _spk_actual = ""
+
+        self._full_duplex = _is_headphones(_spk_actual)
+        if self._full_duplex:
+            print("[JARVIS] 🎧 Headphones — microphone stays open while she "
+                  "speaks; you can interrupt her by talking", flush=True)
+            self.ui.write_log("SYS: Headphones detected — you can interrupt me by speaking.")
+        else:
+            print(f"[JARVIS] 🔇 '{_spk_actual or 'system default'}' is not "
+                  "headphones — microphone closes while she speaks, to stop "
+                  "her hearing herself", flush=True)
 
         def _open_spk(dev):
             try:
