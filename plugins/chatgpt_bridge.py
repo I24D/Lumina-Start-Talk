@@ -937,9 +937,12 @@ def _act_close() -> str:
         return f"I could not close ChatGPT: {exc}"
     for _ in range(15):
         time.sleep(0.3)
-        if _chatgpt_hwnd() is None:
-            return "The ChatGPT desktop app is closed."
-    return "I asked ChatGPT to close, but its window is still open."
+        try:
+            if not win32gui.IsWindow(hwnd) or not win32gui.IsWindowVisible(hwnd):
+                return "The ChatGPT desktop window is closed."
+        except Exception:
+            return "The ChatGPT desktop window is closed."
+    return "I asked ChatGPT to close, but its desktop window is still visible."
 
 
 def run(parameters: dict, player=None, session_memory=None) -> str:
