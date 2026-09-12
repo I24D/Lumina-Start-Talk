@@ -20,6 +20,7 @@ Start it with `.venv\Scripts\python.exe main.py` and watch the marks:
 | `💬 replying...` | she began answering, and how long after the user stopped |
 | `🔈 Spoke` | audio actually reached the speakers, and for how long |
 | `🙉` | the deafness watchdog rebuilt the session |
+| `[VOICE REC]` | every 15 s: whether the server, the microphone, the send path and this event loop are each still alive. Read it before forming any theory about a silence — see VOICE-BUG.md |
 
 Counting `🎧` over one real conversation is the test for almost everything
 here. Zero of them with the microphone open means the audio is not arriving.

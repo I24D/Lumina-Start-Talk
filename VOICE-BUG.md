@@ -5,6 +5,11 @@ fixed four real faults along the way, none of which was the whole story. This
 is the handover: what the user sees, everything that was measured, everything
 that was ruled out, and where the evidence points now.
 
+**Read `[VOICE REC]` first.** The 2026-09-12 pass added a flight recorder that
+answers, every fifteen seconds, the four questions this bug has always turned
+on. Until then every silence had to be argued about, and every argument about
+it was wrong. See *The flight recorder* below.
+
 Read it before changing anything. Most of a day was lost to fixes aimed at
 parts that turned out to be working perfectly.
 
@@ -48,8 +53,48 @@ Start-Process -FilePath ".venv\Scripts\python.exe" -ArgumentList "main.py" `
 | `💀 nothing from the server for Ns` | the dead-session watchdog fired |
 | `👋 server is ending the session` | the server sent `go_away` |
 | `[UI] main thread stalled Ns` | the interface froze |
+| `[VOICE REC] ...` | the flight recorder, once every 15 s — see below |
 
 Counting `🎧` over one real conversation is the test for nearly everything.
+
+## The flight recorder
+
+Four faults produce the one symptom the user reports — he talks and nothing
+comes back — and for a day none of them could be told apart, because none of
+the four was ever printed. `[VOICE REC]` prints all four, every fifteen
+seconds, for the life of every session:
+
+```
+[VOICE REC] 2:32 | srv 0.2s ago | rx audio×61 heard×12 turn×1 | mic 234 peak 0.52 | snd 234 q0 | play q2 | lag 14ms
+```
+
+| field | what it answers |
+|---|---|
+| `srv` | how long since the receive stream yielded **anything at all** |
+| `rx` | what it yielded, by kind: `heard` `interim` `said` `audio` `turn` `tool` `resume` `usage` `other` |
+| `mic` | blocks the device delivered, counted **before** the speaking gate |
+| `peak` | loudest block actually forwarded — was anyone talking |
+| `snd` | blocks that reached the model, and the depth of the send queue |
+| `play` | chunks of her voice waiting for the sound card |
+| `lag` | worst overshoot on a 250 ms sleep — this event loop being held |
+
+Read one line and the silence names itself:
+
+- **`rx` empty, `mic` counting, `peak` high.** He is speaking, the audio is
+  leaving, the server has stopped answering. Nothing local is wrong and
+  nothing local will fix it.
+- **`rx` carrying `usage` or `resume` but no `heard`.** The session is being
+  served and is not transcribing. That points at the configuration it was
+  opened with, not at the network.
+- **`lag` in the hundreds of milliseconds.** Something is holding the event
+  loop, and every other number on the line is late rather than true. That one
+  is a bug in this process.
+- **`snd` far below `mic`, or `drop` appearing.** Audio is captured faster than
+  it is sent, so the model is answering the past.
+
+It only watches. It sends nothing and rebuilds nothing — three watchdogs have
+now destroyed conversations that were working, and an instrument that can do
+that is not an instrument.
 
 ## The failure, measured
 
@@ -135,29 +180,72 @@ tuning it a fourth time.
 0.334 peak** with nobody talking. Anything lower counts an empty room as
 speech. Measure before changing it.
 
+## The 2026-09-12 session, measured
+
+`enable_affective_dialog` and `proactive_audio` are gone (`162f11d`), the
+transport is v1beta, and **the fault survived all three**. That closes the
+hypothesis the previous handover ended on. What one full session
+(`lumina-baseline-20260912-011819.log`, eight minutes) actually shows:
+
+- **Four consecutive turns were perfect.** Fragments every 120–180 ms while he
+  spoke, replies 1.2–1.9 s after he stopped.
+- **Then both directions slowed at once.** The turn at 01:20:12 delivered 5.7 s
+  of *her own* speech over roughly 14 s of wall clock. The very next stretch
+  returned no transcript for 114 s, then fragments 5–20 s apart: `Per` at
+  01:22:07, `fect` five seconds later, `o` ten seconds after that. One sentence
+  took over a minute and came back truncated.
+- **It recovered twice.** 01:23:45 and 01:26:19 were real-time again, at full
+  speed, with no reconnect in between.
+
+That the *output* degraded in the same turn as the input is the new fact. This
+is not the microphone, not the transcription, and not the interface: the whole
+session slows down and speeds back up.
+
+**Ruled out by this run, additionally:**
+
+- **Session resumption.** This was the first connect of the process, so
+  `handle` was `None` and the configuration was upstream's exactly, apart from
+  one field. It degraded anyway.
+- **A local audio backlog.** 7000 blocks of audio left the process in 470 s of
+  wall clock — real time, throughout the failure.
+
+Note that the old `⇢ N audio blocks sent (64s)` line could never have shown a
+backlog: the seconds were arithmetic on the block count, so they read `64s` per
+1000 blocks whether the stream was live or an hour behind. It now prints the
+wall clock beside them.
+
 ## Where the evidence points
 
-The remaining difference from the upstream project that works:
+Against the first commit, which the user reports streamed reliably, the whole
+of what this session now asks for and that one did not is:
 
 ```python
-cfg["enable_affective_dialog"] = True                       # upstream: absent
-cfg["proactivity"] = ProactivityConfig(proactive_audio=True) # upstream: absent
+context_window_compression=ContextWindowCompressionConfig(sliding_window=...)
+speech_config=SpeechConfig(...)                       # the chosen voice
+tools=[... + self._plugin_registry.get_tool_declarations()]
+session_resumption=SessionResumptionConfig(handle=...)  # ruled out above
 ```
 
-Both are hard-coded on (`main.py`, around line 1248) and both force the
-connection onto the **v1alpha** endpoint. Upstream uses neither and, per the
-user, streams reliably.
+Of those, **context window compression is the only one whose cost grows with
+the length of the session**, and session length is the axis this fault lives
+on: it works for four minutes and then does not. That is a suspect, not a
+finding — the arithmetic says a native-audio session should not be near the
+compression trigger in eight minutes, so it may well be innocent.
 
-That is a hypothesis, not a finding. It has not been tested, because the user
-asked for `proactive_audio` to be kept and it is not Claude's call to remove.
-**The experiment is one flag and a stopwatch**: disable `enable_affective_dialog`
-alone, count turns to failure; then disable `proactivity` as well, which drops
-the session to the stable endpoint, and count again. Three runs each. If the
-stable endpoint survives and v1alpha does not, that is the answer, and the
-trade-off then belongs to the user.
+**The experiment is one variable and a stopwatch.** It needs no edit:
 
-Ask him before turning `proactive_audio` off, even temporarily. He has said he
-wants it.
+```powershell
+$env:LUMINA_COMPRESSION="off"; .venv\Scripts\python.exe -u main.py
+```
+
+The session line says which arm ran (`context compression: on|off`). Talk for
+fifteen minutes under each and compare the `[VOICE REC]` lines. If compression
+is the cause, the cost of removing it is that a very long conversation ends in
+a reconnect rather than being compressed in place — a few seconds, and session
+resumption already carries the conversation across it.
+
+If both arms degrade identically, compression is innocent and the recorder will
+say what to look at next. Do not change a second variable before that answer.
 
 ## Known and unfixed, separate from the above
 

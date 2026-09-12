@@ -176,6 +176,32 @@ API_CONFIG_PATH = BASE_DIR / "config" / "api_keys.json"
 PROMPT_PATH     = BASE_DIR / "core" / "prompt.txt"
 LIVE_MODEL          = "models/gemini-2.5-flash-native-audio-preview-12-2025"
 LIVE_API_VERSION    = "v1beta"
+
+# Sliding-window context compression, on by default, and switchable without an
+# edit so it can be measured rather than argued about.
+#
+# It is one of only two things this session asks for that the upstream project
+# does not, and the other — replaying a resumption handle — is already ruled
+# out for the run that failed on 2026-09-12: that was a first connect, so the
+# handle was None and the configuration was upstream's exactly apart from this
+# field, and it degraded anyway. Compression is a server-side operation on the
+# conversation so far, which makes it the one remaining candidate whose cost
+# grows with session length — and session length is the axis this fault lives
+# on. It works for four minutes and then does not.
+#
+# That is a suspect, not a finding, and it is left on until a measured run says
+# otherwise. Turn it off for one run with LUMINA_COMPRESSION=off and compare
+# the [VOICE REC] lines; the trade-off if it turns out to be the cause is that
+# a very long conversation will eventually hit the context limit instead of
+# being compressed, which is a reconnect rather than a failure.
+_COMPRESSION_ON = True
+try:
+    import os as _os_cfg
+    _COMPRESSION_ON = _os_cfg.environ.get(
+        "LUMINA_COMPRESSION", "on"
+    ).strip().lower() not in ("0", "off", "false", "no")
+except Exception:
+    pass
 # How long the microphone may go without delivering a single block before it is
 # treated as dead rather than as a quiet room. Blocks arrive continuously while
 # a stream is healthy — silence still produces them — so a gap this long means
@@ -1219,6 +1245,25 @@ class JarvisLive:
         # microphone thread checks it before writing a placeholder over them.
         self._live_has_text = False
 
+        # ── Voice flight recorder ───────────────────────────────────────────
+        # Every silence in this app looks the same from the outside: the user
+        # talks and nothing comes back. Four very different faults produce it —
+        # the server stopped sending, the microphone stopped delivering, the
+        # audio stopped leaving at the rate it arrives, or this event loop
+        # stopped running — and none of them could be told apart, because none
+        # of the four was ever printed. A session that degraded after four
+        # minutes and one that never worked read identically in the log.
+        #
+        # These are sampled by _run_voice_recorder on a fixed cadence. Nothing
+        # here writes to the session, sends anything, or rebuilds anything: a
+        # measurement that changes what it measures is how the last three
+        # watchdogs destroyed healthy conversations.
+        self._rx_at = 0.0                       # last message the stream yielded
+        self._rx_kinds: dict[str, int] = {}     # what kind, since the last record
+        self._mic_blocks = 0                    # delivered by the device, pre-gate
+        self._mic_peak = 0.0                    # loudest block since the last record
+        self._mic_dropped = 0                   # blocks the send queue had no room for
+
         # Keep the server audio configuration at its proven baseline. Optional
         # affective and proactive fields have both produced sessions that accept
         # microphone audio but never return a transcription. The application's
@@ -1528,11 +1573,6 @@ class JarvisLive:
             session_resumption=types.SessionResumptionConfig(
                 handle=self._resume_handle
             ),
-            # Sliding-window compression: session never dies from a full context
-            # window — JARVIS can stay in one conversation for hours
-            context_window_compression=types.ContextWindowCompressionConfig(
-                sliding_window=types.SlidingWindow(),
-            ),
             speech_config=types.SpeechConfig(
                 voice_config=types.VoiceConfig(
                     prebuilt_voice_config=types.PrebuiltVoiceConfig(
@@ -1541,6 +1581,15 @@ class JarvisLive:
                 )
             ),
         )
+
+        # Sliding-window compression: the session never dies of a full context
+        # window, so one conversation can run for hours. Added here rather than
+        # in the dict above so a measured run can leave it out entirely — see
+        # _COMPRESSION_ON. Leaving it out is upstream's configuration.
+        if _COMPRESSION_ON:
+            cfg["context_window_compression"] = types.ContextWindowCompressionConfig(
+                sliding_window=types.SlidingWindow(),
+            )
         return types.LiveConnectConfig(**cfg)
 
     async def _execute_tool(self, fc) -> types.FunctionResponse:
@@ -1800,6 +1849,10 @@ class JarvisLive:
         )
 
     async def _send_realtime(self):
+        # Stamped per session, because _sent_blocks counts for the life of the
+        # process and the line below needs a rate, not a total.
+        _began = time.monotonic()
+        _began_at = self._sent_blocks
         while True:
             msg = await self.out_queue.get()
             # This project's proven 2.5 native-audio path uses the legacy media
@@ -1827,8 +1880,17 @@ class JarvisLive:
                 raise
             self._sent_blocks += 1
             if self._sent_blocks % 1000 == 0:      # about once a minute
+                # Both clocks, because one of them alone says nothing. The
+                # seconds of audio are arithmetic on the block count and come
+                # out the same whether the stream is live or an hour behind;
+                # only the wall clock beside them can say which. A minute of
+                # audio delivered in a minute is a live microphone. A minute of
+                # audio delivered in two is a model answering the past, and it
+                # reads as "she got slow" rather than as the backlog it is.
+                _audio = (self._sent_blocks - _began_at) * CHUNK_SIZE / SEND_SAMPLE_RATE
+                _wall = time.monotonic() - _began
                 print(f"[JARVIS] ⇢ {self._sent_blocks} audio blocks sent "
-                      f"({self._sent_blocks * CHUNK_SIZE / SEND_SAMPLE_RATE:.0f}s)",
+                      f"({_audio:.0f}s of audio in {_wall:.0f}s)",
                       flush=True)
 
     async def _listen_audio(self):
@@ -1844,6 +1906,12 @@ class JarvisLive:
                 # Best effort: blocking PortAudio's callback to wait for room
                 # would tear a hole in the captured stream, which is worse
                 # than losing the block that would not fit.
+                #
+                # Counted as well as logged. This queue holds thirteen seconds
+                # of audio, so it can only fill if the send task stopped
+                # draining it — and until now that happened behind a diagnostic
+                # switch that is off by default, which is to say invisibly.
+                self._mic_dropped += 1
                 _diag("microphone queue full; dropping one audio block")
 
         def callback(indata, frames, time_info, status):
@@ -1851,6 +1919,10 @@ class JarvisLive:
             # is still delivering, which is a different question from whether we
             # are currently forwarding what it delivers.
             self._last_mic_block = time.monotonic()
+            # Counted here for the same reason the stamp above is taken here:
+            # "the device stopped delivering" and "we stopped forwarding what it
+            # delivers" are different faults with one symptom.
+            self._mic_blocks += 1
             with self._speaking_lock:
                 jarvis_speaking = self._is_speaking
             # Her own speech only has to close the microphone when it can come
@@ -1861,6 +1933,12 @@ class JarvisLive:
                     and not self.ui.muted and not self._phone_active):
                 data = indata.tobytes()
                 level = _pcm_level(indata)
+                # Loudest block the model was actually given since the last
+                # record. A silence with nothing above the noise floor in it is
+                # the user not talking; a silence full of clear speech is the
+                # session failing, and the log could not tell them apart.
+                if level > self._mic_peak:
+                    self._mic_peak = level
                 loop.call_soon_threadsafe(enqueue_realtime, {
                     "data": data,
                     "mime_type": "audio/pcm",       # exactly what upstream sends
@@ -2041,6 +2119,148 @@ class JarvisLive:
             print(f"[JARVIS] ❌ Mic: {e}")
             raise
 
+    def _note_rx(self, response) -> None:
+        """Record that the receive stream yielded something, and what it was.
+
+        The failure this file has been chasing is a stream that stops yielding
+        while the socket stays open and audio keeps being accepted. Nothing in
+        the process could see it, because only transcripts and audio were ever
+        printed — and the two possibilities look identical in that log while
+        meaning opposite things. A session still sending resumption updates and
+        usage metadata is alive and slow, and the fault is in what we asked it
+        for. A session sending nothing at all is gone, and the fault is the
+        connection. Counting every message by kind is what separates them.
+        """
+        self._rx_at = time.monotonic()
+        kinds = self._rx_kinds
+        seen = 0
+
+        def _note(kind: str) -> None:
+            nonlocal seen
+            seen += 1
+            kinds[kind] = kinds.get(kind, 0) + 1
+
+        if getattr(response, "data", None):
+            _note("audio")
+
+        sc = getattr(response, "server_content", None)
+        if sc is not None:
+            _tx = getattr(sc, "input_transcription", None)
+            if _tx is not None and getattr(_tx, "text", None):
+                _note("heard")
+            if getattr(sc, "interim_input_transcription", None) is not None:
+                _note("interim")
+            _out = getattr(sc, "output_transcription", None)
+            if _out is not None and getattr(_out, "text", None):
+                _note("said")
+            if getattr(sc, "turn_complete", None):
+                _note("turn")
+
+        if getattr(response, "tool_call", None):
+            _note("tool")
+        if getattr(response, "session_resumption_update", None) is not None:
+            _note("resume")
+
+        if not seen:
+            # Bookkeeping messages, counted only when they are all that came.
+            # They carry no transcript and no audio, so they cannot make the
+            # user's speech appear — but they are proof the session is still
+            # being served, which is the question that matters during a
+            # silence.
+            if getattr(response, "usage_metadata", None) is not None:
+                _note("usage")
+            else:
+                _note("other")
+
+    async def _run_voice_recorder(self) -> None:
+        """Print what the voice path is doing, on a fixed cadence.
+
+        Read one of these lines and a silence stops being a mystery:
+
+          `rx` empty while `mic` keeps counting and `peak` is high — the user
+          is speaking, the audio is leaving, and the server has stopped
+          answering. Nothing local can fix that and nothing local is wrong.
+
+          `rx` carrying `usage`/`resume` but no `heard` — the session is being
+          served and is not transcribing, which points at the configuration it
+          was opened with, not at the network.
+
+          `lag` in the hundreds of milliseconds — this event loop was held by
+          something else, and every other number on the line is late rather
+          than true. That is a bug in this process.
+
+          `snd` far below `mic`, or `drop` above zero — audio is being captured
+          faster than it is being sent, so the model is hearing the past.
+
+        This task only watches. It sends nothing, rebuilds nothing, and
+        cancels nothing: three watchdogs have now destroyed conversations that
+        were working, and an instrument that can do that is not an instrument.
+        """
+        _TICK = 0.25          # short enough that a real stall shows up as lag
+        _EVERY = 15.0         # one line every fifteen seconds
+
+        last_report = time.monotonic()
+        last_sent = self._sent_blocks
+        last_mic = self._mic_blocks
+        last_drop = self._mic_dropped
+        lag_max = 0.0
+
+        while True:
+            _before = time.monotonic()
+            await asyncio.sleep(_TICK)
+            # Overshoot on a sleep this short is the event loop being held by
+            # someone else. It is measured here rather than assumed because
+            # "the server went quiet" and "we stopped listening to the server"
+            # produce the same empty log.
+            lag_max = max(lag_max, time.monotonic() - _before - _TICK)
+
+            now = time.monotonic()
+            if now - last_report < _EVERY:
+                continue
+
+            # An instrument that can take down the thing it measures is not an
+            # instrument. This task lives in the session's TaskGroup, where one
+            # unhandled error ends the call, so a bad format string here must
+            # cost a line of log and nothing else.
+            try:
+                self._record_voice(now, last_sent, last_mic, last_drop, lag_max)
+            except Exception as exc:
+                print(f"[VOICE REC] recorder error: {type(exc).__name__}: {exc}",
+                      flush=True)
+
+            last_report = now
+            last_sent = self._sent_blocks
+            last_mic = self._mic_blocks
+            last_drop = self._mic_dropped
+            lag_max = 0.0
+            self._mic_peak = 0.0
+
+    def _record_voice(self, now: float, last_sent: int, last_mic: int,
+                      last_drop: int, lag_max: float) -> None:
+        """Write one flight-recorder line. Called only by _run_voice_recorder."""
+        sent = self._sent_blocks
+        mic = self._mic_blocks
+        drop = self._mic_dropped
+        kinds = self._rx_kinds
+        self._rx_kinds = {}
+
+        rx = " ".join(f"{k}×{v}" for k, v in sorted(kinds.items())) or "—"
+        quiet = (now - self._rx_at) if self._rx_at else (now - self._session_started)
+        age = now - self._session_started
+        out_q = self.out_queue.qsize() if self.out_queue else 0
+        play_q = self.audio_in_queue.qsize() if self.audio_in_queue else 0
+
+        print(
+            f"[VOICE REC] {int(age // 60):d}:{int(age % 60):02d}"
+            f" | srv {quiet:.1f}s ago | rx {rx}"
+            f" | mic {mic - last_mic} peak {self._mic_peak:.2f}"
+            f" | snd {sent - last_sent} q{out_q}"
+            f"{f' drop {drop - last_drop}' if drop != last_drop else ''}"
+            f" | play q{play_q}"
+            f" | lag {lag_max * 1000:.0f}ms",
+            flush=True,
+        )
+
     async def _receive_audio(self):
         print("[JARVIS] 👂 Recv started")
         out_buf = _TranscriptAccumulator()
@@ -2061,6 +2281,12 @@ class JarvisLive:
                     print(f"[JARVIS] ♻️ receive stream ended — opening #{_streams}",
                           flush=True)
                 async for response in self.session.receive():
+                    # Before anything is interpreted: this message existed.
+                    # Whether it carried speech is a separate question from
+                    # whether the server is still sending, and only the second
+                    # one can be answered during a silence.
+                    self._note_rx(response)
+
                     # ── Session resumption ───────────────────────────────────
                     # The server sends this periodically. `resumable` goes false
                     # while a turn is mid-flight — replaying a handle from that
@@ -2465,7 +2691,13 @@ class JarvisLive:
                         self.audio_in_queue.get(),
                         timeout=0.1
                     )
-                    _t_wait += time.monotonic() - _t0
+                    # How long this chunk kept us waiting. A chunk already in
+                    # the queue comes back in microseconds; one that arrives
+                    # mid-wait takes as long as the network took to bring it.
+                    # That is the whole difference between starving the sound
+                    # card and having nothing yet to give it.
+                    _got_after = time.monotonic() - _t0
+                    _t_wait += _got_after
                 except asyncio.TimeoutError:
                     if (
                         self._turn_done_event
@@ -2497,8 +2729,17 @@ class JarvisLive:
                         self._turn_done_event.clear()
                     continue
 
-                # Sampled before the batching below empties it.
-                _waiting = self.audio_in_queue.qsize()
+                # Whether the audio was already here when we came for it.
+                #
+                # This used to read the queue depth after the await returned,
+                # which answers a different question: a burst landing during
+                # the gap leaves the queue full at exactly the moment the gap
+                # ends, so every gap the model caused was recorded as one of
+                # ours. One turn reported "chopped 11× for 8291 ms, 10 ours"
+                # while the model was in fact delivering 5.7 s of speech over
+                # 14 s — and a day was nearly spent looking for a stall in this
+                # loop that was never in it.
+                _waiting = _got_after < 0.005
 
                 self.set_speaking(True)
 
@@ -2939,9 +3180,14 @@ class JarvisLive:
                     api_key=_get_api_key(),
                     http_options={"api_version": LIVE_API_VERSION},
                 )
+                # Which arm of the experiment produced the log that follows.
+                # A session that behaved differently is worth nothing if the
+                # configuration it ran under has to be remembered rather than
+                # read.
                 print(
                     f"[JARVIS] Live transport: {LIVE_API_VERSION}; "
-                    "optional server audio features: off"
+                    "optional server audio features: off; "
+                    f"context compression: {'on' if _COMPRESSION_ON else 'off'}"
                 )
 
                 async with (
@@ -2967,6 +3213,10 @@ class JarvisLive:
                     # identical without it.
                     self._session_started = time.monotonic()
                     self._heard_this_session = 0
+                    # The recorder measures this session, not the last one.
+                    self._rx_at = 0.0
+                    self._rx_kinds = {}
+                    self._mic_peak = 0.0
                     print("[JARVIS] Connected.")
                     if _resumed_with:
                         # Say it plainly: the difference between "it reconnected"
@@ -2985,6 +3235,7 @@ class JarvisLive:
                     tg.create_task(self._listen_audio())
                     tg.create_task(self._receive_audio())
                     tg.create_task(self._play_audio())
+                    tg.create_task(self._run_voice_recorder())
                     tg.create_task(self._run_system_monitor())
                     tg.create_task(self._run_background_monitor())
                     tg.create_task(self._run_proactive_mode())
