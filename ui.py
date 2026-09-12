@@ -789,6 +789,7 @@ class LogWidget(QTextEdit):
         self._pos     = 0
         self._tag     = "sys"
         self._ai_name_lc = APP_NAME.lower()   # updated when assistant name changes
+        self._user_name_lc = "you"            # updated from the saved user name
         # The provisional line showing what the user is saying right now.
         # _live_len is how many characters of it are currently drawn, so the
         # next update knows exactly how much to take back off the end.
@@ -888,7 +889,8 @@ class LogWidget(QTextEdit):
         self._pos    = 0
         tl = self._text.lower()
         _ai_pfx = f"{self._ai_name_lc}:"
-        if   tl.startswith("you:"):                              self._tag = "you"
+        _user_pfx = f"{self._user_name_lc}:"
+        if   tl.startswith("you:") or tl.startswith(_user_pfx): self._tag = "you"
         elif tl.startswith(_ai_pfx) or tl.startswith("jarvis:"): self._tag = "ai"
         elif tl.startswith("file:"):                             self._tag = "file"
         elif "err" in tl:                                        self._tag = "err"
@@ -2689,6 +2691,7 @@ class MainWindow(QMainWindow):
         # Load customization from config
         _cfg = _read_full_config()
         self._assistant_name: str = (_cfg.get("assistant_name") or APP_NAME).strip()
+        self._user_name: str = (_cfg.get("user_name") or "You").strip()
         _display = self._assistant_name.upper()
 
         # Apply the saved theme before any widget captures palette colours.
@@ -2724,6 +2727,12 @@ class MainWindow(QMainWindow):
         self._current_file: str | None = None
         self._remote_overlay: RemoteKeyOverlay | None = None
         self._customize_overlay: CustomizeOverlay | None = None
+        # Voice transcription temporarily owns the command box only while the
+        # user has not typed there. This makes speech unmistakably visible in
+        # the chat controls without ever overwriting a manual draft.
+        self._voice_draft_owned = False
+        self._voice_draft_text = ""
+        self._voice_monitor_transcribed = False
 
         central = QWidget()
         central.setStyleSheet(f"background: {C.BG};")
@@ -2804,6 +2813,8 @@ class MainWindow(QMainWindow):
 
         self._right_panel = self._build_right_panel()
         body.addWidget(self._right_panel, stretch=0)
+        self._log._ai_name_lc = self._assistant_name.lower()
+        self._log._user_name_lc = self._user_name.lower()
 
         root.addLayout(body, stretch=1)
         root.addWidget(self._build_footer())
@@ -3478,6 +3489,25 @@ class MainWindow(QMainWindow):
             return l
 
         lay.addWidget(_sec("ACTIVITY LOG"))
+
+        # Keep the live words directly beside the conversation instead of
+        # below file upload, where they were easy to miss on a compact window.
+        self._live_caption = QLabel()
+        self._live_caption.setObjectName("LiveTranscript")
+        self._live_caption.setWordWrap(True)
+        self._live_caption.setMinimumHeight(44)
+        self._live_caption.setMaximumHeight(72)
+        self._live_caption.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
+        self._live_caption.setStyleSheet(f"""
+            QLabel#LiveTranscript {{
+                color: {C.WHITE}; background: {C.PRI_GHO};
+                border: 1px solid {C.PRI}; border-radius: 4px;
+                padding: 5px 7px;
+            }}
+        """)
+        self._live_caption.hide()
+        lay.addWidget(self._live_caption)
+
         self._log = LogWidget()
         lay.addWidget(self._log, stretch=1)
 
@@ -3499,22 +3529,6 @@ class MainWindow(QMainWindow):
         sep2 = QFrame(); sep2.setFrameShape(QFrame.Shape.HLine)
         sep2.setStyleSheet(f"color: {C.BORDER}; margin: 2px 0;")
         lay.addWidget(sep2)
-
-        self._live_caption = QLabel()
-        self._live_caption.setObjectName("LiveTranscript")
-        self._live_caption.setWordWrap(True)
-        self._live_caption.setMinimumHeight(44)
-        self._live_caption.setMaximumHeight(72)
-        self._live_caption.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
-        self._live_caption.setStyleSheet(f"""
-            QLabel#LiveTranscript {{
-                color: {C.WHITE}; background: {C.PRI_GHO};
-                border: 1px solid {C.PRI}; border-radius: 4px;
-                padding: 5px 7px;
-            }}
-        """)
-        self._live_caption.hide()
-        lay.addWidget(self._live_caption)
 
         lay.addWidget(_sec("COMMAND INPUT"))
         lay.addLayout(self._build_input_row())
@@ -3817,19 +3831,56 @@ class MainWindow(QMainWindow):
     def _apply_live_transcript(self, text: str) -> None:
         """Render partial speech immediately, independent of log animation."""
         self._log.set_live(text)
-        spoken = (text or "").strip()
-        if spoken.lower().startswith("you:"):
-            spoken = spoken[4:].lstrip()
+        raw = (text or "").strip()
+        speaker = self._user_name or "You"
+        spoken = raw
+        prefix, separator, remainder = raw.partition(":")
+        if separator and prefix.casefold() in {"you", speaker.casefold()}:
+            spoken = remainder.lstrip()
         if not spoken:
             self._live_caption.clear()
             self._live_caption.hide()
+            if (
+                self._voice_draft_owned
+                and self._input.text() == self._voice_draft_text
+            ):
+                self._input.clear()
+            self._voice_draft_owned = False
+            self._voice_draft_text = ""
+            self._voice_monitor_transcribed = False
             return
 
         # Keep the newest words visible when a long utterance exceeds the
         # compact panel. The activity log still retains the complete preview.
         visible = spoken if len(spoken) <= 240 else f"...{spoken[-237:]}"
-        self._live_caption.setText(f"● LIVE TRANSCRIPT\n{visible}")
+        self._live_caption.setText(
+            f"● {speaker.upper()} — LIVE TRANSCRIPT\n{visible}"
+        )
         self._live_caption.show()
+
+        # Mirror the live words in the command field. If the user starts typing,
+        # their text wins immediately and later voice fragments leave it alone.
+        current_draft = self._input.text()
+        if self._voice_draft_owned and current_draft != self._voice_draft_text:
+            self._voice_draft_owned = False
+        if not self._voice_draft_owned and not current_draft.strip():
+            self._voice_draft_owned = True
+        if self._voice_draft_owned:
+            self._voice_draft_text = spoken
+            self._input.setText(spoken)
+            self._input.setCursorPosition(len(spoken))
+
+        if (
+            spoken.casefold() != "listening..."
+            and not self._voice_monitor_transcribed
+        ):
+            rendered = self._log.toPlainText().endswith(raw)
+            print(
+                f"[VOICE FLOW] 2/3 live transcript rendered in chat: "
+                f"{'yes' if rendered else 'no'}",
+                flush=True,
+            )
+            self._voice_monitor_transcribed = True
 
     def _show_content(self, title: str, text: str):
         """Slot — runs on Qt main thread. Updates and shows the content panel."""
@@ -4141,11 +4192,13 @@ class MainWindow(QMainWindow):
                            voice: str = ""):
         """Update all name/theme-dependent UI elements and persist to config."""
         self._assistant_name = name.strip() or APP_NAME
+        self._user_name = user_name.strip() or "You"
         display = self._assistant_name.upper()
         self.setWindowTitle(APP_NAME)
         self._title_lbl.setText(APP_NAME)
         self._sub_lbl.setText("PERSONAL AI ASSISTANT")
         self._log._ai_name_lc = self._assistant_name.lower()
+        self._log._user_name_lc = self._user_name.lower()
         self.hud._assistant_name = display
 
         color_changed = False
