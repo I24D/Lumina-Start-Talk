@@ -2640,6 +2640,7 @@ class MainWindow(QMainWindow):
     _log_sig        = pyqtSignal(str)
     _live_sig       = pyqtSignal(str)   # partial transcript, replaced as it grows
     _state_sig      = pyqtSignal(str)
+    _busy_sig       = pyqtSignal(str, bool)   # what she is doing, and whether the mic is live
     _content_sig    = pyqtSignal(str, str)   # (title, text) — thread-safe content display
     _reconfig_sig   = pyqtSignal()           # trigger setup overlay from any thread
     _camera_sig     = pyqtSignal(bytes)      # show camera frame preview (small overlay)
@@ -2684,6 +2685,10 @@ class MainWindow(QMainWindow):
         self._confirm_overlay  = None   # live ConfirmBanner, if one is on screen
         self.get_plugins       = None   # callable: () -> list[dict], set by JarvisLive
         self._muted            = False
+        # Why the app itself has the microphone shut, if it has: the
+        # user's mute is theirs and is never overwritten by this.
+        self._busy             = ""
+        self._busy_mic_open    = False
         self._current_file: str | None = None
         self._remote_overlay: RemoteKeyOverlay | None = None
         self._customize_overlay: CustomizeOverlay | None = None
@@ -2792,6 +2797,7 @@ class MainWindow(QMainWindow):
         self._log_sig.connect(self._log.append_log)
         self._live_sig.connect(self._apply_live_transcript)
         self._state_sig.connect(self._apply_state)
+        self._busy_sig.connect(self._apply_busy)
         self._content_sig.connect(self._show_content)
         self._reconfig_sig.connect(self._show_setup)
         self._camera_sig.connect(self._show_camera_frame)
@@ -4261,6 +4267,30 @@ class MainWindow(QMainWindow):
             self._apply_state("LISTENING")
             self._log.append_log("SYS: Microphone active.")
 
+    def _apply_busy(self, reason: str, mic_open: bool):
+        """Slot — she started or finished doing something, and may be deaf for it.
+
+        The user could never tell whether she was listening, so every silence
+        read as a failure. The button now names what she is doing and whether
+        the microphone is live through it, which is not the same question: she
+        is deaf while she speaks through the speakers, but not while she waits
+        on another assistant, and not while she speaks on headphones. Green
+        means she is hearing you, and it means it.
+        """
+        if (reason, mic_open) == (self._busy, self._busy_mic_open):
+            return
+        self._busy = reason
+        self._busy_mic_open = mic_open
+        self._style_mute_btn()
+        if self._muted:
+            return                      # the user's own mute outranks this
+        if reason == "SPEAKING":
+            self._apply_state("SPEAKING")
+        elif reason:
+            self._apply_state("WORKING")
+        else:
+            self._apply_state("LISTENING")
+
     def _style_mute_btn(self):
         if self._muted:
             self._mute_btn.setText("🔇  MICROPHONE MUTED")
@@ -4270,6 +4300,26 @@ class MainWindow(QMainWindow):
                     border: 1px solid {C.MUTED_C}; border-radius: 3px;
                 }}
             """)
+        elif self._busy:
+            doing = "SPEAKING" if self._busy == "SPEAKING" else "WORKING"
+            if self._busy_mic_open:
+                # Busy, but the words still reach her — worth saying, because
+                # the whole point is knowing when it is worth talking.
+                self._mute_btn.setText(f"🎙  {doing} — STILL LISTENING")
+                self._mute_btn.setStyleSheet(f"""
+                    QPushButton {{
+                        background: #00140a; color: {C.GREEN_D};
+                        border: 1px solid {C.GREEN_D}; border-radius: 3px;
+                    }}
+                """)
+            else:
+                self._mute_btn.setText(f"🔇  {doing} — MIC OFF")
+                self._mute_btn.setStyleSheet(f"""
+                    QPushButton {{
+                        background: #140f00; color: {C.ACC2};
+                        border: 1px solid {C.ACC2}; border-radius: 3px;
+                    }}
+                """)
         else:
             self._mute_btn.setText("🎙  MICROPHONE ACTIVE")
             self._mute_btn.setStyleSheet(f"""
@@ -4421,6 +4471,19 @@ class JarvisUI:
     @get_plugins.setter
     def get_plugins(self, cb):
         self._win.get_plugins = cb
+
+    def set_busy(self, reason: str = "", mic_open: bool = True) -> None:
+        """Thread-safe: say why the app itself has the microphone shut.
+
+        "SPEAKING" while her own voice is going out, "WORKING" while she is
+        waiting on another assistant, "" when she is listening. The button
+        turns amber and says which, so green comes to mean she really is
+        hearing you rather than probably hearing you.
+        """
+        try:
+            self._win._busy_sig.emit(reason or "", bool(mic_open))
+        except Exception:
+            pass
 
     def set_audio_level(self, level: float) -> None:
         """Thread-safe: feed a 0.0–1.0 live audio level to the HUD waveform.

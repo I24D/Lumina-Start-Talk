@@ -95,13 +95,22 @@ cannot reach her. Measured in one two-minute session: 71 seconds speaking, in
 turns of up to 21, and none of the user's speech in those 71 seconds was
 transcribed.
 
-Two consequences:
+Three consequences:
 
 - Never loosen the `Length:` rule in `core/prompt.txt`. Verbosity is not a
   style question here; it is dead air on the microphone.
-- `START_OF_ACTIVITY_INTERRUPTS` is configured but **cannot fire**, because the
-  model receives no audio during her speech. Voice barge-in does not work and
-  will not until the gate opens. Do not report it as working.
+- On **headphones** the gate is off entirely (`self._full_duplex`, decided from
+  the output device's name), the microphone never closes, and
+  `START_OF_ACTIVITY_INTERRUPTS` can fire — she can be talked over. On speakers
+  it cannot, because her echo was measured returning at up to full scale, and
+  barge-in there needs real echo cancellation. Do not report barge-in as
+  working without saying which of the two you measured.
+- The button says which state she is in, and it must keep telling the truth.
+  "SPEAKING — MIC OFF" and "WORKING — STILL LISTENING" are different claims:
+  waiting on another assistant does **not** deafen her, the audio still
+  reaches the model and is transcribed, it simply cannot be answered until the
+  tool returns. Do not collapse those two into one "busy" state — the user's
+  whole complaint was never knowing whether talking was worth it.
 
 ## The ChatGPT desktop bridge
 

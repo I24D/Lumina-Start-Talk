@@ -1389,6 +1389,27 @@ class JarvisLive:
             self._loop
         )
 
+    def _refresh_mic_state(self) -> None:
+        """Tell the HUD what she is doing and whether the microphone is live.
+
+        Two different questions, and conflating them is what made every
+        silence ambiguous. She is deaf while speaking through speakers, but
+        not while speaking on headphones, and not while waiting on another
+        assistant — that audio still reaches the model, it simply cannot be
+        answered until the tool returns. The button says which, so the user
+        never has to wonder whether talking is worth it.
+        """
+        if self._tool_running:
+            reason = "WORKING"
+        elif self._is_speaking:
+            reason = "SPEAKING"
+        else:
+            reason = ""
+        try:
+            self.ui.set_busy(reason, self._full_duplex or not self._is_speaking)
+        except Exception:
+            pass
+
     def set_speaking(self, value: bool):
         with self._speaking_lock:
             self._is_speaking = value
@@ -1398,6 +1419,7 @@ class JarvisLive:
             self.ui.set_state("SPEAKING")
         elif not self.ui.muted:
             self.ui.set_state("LISTENING")
+        self._refresh_mic_state()
 
     def interrupt(self) -> None:
         """Stop JARVIS mid-speech: drain queued audio and open mic immediately."""
@@ -1547,6 +1569,7 @@ class JarvisLive:
         # hearing, and it tore one down in the middle of a Copilot query that
         # had another twenty seconds to run — losing the answer. So it is told.
         self._tool_running += 1
+        self._refresh_mic_state()
         try:
             return await self._dispatch_tool(fc)
         finally:
@@ -1554,6 +1577,7 @@ class JarvisLive:
             # Speech from while the tool was busy is not evidence of anything.
             self._voice_blocks_unheard = 0
             self._last_user_speech = time.monotonic()
+            self._refresh_mic_state()
 
     async def _dispatch_tool(self, fc) -> types.FunctionResponse:
         name = fc.name
