@@ -182,10 +182,32 @@ LIVE_MODEL          = "models/gemini-2.5-flash-native-audio-preview-12-2025"
 # does not trigger a needless reopen.
 _MIC_STALL_SECONDS  = 6.0
 
+# How much real speech has to go unheard before the session is treated as deaf.
+# Generous on purpose: a false alarm costs a reconnect in the middle of a
+# conversation, and several seconds of speech with no transcription at all is
+# already well outside anything normal.
+# Deliberately conservative, because the first version was not and turned one
+# fault into a worse one: it reset the voice counter when it fired but not the
+# silence clock, so the condition was still true the instant the new session
+# came up and it reconnected in a loop. A level of 0.02 also counts a quiet
+# room as somebody talking.
+_DEAF_VOICE_SECONDS   = 8.0     # this much *clear* speech, not this much sound
+_DEAF_SILENCE_SECONDS = 25.0
+_DEAF_VOICE_LEVEL     = 0.15    # well above a room; a person talking clears it
+_DEAF_COOLDOWN        = 120.0   # never rebuild more often than this
 CHANNELS            = 1
 SEND_SAMPLE_RATE    = 16000
 RECEIVE_SAMPLE_RATE = 24000
 CHUNK_SIZE          = 1024
+
+# Client-side VAD complements Gemini's automatic detector. The server still
+# detects speech starts (and remains the fallback for speech ends), while this
+# detector flushes the stream after a natural pause so the model can begin its
+# response without waiting on a delayed remote timeout.
+_LOCAL_VAD_MIN_START_LEVEL   = 0.20
+_LOCAL_VAD_MIN_END_LEVEL     = 0.08
+_LOCAL_VAD_START_BLOCKS      = 3
+_LOCAL_VAD_SILENCE_BLOCKS    = 10  # 640 ms at 16 kHz / 1024 samples
 
 # RMS below which 16-bit PCM is treated as room silence; above _LEVEL_FULL it
 # reads as a full-height waveform. Tuned so ordinary speech lands mid-range and
@@ -312,6 +334,83 @@ class _TranscriptAccumulator:
     def clear(self) -> None:
         self._committed = ""
         self._interim = ""
+
+
+class _LocalVoiceActivityDetector:
+    """Detect speech endings locally while leaving speech starts to Gemini.
+
+    The microphone noise floor is estimated continuously, so a loud laptop fan
+    or an amplified input does not look like speech. Three consecutive blocks
+    above the adaptive start threshold reject isolated taps. Ten quiet blocks
+    preserve natural pauses while finalizing a clean turn in roughly 640 ms.
+    """
+
+    def __init__(self):
+        self._active = False
+        self._voiced_blocks = 0
+        self._silent_blocks = 0
+        self._recent_levels: list[float] = []
+        self._noise_floor = 0.0
+        self._speech_peak = 0.0
+
+    def _observe_noise(self, level: float) -> None:
+        self._recent_levels.append(max(0.0, min(1.0, float(level))))
+        del self._recent_levels[:-48]
+        # The lower quartile is stable when speech occupies part of the rolling
+        # window, unlike an average that rises sharply as soon as a user talks.
+        self._noise_floor = float(np.percentile(self._recent_levels, 25))
+
+    def _start_threshold(self) -> float:
+        margin = max(0.18, self._noise_floor * 0.55)
+        return min(0.90, max(_LOCAL_VAD_MIN_START_LEVEL,
+                             self._noise_floor + margin))
+
+    def _end_threshold(self) -> float:
+        margin = max(0.10, self._noise_floor * 0.30)
+        return min(0.85, max(_LOCAL_VAD_MIN_END_LEVEL,
+                             self._noise_floor + margin))
+
+    def process(self, level: float) -> str | None:
+        if not self._active:
+            self._observe_noise(level)
+            if level >= self._start_threshold():
+                self._voiced_blocks += 1
+                if self._voiced_blocks >= _LOCAL_VAD_START_BLOCKS:
+                    self._active = True
+                    self._silent_blocks = 0
+                    self._speech_peak = level
+                    return "start"
+            else:
+                self._voiced_blocks = 0
+            return None
+
+        self._speech_peak = max(self._speech_peak * 0.995, level)
+        strong_speech = max(self._start_threshold(), self._speech_peak * 0.78)
+        if level >= strong_speech:
+            self._voiced_blocks += 1
+            # A single sharp noise must not erase an otherwise complete pause.
+            if self._voiced_blocks >= 2:
+                self._silent_blocks = 0
+            return None
+        self._voiced_blocks = 0
+
+        quiet_level = max(self._end_threshold(), self._speech_peak * 0.50)
+        if level < quiet_level:
+            self._silent_blocks += 1
+        else:
+            # Borderline background noise should delay finalization slightly,
+            # not erase all of the silence already observed.
+            self._silent_blocks = max(0, self._silent_blocks - 1)
+        if self._silent_blocks >= _LOCAL_VAD_SILENCE_BLOCKS:
+            self.reset()
+            return "end"
+        return None
+
+    def reset(self) -> None:
+        self._active = False
+        self._voiced_blocks = 0
+        self._silent_blocks = 0
+        self._speech_peak = 0.0
 
 
 # ── Wake phrases ─────────────────────────────────────────────────────────────
@@ -1051,12 +1150,20 @@ class JarvisLive:
         self._sys_monitor      = SystemMonitor()  # persistent cooldown state
         self._proactive        = ProactiveEngine()
         self._last_user_speech = time.monotonic()  # updated on every user utterance
+        self._last_voice_end   = 0.0               # local VAD end for latency diagnostics
         self._session_log: list[str] = []          # conversation turns for end-of-session summary
         # When the close-session phrase was last actually heard. shutdown_jarvis
         # refuses unless this is recent, so no amount of model confidence can
         # end the session on its own.
         self._close_heard_at = 0.0
         self._session_started = time.monotonic()
+        # Blocks of real speech forwarded since the session last transcribed
+        # anything. The difference between "nobody is talking" and "they are
+        # talking and it is not arriving" is invisible without this.
+        self._voice_blocks_unheard = 0
+        self._last_deaf_rebuild = 0.0
+        self._tool_running = 0
+
         # Tracked apart because models support them apart: gemini-3.1-flash-live
         # takes proactive audio and refuses affective dialog. Bundled together,
         # one refusal switched off both — and proactive audio is the one that
@@ -1385,6 +1492,21 @@ class JarvisLive:
         the v1alpha endpoint, so it decides which API version to connect to."""
         return self._affective_live or self._proactive_live
 
+    async def _execute_tool(self, fc) -> types.FunctionResponse:
+        # A running tool is a legitimate reason for the session to transcribe
+        # nothing: the model is inside the call and not listening. The deafness
+        # watchdog cannot tell that apart from a session that has stopped
+        # hearing, and it tore one down in the middle of a Copilot query that
+        # had another twenty seconds to run — losing the answer. So it is told.
+        self._tool_running += 1
+        try:
+            return await self._dispatch_tool(fc)
+        finally:
+            self._tool_running -= 1
+            # Speech from while the tool was busy is not evidence of anything.
+            self._voice_blocks_unheard = 0
+            self._last_user_speech = time.monotonic()
+
     async def _dispatch_tool(self, fc) -> types.FunctionResponse:
         name = fc.name
         args = dict(fc.args or {})
@@ -1627,29 +1749,31 @@ class JarvisLive:
     async def _send_realtime(self):
         while True:
             msg = await self.out_queue.get()
-            # `media=` is the deprecated compatibility path. With current
-            # google-genai releases it accepts these dictionaries without an
-            # exception but Gemini receives no audio and emits no transcript.
-            # The typed Blob path is the supported realtime audio transport.
-            await self.session.send_realtime_input(
-                audio=types.Blob(
-                    data=msg["data"],
-                    mime_type=msg["mime_type"],
-                )
-            )
+            if msg.get("audio_stream_end"):
+                await self.session.send_realtime_input(audio_stream_end=True)
+            else:
+                # The 2.5 native-audio configuration with proactive and
+                # affective audio requires the legacy media transport. The
+                # newer audio= field is rejected when those features are on.
+                await self.session.send_realtime_input(media=msg)
 
     async def _listen_audio(self):
         print("[JARVIS] 🎤 Mic started")
         loop = asyncio.get_event_loop()
+        local_vad = _LocalVoiceActivityDetector()
 
         def enqueue_realtime(message: dict) -> None:
             """Enqueue from the audio thread without allowing callback errors."""
             try:
                 self.out_queue.put_nowait(message)
             except asyncio.QueueFull:
-                # Audio remains best effort because blocking PortAudio's
-                # callback would create a larger capture gap.
-                _diag("microphone queue full; dropping one audio block")
+                # A delayed stream end is preferable to losing it completely.
+                # Normal audio remains best effort because blocking PortAudio's
+                # callback would cause larger gaps in the captured stream.
+                if message.get("audio_stream_end"):
+                    asyncio.create_task(self.out_queue.put(message))
+                else:
+                    _diag("microphone queue full; dropping one audio block")
 
         def callback(indata, frames, time_info, status):
             # Stamped on every block, before any gate: this is proof the device
@@ -1666,6 +1790,28 @@ class JarvisLive:
                     "mime_type": "audio/pcm;rate=16000",
                 })
 
+                vad_event = local_vad.process(level)
+                if vad_event == "start":
+                    self._last_voice_end = 0.0
+                    self.ui.set_live_transcript("You: Listening...")
+                    _diag("local VAD: speech started")
+                elif vad_event == "end":
+                    ended_at = time.monotonic()
+                    self._last_user_speech = ended_at
+                    self._last_voice_end = ended_at
+                    loop.call_soon_threadsafe(
+                        enqueue_realtime, {"audio_stream_end": True}
+                    )
+                    _diag("local VAD: speech ended; flushing audio stream")
+
+                # Counted here rather than at the top of the callback: only
+                # audio that was actually sent can be evidence that sending is
+                # not working.
+                try:
+                    if level > _DEAF_VOICE_LEVEL:
+                        self._voice_blocks_unheard += 1
+                except Exception:
+                    pass
                 # Feed the live mic level to the HUD so the waveform reacts to
                 # the user's actual voice while listening. Purely cosmetic — any
                 # failure here must never disturb the mic.
@@ -1673,6 +1819,8 @@ class JarvisLive:
                     self.ui.set_audio_level(level)
                 except Exception:
                     pass
+            else:
+                local_vad.reset()
 
         try:
             def _open_mic(dev):
@@ -1733,6 +1881,39 @@ class JarvisLive:
                         # Muting stops nothing at the device, but there is no
                         # sense reopening hardware the user has switched off.
                         self._last_mic_block = time.monotonic()
+                        continue
+
+                    # A second, different deafness. The check below reopens a
+                    # device that stopped delivering. This one is for the case
+                    # that keeps happening instead: the device delivers, the
+                    # HUD says LISTENING, the level meter moves — and the
+                    # session transcribes nothing, because the connection is
+                    # alive enough to answer typed text and no longer hears
+                    # audio. Nothing raises, so nothing recovers, and the user
+                    # is left talking to something that looks like it works.
+                    # Rebuilding the session is the only cure; the context is
+                    # kept so the conversation survives it.
+                    if self._tool_running:
+                        # Nothing said while a tool runs counts towards deafness.
+                        self._voice_blocks_unheard = 0
+                        self._last_user_speech = time.monotonic()
+
+                    _spoke_seconds = self._voice_blocks_unheard * CHUNK_SIZE / SEND_SAMPLE_RATE
+                    if (
+                        _spoke_seconds > _DEAF_VOICE_SECONDS
+                        and (time.monotonic() - self._last_user_speech) > _DEAF_SILENCE_SECONDS
+                        and (time.monotonic() - self._last_deaf_rebuild) > _DEAF_COOLDOWN
+                    ):
+                        self._voice_blocks_unheard = 0
+                        self._last_deaf_rebuild = time.monotonic()
+                        # Both clocks restart, not just the counter. Leaving
+                        # this one stale is exactly what caused the loop.
+                        self._last_user_speech = time.monotonic()
+                        print(f"[JARVIS] 🙉 {_spoke_seconds:.0f}s of speech sent and nothing "
+                              f"transcribed — rebuilding the session", flush=True)
+                        self.ui.write_log("SYS: I stopped hearing you — reconnecting.")
+                        self.request_reconnect(keep_context=True,
+                                               reason="microphone not reaching the model")
                         continue
 
                     silent_for = time.monotonic() - self._last_mic_block
@@ -1835,7 +2016,8 @@ class JarvisLive:
                                     # since the app opened and reads as a
                                     # twenty-second delay that never happened.
                                     if in_buf.text:
-                                        _lag = time.monotonic() - self._last_user_speech
+                                        speech_end = self._last_voice_end or self._last_user_speech
+                                        _lag = time.monotonic() - speech_end
                                         _when = f"{_lag:.1f}s after you stopped"
                                     else:
                                         _when = "unprompted"
@@ -1847,6 +2029,7 @@ class JarvisLive:
                         interim = getattr(sc, "interim_input_transcription", None)
                         if interim and interim.text and in_buf.set_interim(interim.text):
                             self._last_user_speech = time.monotonic()
+                            self._voice_blocks_unheard = 0
                             preview = in_buf.text
                             if preview:
                                 self.ui.set_live_transcript(f"You: {preview}")
@@ -1857,6 +2040,7 @@ class JarvisLive:
                             txt = _normalise_transcript_spacing(raw_text)
                             if txt and in_buf.add_final(raw_text):
                                 self._last_user_speech = time.monotonic()
+                                self._voice_blocks_unheard = 0
 
                                 # Also on the console, fragment by fragment.
                                 # "Heard:" below prints at turn_complete, which
@@ -1986,7 +2170,7 @@ class JarvisLive:
                         fn_responses = []
                         for fc in response.tool_call.function_calls:
                             print(f"[JARVIS] 📞 {fc.name}")
-                            fr = await self._dispatch_tool(fc)
+                            fr = await self._execute_tool(fc)
                             fn_responses.append(fr)
                         await self.session.send_tool_response(
                             function_responses=fn_responses
