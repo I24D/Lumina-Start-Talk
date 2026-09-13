@@ -603,7 +603,7 @@ TOOL_DECLARATIONS = [
         "parameters": {
             "type": "OBJECT",
             "properties": {
-                "city": {"type": "STRING", "description": "City name"}
+                "city": {"type": "STRING", "description": "City name in English, with the state or country when it could be ambiguous, e.g. 'New York, US' or 'Greeneville, Tennessee'"}
             },
             "required": ["city"]
         }
