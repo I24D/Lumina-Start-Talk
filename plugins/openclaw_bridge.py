@@ -1,15 +1,21 @@
 """
 Two-way bridge from Lumina Start Talk to OpenClaw.
 
+Uses a persistent WebSocket connection to the OpenClaw Gateway for instant
+message delivery. Falls back to the CLI when the WebSocket is unavailable.
+
 The endpoint and lifecycle below were verified against the local
 ``I24D/Lumina-Openclaw`` checkout at ``C:\\I24D_WhatsApp\\openclaw-main``:
 
 * The gateway listens on ``ws://127.0.0.1:18789``. Its HTTP dashboard is served
   from ``http://127.0.0.1:18789/``; agent calls use the WebSocket protocol, not
   an HTTP chat route.
-* Authentication mode is ``token``. The token lives in
-  ``~/.openclaw/openclaw.json`` under ``gateway.auth.token`` and must never be
-  copied into this project. The official CLI reads it automatically.
+* Authentication mode is ``token``. ``gateway.auth.token`` in
+  ``~/.openclaw/openclaw.json`` is a SecretRef into OpenClaw's own secret store,
+  which Python cannot read, and the CLI refuses to print the value outside an
+  interactive terminal. The persistent WebSocket therefore takes the token from
+  ``GATEWAY_AUTH_TOKEN`` in the environment or in this project's git-ignored
+  ``.env``; the CLI fallback keeps resolving it on its own.
 * On Windows the gateway is registered as the ``OpenClaw Gateway`` Scheduled
   Task. ``openclaw gateway start`` starts it; the installed task may take a
   while to open port 18789 while its agent databases initialize.
@@ -18,9 +24,9 @@ The endpoint and lifecycle below were verified against the local
   owns the state directory, ``openclaw agent --local`` is the supported local
   fallback and uses the same configured agent, model, and credentials.
 
-This module intentionally invokes the OpenClaw CLI. It never automates the
-OpenClaw dashboard or any desktop window, so it does not steal keyboard focus
-and does not depend on UI layout.
+This module intentionally invokes the OpenClaw CLI only as a fallback. The
+primary path is a persistent WebSocket that stays open for the lifetime of
+Lumina Start Talk, eliminating per-message CLI startup overhead.
 """
 
 from __future__ import annotations
@@ -35,7 +41,26 @@ import sqlite3
 import subprocess
 import threading
 import time
+import uuid
+from concurrent.futures import Future, TimeoutError as FutureTimeout
 from typing import Any
+
+# ── Optional WebSocket support ────────────────────────────────────────────────
+# The persistent connection uses the `websockets` library when available.
+# It is a common dependency, but we fall back to the CLI if it is missing
+# rather than making it a hard requirement.
+_ws_available = False
+_WsState = None
+try:
+    import asyncio as _asyncio
+    import websockets as _websockets
+    _ws_available = True
+    try:
+        from websockets.protocol import State as _WsState
+    except ImportError:  # websockets < 11 exposes open/closed instead of state
+        _WsState = None
+except ImportError:
+    pass
 
 
 PLUGIN = {
@@ -117,17 +142,6 @@ _transport = ""
 _last_answer = ""
 
 # ── waiting without blocking ─────────────────────────────────────────────────
-# OpenClaw takes minutes on a real task, and this bridge used to wait for it
-# inside the tool call itself: the turn stayed open, the model received nothing
-# until the CLI returned, and anything slower than the timeout was thrown away.
-# The user asked a long question and simply never got an answer.
-#
-# But nothing about a tool response requires the work to be finished. The
-# question goes to a background thread and the tool returns at once; when the
-# answer finally lands it is pushed into the live session the same way
-# phone_notifications announces an arriving message, and Lumina reads it out
-# unprompted however long it took. The answer is also kept, so it survives a
-# session that dropped while OpenClaw was thinking — action='read' still has it.
 _job_lock = threading.Lock()
 _job_question = ""            # non-empty while an answer is still being waited for
 _job_started = 0.0
@@ -135,6 +149,26 @@ _job_started = 0.0
 # Nothing blocks on this any more, so it guards against a hung CLI rather than
 # rationing the user's patience.
 _BACKGROUND_TIMEOUT = 1800
+
+# ── Persistent WebSocket connection ──────────────────────────────────────────
+# A single long-lived WebSocket to the Gateway. Created on first use (or on
+# explicit connect), kept alive with a heartbeat, and reused for every
+# subsequent message. This eliminates the 5-10s CLI startup overhead per
+# message and makes Lumina Start Talk → OpenClaw feel instant.
+_ws_lock = threading.Lock()
+_ws_ws = None              # type: ignore[assignment]
+_ws_loop = None            # type: ignore[assignment]
+_ws_thread = None          # type: ignore[assignment]
+_ws_connected = False
+_ws_heartbeat_stop = threading.Event()
+_ws_pending_lock = threading.Lock()
+# Request id -> Future resolved by the matching `res` frame.
+_ws_pending: dict[str, Future] = {}
+# chat.send run id -> Future resolved by that run's terminal `chat` event.
+_ws_runs: dict[str, Future] = {}
+# The Gateway only sends a run's `chat` events to connections subscribed to it.
+_SESSION_SUBSCRIPTION_KEY = f"agent:{_AGENT_ID}:{_SESSION_KEY}"
+_TERMINAL_CHAT_STATES = frozenset({"final", "error", "aborted"})
 
 
 def _cli_path() -> str | None:
@@ -144,6 +178,73 @@ def _cli_path() -> str | None:
         path = shutil.which(name)
         if path:
             return path
+    return None
+
+
+def _project_dotenv_path() -> pathlib.Path:
+    """This project's git-ignored .env, next to main.py."""
+    return pathlib.Path(__file__).resolve().parent.parent / ".env"
+
+
+def _dotenv_value(name: str) -> str:
+    """Read one KEY=value entry from the project .env without a dotenv dependency."""
+    try:
+        lines = _project_dotenv_path().read_text(encoding="utf-8-sig").splitlines()
+    except OSError:
+        return ""
+    for raw_line in lines:
+        line = raw_line.strip()
+        if line.lower().startswith("export "):
+            line = line[7:].lstrip()
+        key, separator, value = line.partition("=")
+        if not separator or key.strip() != name:
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+            value = value[1:-1]
+        return value.strip()
+    return ""
+
+
+def _read_gateway_token() -> str | None:
+    """Read the gateway auth token for the WebSocket handshake.
+
+    Checked in order: the ``GATEWAY_AUTH_TOKEN`` environment variable, the same
+    key in this project's ``.env``, then ``gateway.auth.token`` in openclaw.json
+    when it is a plain string, or the environment variable its SecretRef names.
+
+    OpenClaw keeps a SecretRef's value in its own SQLite secret store, which is
+    not an interface for other processes, and ``openclaw gateway auth-token
+    --show`` refuses to print outside an interactive terminal. The project .env
+    is the channel left for a separately launched Lumina.
+    """
+    env_token = os.environ.get("GATEWAY_AUTH_TOKEN", "").strip()
+    if env_token:
+        return env_token
+
+    dotenv_token = _dotenv_value("GATEWAY_AUTH_TOKEN")
+    if dotenv_token:
+        return dotenv_token
+
+    try:
+        config_path = pathlib.Path.home() / ".openclaw" / "openclaw.json"
+        with open(config_path, "r", encoding="utf-8") as f:
+            config = json.load(f)
+        token = config.get("gateway", {}).get("auth", {}).get("token", {})
+
+        if isinstance(token, str) and token.strip():
+            return token.strip()
+
+        if isinstance(token, dict):
+            token_id = str(token.get("id", "")).strip()
+            if token_id and token_id != "__OPENCLAW_REDACTED__":
+                for name in (token_id, f"OPENCLAW_{token_id}"):
+                    env_val = os.environ.get(name, "").strip()
+                    if env_val:
+                        return env_val
+    except Exception:
+        pass
+
     return None
 
 
@@ -176,27 +277,27 @@ def _json_objects(output: str) -> list[dict[str, Any]]:
     """Decode JSON objects from CLI output that may also contain status lines."""
     decoder = json.JSONDecoder()
     objects: list[dict[str, Any]] = []
-    for index, character in enumerate(output):
-        if character != "{" or (index > 0 and output[index - 1] not in "\r\n"):
+    for index in range(len(output)):
+        if output[index] != "{":
             continue
         try:
-            value, _ = decoder.raw_decode(output[index:])
+            obj, end = decoder.raw_decode(output[index:])
+            if isinstance(obj, dict):
+                objects.append(obj)
         except json.JSONDecodeError:
             continue
-        if isinstance(value, dict):
-            objects.append(value)
     return objects
 
 
-def _nested_dicts(value: Any):
-    """Yield every dictionary in a decoded response, including wrapped results."""
-    if isinstance(value, dict):
-        yield value
-        for child in value.values():
-            yield from _nested_dicts(child)
-    elif isinstance(value, list):
-        for child in value:
-            yield from _nested_dicts(child)
+def _nested_dicts(obj: Any):
+    """Yield every dict nested anywhere inside obj (DFS, pre-order)."""
+    if isinstance(obj, dict):
+        yield obj
+        for value in obj.values():
+            yield from _nested_dicts(value)
+    elif isinstance(obj, list):
+        for item in obj:
+            yield from _nested_dicts(item)
 
 
 def _result_error(result: subprocess.CompletedProcess[str]) -> str:
@@ -258,10 +359,23 @@ def _ensure_connection(player=None) -> tuple[bool, str]:
     global _bridge_connected, _gateway_started_by_bridge, _transport
 
     if _bridge_connected:
-        if _transport == "local" or _gateway_health()[0]:
+        if _transport == "websocket":
+            # A live socket is its own health check; asking the CLI first would
+            # add the multi-second startup this transport exists to avoid.
+            if _ws_connected and _ws_is_open(_ws_ws):
+                return True, ""
+        elif _transport == "local" or _gateway_health()[0]:
             return True, ""
         _bridge_connected = False
         _transport = ""
+
+    # Try WebSocket first if available
+    if _ws_available:
+        ws_ok, ws_error = _ensure_ws_connection(player)
+        if ws_ok:
+            _bridge_connected = True
+            _transport = "websocket"
+            return True, ""
 
     healthy, _ = _gateway_health()
     if healthy:
@@ -289,6 +403,11 @@ def _ensure_connection(player=None) -> tuple[bool, str]:
         if healthy:
             _bridge_connected = True
             _transport = "gateway"
+            # Try to upgrade to WebSocket now that the gateway is up
+            if _ws_available:
+                ws_ok, _ = _ensure_ws_connection(player)
+                if ws_ok:
+                    _transport = "websocket"
             return True, ""
         start_error = health_error or start_error
         _stop_owned_gateway()
@@ -298,6 +417,10 @@ def _ensure_connection(player=None) -> tuple[bool, str]:
         if healthy:
             _bridge_connected = True
             _transport = "gateway"
+            if _ws_available:
+                ws_ok, _ = _ensure_ws_connection(player)
+                if ws_ok:
+                    _transport = "websocket"
             return True, ""
         start_error = health_error or start_error
 
@@ -323,19 +446,361 @@ def _stop_owned_gateway() -> None:
     _gateway_started_by_bridge = False
 
 
-def _describe_parts(items: Any) -> str:
-    """Turn OpenClaw's reply parts into something that can be said out loud.
+# ── WebSocket persistent connection ──────────────────────────────────────────
 
-    Reading only the "text" parts looked complete until OpenClaw answered with
-    a picture. A request to generate an image comes back as a part of type
-    "image" carrying no text at all, the extractor found nothing, and the run
-    fell through to the error reporter — which, finding no error either, read
-    out the last line of the CLI's pretty-printed JSON and told the user
-    "OpenClaw could not answer: }". The image had in fact been generated.
+def _ws_url() -> str:
+    return f"ws://{_GATEWAY_HOST}:{_GATEWAY_PORT}"
 
-    So a part with no text is still an answer; it just has to be described
-    rather than quoted.
+
+def _ws_run_loop(loop: Any) -> None:
+    """Background asyncio event loop for the persistent WebSocket."""
+    _asyncio.set_event_loop(loop)
+    try:
+        loop.run_forever()
+    except Exception:
+        pass
+
+
+def _ws_is_open(ws: Any) -> bool:
+    """Whether a websockets connection is open, across library generations.
+
+    websockets 11+ (Lumina ships 16.x) replaced ``open``/``closed`` with
+    ``state``. Reading the removed attributes raises AttributeError, which broke
+    every call into this bridge after the first one.
     """
+    if ws is None:
+        return False
+    state = getattr(ws, "state", None)
+    if state is not None and _WsState is not None:
+        return state is _WsState.OPEN
+    if hasattr(ws, "open"):
+        return bool(ws.open)
+    return not bool(getattr(ws, "closed", True))
+
+
+def _frame_error(frame: dict[str, Any]) -> str:
+    """The human-readable reason carried by a failed Gateway response."""
+    error = frame.get("error")
+    if isinstance(error, dict) and error.get("message"):
+        return str(error["message"]).strip()
+    if isinstance(error, str) and error.strip():
+        return error.strip()
+    return "unknown error"
+
+
+def _ws_fail_waiters(reason: str) -> None:
+    """Wake everyone still waiting on a connection that has gone away."""
+    with _ws_pending_lock:
+        waiters = [*_ws_pending.values(), *_ws_runs.values()]
+        _ws_pending.clear()
+        _ws_runs.clear()
+    for future in waiters:
+        if not future.done():
+            future.set_exception(ConnectionError(reason))
+
+
+def _dispatch_ws_message(msg: dict[str, Any]) -> None:
+    """Route one Gateway frame to whoever is waiting for it.
+
+    A ``res`` frame only answers the request with the same id. For ``chat.send``
+    that is the acceptance receipt ({runId, status}), never the answer: the
+    answer is the run's terminal ``chat`` event, matched by runId.
+    """
+    kind = msg.get("type")
+    if kind == "res":
+        with _ws_pending_lock:
+            future = _ws_pending.pop(str(msg.get("id") or ""), None)
+        if future is not None and not future.done():
+            future.set_result(msg)
+        return
+    if kind != "event" or msg.get("event") != "chat":
+        return
+    payload = msg.get("payload")
+    if not isinstance(payload, dict) or payload.get("state") not in _TERMINAL_CHAT_STATES:
+        return
+    with _ws_pending_lock:
+        future = _ws_runs.pop(str(payload.get("runId") or ""), None)
+    if future is not None and not future.done():
+        future.set_result(payload)
+
+
+def _answer_from_chat_event(payload: dict[str, Any]) -> tuple[str, str, bool]:
+    """Turn a terminal ``chat`` event into (answer, error, started=True)."""
+    if payload.get("state") == "error":
+        return "", str(payload.get("errorMessage") or "OpenClaw reported an error."), True
+    message = payload.get("message")
+    content = message.get("content") if isinstance(message, dict) else None
+    said = content.strip() if isinstance(content, str) else _describe_parts(content)
+    if said:
+        return said, "", True
+    if payload.get("state") == "aborted":
+        return "", "OpenClaw stopped before it answered.", True
+    return "", "OpenClaw finished without an answer to read out.", True
+
+
+def _ensure_ws_connection(player=None) -> tuple[bool, str]:
+    """Ensure the persistent WebSocket is connected. Returns (ok, error)."""
+    global _ws_ws, _ws_loop, _ws_thread, _ws_connected, _ws_heartbeat_stop
+
+    if not _ws_available:
+        return False, "websockets library not installed"
+
+    with _ws_lock:
+        if _ws_connected and _ws_is_open(_ws_ws):
+            return True, ""
+
+        # Retire any stale connection, its heartbeat, and whoever still waits on it.
+        _ws_connected = False
+        _ws_heartbeat_stop.set()
+        stale = _ws_ws
+        _ws_ws = None
+        if stale is not None and _ws_loop is not None and not _ws_loop.is_closed():
+            try:
+                _asyncio.run_coroutine_threadsafe(stale.close(), _ws_loop).result(timeout=5)
+            except Exception:
+                pass
+        _ws_fail_waiters("The OpenClaw WebSocket was reconnected.")
+
+        # Ensure the event loop is running
+        if _ws_loop is None or _ws_loop.is_closed():
+            _ws_loop = _asyncio.new_event_loop()
+            _ws_thread = threading.Thread(
+                target=_ws_run_loop, args=(_ws_loop,), name="lumina-openclaw-ws", daemon=True
+            )
+            _ws_thread.start()
+
+        # Connect, authenticate and subscribe (each step waits up to 15 s).
+        try:
+            future = _asyncio.run_coroutine_threadsafe(_ws_connect_async(), _ws_loop)
+            ok, error = future.result(timeout=45)
+        except Exception as exc:
+            return False, f"WebSocket connect failed: {exc}"
+
+        if not ok:
+            return False, error
+
+        _ws_connected = True
+        _ws_heartbeat_stop = threading.Event()
+        threading.Thread(
+            target=_ws_heartbeat,
+            args=(_ws_heartbeat_stop,),
+            name="lumina-openclaw-ws-heartbeat",
+            daemon=True,
+        ).start()
+
+    print(f"[OpenClaw] persistent WebSocket connected to {_ws_url()}")
+    return True, ""
+
+
+async def _ws_connect_async() -> tuple[bool, str]:
+    """Open the socket, authenticate, and subscribe to this bridge's session.
+
+    The Gateway only delivers a run's ``chat`` events to connections subscribed
+    to that session, so without the subscription no answer would ever arrive.
+    """
+    global _ws_ws
+
+    token = _read_gateway_token()
+
+    try:
+        ws = await _websockets.connect(
+            _ws_url(),
+            max_size=26_214_400,  # 25 MiB, matching gateway default
+            ping_interval=20,
+            ping_timeout=10,
+            close_timeout=5,
+        )
+    except Exception as exc:
+        return False, f"Could not connect to {_ws_url()}: {exc}"
+
+    async def request(method: str, params: dict[str, Any]) -> dict[str, Any]:
+        request_id = str(uuid.uuid4())
+        await ws.send(
+            json.dumps({"type": "req", "id": request_id, "method": method, "params": params})
+        )
+        while True:
+            frame = json.loads(await _asyncio.wait_for(ws.recv(), timeout=15))
+            if isinstance(frame, dict) and frame.get("type") == "res" and frame.get("id") == request_id:
+                return frame
+
+    try:
+        try:
+            # The Gateway greets every socket with a connect.challenge event.
+            await _asyncio.wait_for(ws.recv(), timeout=10)
+        except _asyncio.TimeoutError:
+            pass
+
+        connected = await request(
+            "connect",
+            {
+                "minProtocol": 4,
+                "maxProtocol": 4,
+                "client": {
+                    "id": "cli",
+                    "version": "1.0.0",
+                    "platform": "windows" if platform.system() == "Windows" else "linux",
+                    "mode": "cli",
+                },
+                "role": "operator",
+                "scopes": ["operator.read", "operator.write"],
+                "caps": [],
+                "commands": [],
+                "permissions": {},
+                "auth": {"token": token} if token else {},
+                "locale": "en-US",
+                "userAgent": "lumina-start-talk/1.0.0",
+            },
+        )
+        if not connected.get("ok"):
+            await ws.close()
+            return False, f"Gateway rejected handshake: {_frame_error(connected)}"
+
+        subscribed = await request("sessions.messages.subscribe", {"key": _SESSION_SUBSCRIPTION_KEY})
+        if not subscribed.get("ok"):
+            await ws.close()
+            return False, f"Gateway refused the session subscription: {_frame_error(subscribed)}"
+    except Exception as exc:
+        try:
+            await ws.close()
+        except Exception:
+            pass
+        return False, f"Handshake error: {exc}"
+
+    _ws_ws = ws
+    _asyncio.get_running_loop().create_task(_ws_reader_loop())
+    return True, ""
+
+
+async def _ws_reader_loop() -> None:
+    """Background task: read Gateway frames and hand each one to its waiter."""
+    global _ws_connected
+    try:
+        async for raw in _ws_ws:
+            try:
+                msg = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(msg, dict):
+                _dispatch_ws_message(msg)
+    except Exception as exc:
+        print(f"[OpenClaw] WebSocket reader stopped: {exc}")
+    finally:
+        _ws_connected = False
+        _ws_fail_waiters("The OpenClaw WebSocket closed.")
+
+
+def _ws_request(method: str, params: dict[str, Any], timeout: float) -> dict[str, Any]:
+    """Send one request over the live socket and wait for its ``res`` frame."""
+    ws, loop = _ws_ws, _ws_loop
+    if ws is None or loop is None:
+        raise ConnectionError("The OpenClaw WebSocket is not connected.")
+    request_id = str(uuid.uuid4())
+    future: Future = Future()
+    with _ws_pending_lock:
+        _ws_pending[request_id] = future
+    frame = json.dumps({"type": "req", "id": request_id, "method": method, "params": params})
+    try:
+        _asyncio.run_coroutine_threadsafe(ws.send(frame), loop).result(timeout=10)
+        return future.result(timeout=timeout)
+    finally:
+        with _ws_pending_lock:
+            _ws_pending.pop(request_id, None)
+
+
+def _ws_heartbeat(stop: threading.Event) -> None:
+    """Ping every 30 s so a silently dead connection is noticed and replaced."""
+    global _ws_connected
+    while not stop.wait(30):
+        if not _ws_connected or _ws_ws is None:
+            return
+        try:
+            _asyncio.run_coroutine_threadsafe(_ws_ping(), _ws_loop).result(timeout=15)
+        except Exception:
+            _ws_connected = False
+            return
+
+
+async def _ws_ping() -> None:
+    """Ping and wait for the pong; an unsolicited pong proves nothing."""
+    ws = _ws_ws
+    if not _ws_is_open(ws):
+        raise ConnectionError("The OpenClaw WebSocket is not open.")
+    pong_waiter = await ws.ping()
+    await _asyncio.wait_for(pong_waiter, timeout=10)
+
+
+def _ws_send_message(question: str, timeout: int) -> tuple[str, str, bool]:
+    """Ask through the persistent WebSocket and wait for the run to finish.
+
+    Returns (answer, error, started). ``started`` turns True once the question
+    may be running on the Gateway; from then on the caller must not retry
+    through the CLI, because that would carry out the same request twice.
+    """
+    run_id = str(uuid.uuid4())
+    run_future: Future = Future()
+    with _ws_pending_lock:
+        _ws_runs[run_id] = run_future
+
+    try:
+        receipt = _ws_request(
+            "chat.send",
+            {"sessionKey": _SESSION_SUBSCRIPTION_KEY, "message": question, "idempotencyKey": run_id},
+            timeout=15,
+        )
+    except FutureTimeout:
+        with _ws_pending_lock:
+            _ws_runs.pop(run_id, None)
+        # The question may have left without its receipt coming back.
+        return "", "OpenClaw did not confirm the question, so it was not sent again.", True
+    except Exception as exc:
+        with _ws_pending_lock:
+            _ws_runs.pop(run_id, None)
+        return "", f"WebSocket send failed: {exc}", False
+
+    if not receipt.get("ok"):
+        with _ws_pending_lock:
+            _ws_runs.pop(run_id, None)
+        return "", f"Gateway rejected the question: {_frame_error(receipt)}", False
+
+    accepted = receipt.get("payload")
+    accepted_run = str(accepted.get("runId") or run_id) if isinstance(accepted, dict) else run_id
+    if accepted_run != run_id:
+        with _ws_pending_lock:
+            _ws_runs.pop(run_id, None)
+            _ws_runs[accepted_run] = run_future
+
+    try:
+        event = run_future.result(timeout=max(1, timeout))
+    except FutureTimeout:
+        with _ws_pending_lock:
+            _ws_runs.pop(accepted_run, None)
+        return "", f"OpenClaw is still working after {timeout} seconds.", True
+    except Exception as exc:
+        return "", f"The connection dropped while OpenClaw was working: {exc}", True
+    return _answer_from_chat_event(event)
+
+
+def _ws_close() -> None:
+    """Close the persistent WebSocket connection."""
+    global _ws_ws, _ws_connected
+
+    _ws_heartbeat_stop.set()
+    with _ws_lock:
+        _ws_connected = False
+        stale = _ws_ws
+        _ws_ws = None
+        if stale is not None and _ws_loop is not None and not _ws_loop.is_closed():
+            try:
+                _asyncio.run_coroutine_threadsafe(stale.close(), _ws_loop).result(timeout=5)
+            except Exception:
+                pass
+    _ws_fail_waiters("The OpenClaw bridge was disconnected.")
+
+
+# ── CLI fallback (used when WebSocket is not available) ─────────────────────
+
+def _describe_parts(items: Any) -> str:
+    """Turn OpenClaw's reply parts into something that can be said out loud."""
     if not isinstance(items, list):
         return ""
 
@@ -405,6 +870,8 @@ def _act_connect(player=None) -> str:
     connected, error = _ensure_connection(player)
     if not connected:
         return f"I could not connect to OpenClaw: {error}"
+    if _transport == "websocket":
+        return "Connected to OpenClaw through a persistent WebSocket link."
     if _transport == "gateway":
         return "Connected to the OpenClaw gateway."
     return "Connected to OpenClaw through its local CLI fallback."
@@ -417,6 +884,21 @@ def _wait_for_answer(question: str, timeout: int, player=None) -> tuple[str, str
     connected, error = _ensure_connection(player)
     if not connected:
         return "", f"I could not connect to OpenClaw: {error}"
+
+    # Prefer WebSocket
+    if _transport == "websocket":
+        answer, error, started = _ws_send_message(question, timeout)
+        if answer or started:
+            # Once the Gateway may be running the turn, retrying through the CLI
+            # would carry out the same request a second time.
+            return answer, error
+        print(f"[OpenClaw] WebSocket failed before the question was accepted ({error}), falling back to CLI")
+        if _gateway_health()[0]:
+            _transport = "gateway"
+        elif _cli_path():
+            _transport = "local"
+        else:
+            return "", error
 
     if _transport == "local" and _gateway_health()[0]:
         _transport = "gateway"
@@ -456,13 +938,6 @@ def _deliver(question: str, answer: str, player=None) -> None:
         except Exception:
             pass
 
-    # The marker is not decoration. Without it this lands as an ordinary user
-    # turn, and a model handed "OpenClaw has just answered..." reads it as the
-    # user making conversation: the first attempt answered "I have already put
-    # the question to OpenClaw and am waiting for the response" — in English,
-    # because an injected English sentence had become the latest user message.
-    # core/prompt.txt recognises [DELAYED_ANSWER] the way it already recognises
-    # [SYSTEM_ALERT] and [STARTUP_BRIEFING].
     _say(
         player,
         "[DELAYED_ANSWER] OpenClaw has finished the question you sent it "
@@ -510,9 +985,6 @@ def _act_ask(question: str, timeout: int, player=None) -> str:
         _job_question = question
         _job_started = time.monotonic()
 
-    # The caller's timeout was sized for a wait someone was sitting through.
-    # Nobody is sitting through this one, so it only has to be long enough that
-    # a hung CLI is eventually given up on.
     threading.Thread(
         target=_run_job,
         args=(question, max(timeout, _BACKGROUND_TIMEOUT), player),
@@ -535,20 +1007,7 @@ def _session_store() -> pathlib.Path:
 
 
 def _stored_answer() -> str:
-    """The last thing OpenClaw actually said, read back from its own session.
-
-    _last_answer only lives as long as this process, so every restart of Lumina
-    threw away an answer OpenClaw had already given — and restarts happen for
-    reasons that have nothing to do with the question: a crash, an update, a
-    change to the code. The user would ask her to read the answer and be told
-    none had ever arrived, which was false.
-
-    OpenClaw keeps the conversation itself, so that is where the answer is
-    recovered from. The database is opened read-only and never written to: it
-    belongs to OpenClaw, this is only reading the chat. If the shape of that
-    store ever changes, this returns nothing and the bridge behaves exactly as
-    it did before — a recovered answer is a bonus, never a dependency.
-    """
+    """The last thing OpenClaw actually said, read back from its own session."""
     store = _session_store()
     if not store.exists():
         return ""
@@ -566,7 +1025,6 @@ def _stored_answer() -> str:
         if not row or not row[0]:
             return ""
 
-        # Newest first, and only far enough back to cross a few tool events.
         for (event_json,) in connection.execute(
             "select event_json from transcript_events "
             "where session_id = ? order by seq desc limit 100",
@@ -620,6 +1078,7 @@ def _act_read() -> str:
 
 def _act_close() -> str:
     global _bridge_connected, _transport
+    _ws_close()
     _stop_owned_gateway()
     _bridge_connected = False
     _transport = ""
