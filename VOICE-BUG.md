@@ -214,49 +214,14 @@ backlog: the seconds were arithmetic on the block count, so they read `64s` per
 1000 blocks whether the stream was live or an hour behind. It now prints the
 wall clock beside them.
 
-## Windows dictation: built, measured, and turned off
+## Windows dictation: tried and removed
 
-The user asked why dictation into a chat box shows his words as he says them
-and this does not. The diagnosis still stands: `input_audio_transcription`
-arrives on the conversation socket, so the live line dies whenever the session
-does. The first remedy did not survive measurement.
-
-`WindowsDictation` (`core/stt.py`) ran the operating system recogniser beside
-the session. Windows will not accept audio for it; it opens the microphone
-itself. On this machine that silences every other client of the same device.
-
-Measured 2026-09-12, Lumina closed, one arm per process, raw int16 RMS of a
-16 kHz stream opened the way `_listen_audio` opens it:
-
-| arm | stream median | CPU of the process |
-|---|---|---|
-| no recogniser | 88.7 | 0.6% |
-| recogniser running, then stream opened | 1.0 | 1.5% |
-| stream open, before the recogniser starts | 75.0 | 0.9% |
-| the same stream, after it starts | 1.0 | 1.4% |
-
-Sampled once a second, the mechanism has two parts. Within two seconds of the
-recogniser starting, the capture endpoint master volume drops from 0.941 to
-0.550 — its own gain control, applied to the whole device — and the other
-stream then reads a flat 0.5 RMS, which is not a quieter signal but silence.
-Both undo themselves when the recogniser process exits: a fresh process read
-0.941 again.
-
-What that did in practice: the 2.5 h session run with it on logged a normal
-microphone level on connection 1, then a peak of 0.00 on every one of the next
-sixteen connections, zero local speech detections and zero deafness rebuilds.
-The watchdog reads the same level, so it could not see anything wrong. The
-model was being fed that stream the whole time.
-
-So `_DICTATION_ON` defaults to off, and `LUMINA_DICTATION=on` brings it back for
-a machine where the same A/B says it is harmless. The class is kept for that.
-
-**The remedy that fits** is a recogniser fed from the stream this process
-already captures — one that accepts PCM, such as Vosk — so that no second
-client ever opens the device. Not built yet.
-
-The recogniser costs about 1.5% of one core. It is not what held that session
-at roughly 1.4 cores, which is still unexplained.
+Running the operating system recogniser beside the session, to show the user
+his words independently of the model, silenced the microphone the model is
+fed. Windows opens the device itself: measured on 2026-09-12, the endpoint
+volume dropped from 0.941 to 0.550 and the other capture stream fell from a
+median of 88.7 RMS to 1.0. A 2.5 h session with it on logged a peak of 0.00 on
+sixteen consecutive connections. It was removed. See AGENTS.md item 1c.
 
 ## Why it never recovers: the handle is replayed into the fault
 

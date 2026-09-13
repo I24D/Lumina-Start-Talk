@@ -162,7 +162,6 @@ from memory.config_manager     import (
     get_brief_enabled, get_voice, get_input_device, get_output_device,
 )
 from core.plugin_loader        import discover_plugins
-from core.stt                 import WindowsDictation
 from core                      import undo as undo_stack
 from core                      import confirm as confirm_gate
 from core                      import audio_devices
@@ -201,29 +200,6 @@ try:
     _COMPRESSION_ON = _os_cfg.environ.get(
         "LUMINA_COMPRESSION", "on"
     ).strip().lower() not in ("0", "off", "false", "no")
-except Exception:
-    pass
-
-# Windows dictation beside the live session (core/stt.py). OFF by default,
-# because on this machine it silences the microphone Lumina itself reads.
-#
-# Measured 2026-09-12 with a standalone A/B, Lumina closed, one arm per process:
-# the stream median fell from 88.7 RMS with no recogniser to 1.0 RMS with one
-# running, and an already-open stream fell from 75.0 to 1.0 the moment the
-# recogniser started. The model is fed that stream, so for as long as the
-# recogniser runs the assistant is close to deaf — and neither the local speech
-# detector nor the deafness watchdog can notice, because both read that same
-# level. A 2.5 h session with it on logged zero local speech detections and a
-# peak of 0.00 across sixteen connections.
-#
-# The recogniser itself costs about 1.5% of one core, so it is not what held the
-# process at 1.4 cores. LUMINA_DICTATION=on brings it back, for a machine where
-# the same A/B says it is harmless.
-_DICTATION_ON = False
-try:
-    _DICTATION_ON = _os_cfg.environ.get(
-        "LUMINA_DICTATION", "off"
-    ).strip().lower() in ("1", "on", "true", "yes")
 except Exception:
     pass
 # How long the microphone may go without delivering a single block before it is
@@ -1287,10 +1263,6 @@ class JarvisLive:
         # here writes to the session, sends anything, or rebuilds anything: a
         # measurement that changes what it measures is how the last three
         # watchdogs destroyed healthy conversations.
-        # Windows' own recogniser, painting the live line when the model's
-        # transcript is not arriving. Started in run(); absent on a machine
-        # with no speech pack for the user's language, which costs nothing.
-        self._dictation = None
         self._rx_at = 0.0                       # last message the stream yielded
         self._rx_kinds: dict[str, int] = {}     # what kind, since the last record
         self._mic_blocks = 0                    # delivered by the device, pre-gate
@@ -1496,12 +1468,6 @@ class JarvisLive:
     def set_speaking(self, value: bool):
         with self._speaking_lock:
             self._is_speaking = value
-        # The same gate the microphone callback applies, for the same reason.
-        # Windows opens its own capture, so it hears her through the speakers
-        # whatever this process does with its stream, and would write her own
-        # sentences into the chat under the user's name.
-        if self._dictation is not None and not self._full_duplex:
-            self._dictation.set_enabled(not value)
         if not value:
             self._last_spoke_at = time.monotonic()
         if value:
@@ -2184,34 +2150,6 @@ class JarvisLive:
         except Exception as e:
             print(f"[JARVIS] ❌ Mic: {e}")
             raise
-
-    def _on_dictation(self, text: str, final: bool) -> None:
-        """Put the user's words on the live line from the operating system.
-
-        Called from the dictation thread. The model's own transcript is better
-        and is what she actually heard, so it wins the moment it arrives:
-        `_live_has_text` is set by the first fragment of a turn and cleared at
-        turn_complete, and this writes only while it is false.
-
-        That leaves exactly one case where these words reach the screen — the
-        model has returned nothing for this turn — and that case is the bug.
-        A user talking to a session that has gone quiet used to watch an empty
-        line and had no way to tell being ignored from being unheard. Now he
-        sees his own sentence appear and no answer follow, which says which of
-        the two it is without reading a log.
-        """
-        if self._live_has_text:
-            return
-        # set_enabled already mutes this while she speaks; the window between
-        # her first sample and that call is small and this closes it.
-        if self._is_speaking and not self._full_duplex:
-            return
-        if self.ui.muted:
-            return
-        try:
-            self.ui.set_live_transcript(f"{self._user_name}: {text}")
-        except Exception:
-            pass
 
     def _note_rx(self, response) -> None:
         """Record that the receive stream yielded something, and what it was.
@@ -3251,28 +3189,6 @@ class JarvisLive:
         # Enumerate audio devices off-thread. The settings drawer must never pay
         # for host-API enumeration on the Qt thread.
         audio_devices.prefetch()
-
-        # Live transcription that does not depend on the conversation.
-        #
-        # Started once for the process, not per session, because that is the
-        # entire point: it has no session to lose. Every reconnect, every
-        # rebuild and every quiet stretch below leaves it running, so the words
-        # keep appearing while the part that answers them is being rebuilt.
-        try:
-            if not _DICTATION_ON:
-                print("[Dictation] off - it silences this microphone on this "
-                      "machine (see _DICTATION_ON); LUMINA_DICTATION=on to "
-                      "re-enable", flush=True)
-            else:
-                self._dictation = WindowsDictation(self._on_dictation)
-                if not self._dictation.start():
-                    self._dictation = None
-        except Exception as exc:
-            # Never fatal. An assistant with no live line still hears and still
-            # answers; one that will not start because of a speech pack is
-            # worse than the problem it was added to solve.
-            print(f"[Dictation] unavailable: {type(exc).__name__}: {exc}", flush=True)
-            self._dictation = None
 
         # Start dashboard (optional — needs: pip install fastapi "uvicorn[standard]" cryptography)
         try:

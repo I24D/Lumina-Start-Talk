@@ -96,8 +96,8 @@ order.
 The local detector and the deafness watchdog read the same level, so a whole
 session logs a peak of 0.00, no speech detected and no rebuild, while the odd
 sentence still gets through between recogniser restarts — which makes it look
-intermittent. `_DICTATION_ON` is off for this reason. Anything that wants the
-audio takes it from `_listen_audio`, never from the device.
+intermittent. It was removed for this reason. Anything that wants the audio
+takes it from `_listen_audio`, never from the device.
 
 ### 2. The deafness watchdog may only rebuild a session that has never heard anything
 
