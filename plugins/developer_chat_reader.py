@@ -22,6 +22,9 @@ Sending cannot work that way. Neither extension exposes an API or a CLI that
 posts into the panel on screen, so writing goes through VS Code's own command
 palette and the keyboard — see the section further down, which is the only part
 of this plugin that touches the editor's window.
+
+The same history files let Lumina speak up without being asked: start() watches
+them and announces each new final answer once, as soon as it is written.
 """
 
 from __future__ import annotations
@@ -32,6 +35,7 @@ import platform
 import re
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -57,7 +61,9 @@ PLUGIN = {
         "language it was asked in. Relay what the user actually asked, whole: you are the "
         "messenger, not the judge, and you do not know what Codex or Claude Code can do. Never "
         "refuse to pass a message on because you believe it is beyond them. "
-        "source='codex' | 'claude' | 'both' chooses the chat."
+        "source='codex' | 'claude' | 'both' chooses the chat. "
+        "New final answers from both chats are announced by Lumina on her own as soon as they "
+        "are written; no tool call is needed for that."
     ),
     "parameters": {
         "type": "OBJECT",
@@ -178,23 +184,40 @@ def _content_text(content: Any, block_types: set[str]) -> str:
     return "\n\n".join(parts)
 
 
+def _codex_answer(row: dict) -> tuple[str, str]:
+    """(text, phase) of an assistant message in a Codex rollout, or ("", "")."""
+    if row.get("type") != "response_item":
+        return "", ""
+    payload = row.get("payload")
+    if not isinstance(payload, dict):
+        return "", ""
+    if payload.get("type") != "message" or payload.get("role") != "assistant":
+        return "", ""
+    phase = str(payload.get("phase") or "").strip().lower()
+    return _content_text(payload.get("content"), {"output_text", "text"}), phase
+
+
+def _claude_answer(row: dict) -> tuple[str, str]:
+    """(text, stop_reason) of an assistant message in a Claude Code chat, or
+    ("", "") for anything else, subagent and meta records included."""
+    if row.get("type") != "assistant" or row.get("isSidechain") is True:
+        return "", ""
+    if row.get("isMeta") is True:
+        return "", ""
+    message = row.get("message")
+    if not isinstance(message, dict) or message.get("role") != "assistant":
+        return "", ""
+    reason = str(message.get("stop_reason") or "").strip().lower()
+    return _content_text(message.get("content"), {"text"}), reason
+
+
 def _latest_codex_reply() -> ChatReply | None:
     best: ChatReply | None = None
     fallback: ChatReply | None = None
     for path in _history_files(_codex_roots()):
         for line_number, row in _jsonl_rows(path):
-            if row.get("type") != "response_item":
-                continue
-            payload = row.get("payload")
-            if not isinstance(payload, dict):
-                continue
-            if payload.get("type") != "message" or payload.get("role") != "assistant":
-                continue
-            phase = str(payload.get("phase") or "").strip().lower()
-            if phase and phase not in _FINAL_CODEX_PHASES:
-                continue
-            text = _content_text(payload.get("content"), {"output_text", "text"})
-            if not text:
+            text, phase = _codex_answer(row)
+            if not text or (phase and phase not in _FINAL_CODEX_PHASES):
                 continue
             reply = ChatReply(
                 source="Codex",
@@ -214,14 +237,7 @@ def _latest_claude_reply() -> ChatReply | None:
     fallback: ChatReply | None = None
     for path in _history_files(_claude_roots()):
         for line_number, row in _jsonl_rows(path):
-            if row.get("type") != "assistant" or row.get("isSidechain") is True:
-                continue
-            if row.get("isMeta") is True:
-                continue
-            message = row.get("message")
-            if not isinstance(message, dict) or message.get("role") != "assistant":
-                continue
-            text = _content_text(message.get("content"), {"text"})
+            text, reason = _claude_answer(row)
             if not text:
                 continue
             reply = ChatReply(
@@ -230,7 +246,6 @@ def _latest_claude_reply() -> ChatReply | None:
                 timestamp=_timestamp(row.get("timestamp"), path, line_number),
                 path=path,
             )
-            reason = str(message.get("stop_reason") or "").strip().lower()
             if not reason and (fallback is None or reply.timestamp > fallback.timestamp):
                 fallback = reply
             if reason in _FINAL_CLAUDE_REASONS and (best is None or reply.timestamp > best.timestamp):
@@ -298,6 +313,193 @@ def _read_source(source: str) -> str:
     if claude:
         parts.append(f"Latest Claude Code response: {claude}")
     return "\n\n".join(parts)
+
+
+# ── announcing finished answers ──────────────────────────────────────────────
+#
+# Reading on request leaves the user asking "has it finished yet?". start() runs
+# a watcher that notices a new final answer the moment it is written and queues
+# it for Lumina to announce once she is free.
+#
+# Only what is written after Lumina starts is news. Each transcript is read on
+# from where the previous look ended, so a long chat is never read twice, and
+# the first look takes every existing transcript from its current end. A record
+# older than the watcher is never announced either: a resumed chat copies its
+# history into a new file. And Claude Code writes some finished answers into a
+# transcript a second time, identical and much later — measured on this
+# machine, 218 of 693 — so a message id is announced once.
+
+_WATCH_SECONDS = 2.0
+_ANNOUNCE_LIMIT = 12_000
+
+# Recognised by the "Answering in depth" rule in core/prompt.txt.
+_ANSWER_IN_DEPTH = "[ANSWER_IN_DEPTH]\n"
+
+_watch_lock = threading.Lock()
+_watch_thread: threading.Thread | None = None
+
+
+class _TranscriptTail:
+    """Hands back the complete JSONL records appended since the previous sweep."""
+
+    def __init__(self) -> None:
+        self._offsets: dict[Path, int] = {}
+        self._primed = False
+
+    def sweep(self, paths: Iterable[Path]) -> list[tuple[Path, dict]]:
+        rows: list[tuple[Path, dict]] = []
+        for path in paths:
+            try:
+                size = path.stat().st_size
+            except OSError:
+                continue
+            offset = self._offsets.get(path)
+            if offset is None:
+                offset = 0 if self._primed else size
+            elif size < offset:
+                offset = 0    # rewritten in place; the age check keeps old answers quiet
+            self._offsets[path] = offset
+            if size == offset:
+                continue
+            try:
+                with path.open("rb") as stream:
+                    stream.seek(offset)
+                    chunk = stream.read(size - offset)
+            except OSError:
+                continue
+            end = chunk.rfind(b"\n")
+            if end < 0:
+                continue      # a line still being written; it is taken next time
+            self._offsets[path] = offset + end + 1
+            for line in chunk[: end + 1].splitlines():
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(row, dict):
+                    rows.append((path, row))
+        self._primed = True
+        return rows
+
+
+def _codex_chat_is_the_users(path: Path, known: dict[Path, bool]) -> bool:
+    """False for Codex sessions nobody is typing into: the subagents Codex
+    starts for itself, and `codex exec` runs launched by other programs."""
+    if path not in known:
+        for _, row in _jsonl_rows(path):
+            meta = row.get("payload") if row.get("type") == "session_meta" else None
+            meta = meta if isinstance(meta, dict) else {}
+            source = meta.get("source")
+            known[path] = not (
+                source == "exec"
+                or isinstance(source, dict)
+                or meta.get("thread_source") == "subagent"
+            )
+            break
+    return known.get(path, True)
+
+
+def _is_news(row: dict, path: Path, started: float, message_id: Any, announced: deque) -> bool:
+    if _timestamp(row.get("timestamp"), path, 0) < started:
+        return False
+    if message_id:
+        if message_id in announced:
+            return False
+        announced.append(message_id)
+    return True
+
+
+def _finished_since_last_look(
+    tails: dict[str, _TranscriptTail],
+    started: float,
+    announced: deque,
+    codex_sessions: dict[Path, bool],
+) -> list[tuple[str, str]]:
+    """(label, text) for every final answer written since the previous look."""
+    news: list[tuple[str, str]] = []
+
+    for path, row in tails["claude"].sweep(_history_files(_claude_roots())):
+        text, reason = _claude_answer(row)
+        if not text or reason not in _FINAL_CLAUDE_REASONS:
+            continue
+        message_id = (row.get("message") or {}).get("id")
+        if _is_news(row, path, started, message_id, announced):
+            news.append(("Claude Code", text))
+
+    for path, row in tails["codex"].sweep(_history_files(_codex_roots())):
+        text, phase = _codex_answer(row)
+        if not text or phase not in _FINAL_CODEX_PHASES:
+            continue
+        if not _codex_chat_is_the_users(path, codex_sessions):
+            continue
+        message_id = (row.get("payload") or {}).get("id")
+        if _is_news(row, path, started, message_id, announced):
+            news.append(("Codex", text))
+
+    return news
+
+
+def _announce(player, label: str, text: str) -> None:
+    spoken = _speech_text(text)
+    if not spoken:
+        return
+    if len(spoken) > _ANNOUNCE_LIMIT:
+        spoken = spoken[:_ANNOUNCE_LIMIT].rsplit(" ", 1)[0] + "…"
+    print(f"[DeveloperChat] {label} finished a task ({len(text)} chars); announcing")
+    try:
+        if player:
+            player.write_log(f"[Developer chats] {label} finished a task")
+        announce = getattr(player, "request_announce", None)
+        if callable(announce):
+            announce(
+                f"[CHAT_FINISHED] {label} has just finished a task in its chat. "
+                "Its answer follows.\n\n" + _ANSWER_IN_DEPTH + spoken
+            )
+    except Exception as exc:
+        print(f"[DeveloperChat] could not announce: {exc}")
+
+
+def _enabled() -> bool:
+    try:
+        from memory.config_manager import get_plugin_enabled
+        return get_plugin_enabled(PLUGIN["name"])
+    except Exception:
+        return True
+
+
+def _watch(player) -> None:
+    started = time.time()
+    tails = {"claude": _TranscriptTail(), "codex": _TranscriptTail()}
+    announced: deque = deque(maxlen=500)
+    codex_sessions: dict[Path, bool] = {}
+    last_error = ""
+    while True:
+        try:
+            # A disabled plugin still looks, so switching it back on does not
+            # announce everything that finished in the meantime.
+            news = _finished_since_last_look(tails, started, announced, codex_sessions)
+            if news and _enabled():
+                for label, text in news:
+                    _announce(player, label, text)
+            last_error = ""
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            if error != last_error:
+                print(f"[DeveloperChat] watcher: {error}")
+            last_error = error
+        time.sleep(_WATCH_SECONDS)
+
+
+def start(player=None) -> None:
+    """Begin announcing finished answers. Called once, at startup, by the plugin loader."""
+    global _watch_thread
+    with _watch_lock:
+        if _watch_thread and _watch_thread.is_alive():
+            return
+        _watch_thread = threading.Thread(
+            target=_watch, args=(player,), name="developer-chat-watch", daemon=True
+        )
+        _watch_thread.start()
 
 
 # ── writing into the chats ───────────────────────────────────────────────────

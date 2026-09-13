@@ -4,11 +4,15 @@ Run from the project root: python -m unittest tests.test_openclaw_bridge
 """
 
 import importlib.util
+import json
 import os
 import pathlib
+import sqlite3
 import tempfile
+import time
 import unittest
 from concurrent.futures import Future
+from contextlib import closing
 from unittest import mock
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -167,6 +171,112 @@ class WaitForAnswerTests(unittest.TestCase):
         ):
             self.assertEqual(bridge._wait_for_answer("q", 30), ("from cli", ""))
         cli.assert_called_once()
+
+
+class ChatWatcherTests(unittest.TestCase):
+    """The watcher that announces answers from OpenClaw's own chat."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.store = pathlib.Path(tmp.name) / "openclaw-agent.sqlite"
+        with closing(sqlite3.connect(self.store)) as db:
+            db.executescript(
+                """
+                create table transcript_events (
+                    session_id text, seq integer, event_json text, created_at integer);
+                create table session_windows (session_id text primary key, session_key text);
+                create table conversations (conversation_id text, channel text);
+                create table session_conversations (session_id text, conversation_id text);
+                insert into conversations values ('contact', 'telegram');
+                insert into session_conversations values ('telegram', 'contact');
+                """
+            )
+            db.executemany(
+                "insert into session_windows values (?, ?)",
+                [
+                    ("chat", "agent:main:main"),
+                    ("bridge", bridge._SESSION_SUBSCRIPTION_KEY),
+                    ("cron", "agent:main:cron:daily-news"),
+                    ("telegram", "agent:main:telegram:direct:1"),
+                ],
+            )
+            db.commit()
+
+        for patcher in (
+            mock.patch.object(bridge, "_session_store", return_value=self.store),
+            mock.patch.object(bridge, "_job_question", ""),
+            mock.patch.object(bridge, "_last_answer", ""),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        bridge._bridge_run_ids.clear()
+        self.addCleanup(bridge._bridge_run_ids.clear)
+
+        self.started = time.time() - 1
+        self.seq = 0
+        self.after, _ = None, None
+        _, self.after = bridge._finished_since(None, self.started)
+
+    def add(self, session, text, stop="stop", when_ms=None, **message):
+        self.seq += 1
+        now_ms = int(time.time() * 1000)
+        body = {
+            "role": "assistant",
+            "stopReason": stop,
+            "timestamp": when_ms or now_ms,
+            "content": [{"type": "text", "text": text}],
+            **message,
+        }
+        with closing(sqlite3.connect(self.store)) as db:
+            db.execute(
+                "insert into transcript_events values (?, ?, ?, ?)",
+                (session, self.seq, json.dumps({"type": "message", "message": body}), now_ms),
+            )
+            db.commit()
+
+    def look(self):
+        answers, self.after = bridge._finished_since(self.after, self.started)
+        return answers
+
+    def test_answers_already_in_the_store_are_not_news(self):
+        self.add("chat", "vieja")
+        _, after = bridge._finished_since(None, self.started)
+        self.after = after
+        self.add("chat", "nueva")
+        self.assertEqual(self.look(), ["nueva"])
+        self.assertEqual(self.look(), [])
+
+    def test_contacts_scheduled_jobs_voice_and_tool_steps_are_not_announced(self):
+        self.add("telegram", "Hola, Dal")
+        self.add("cron", "Noticias del día")
+        self.add("chat", "dicho por la voz", api="realtime")
+        self.add("chat", "buscando…", stop="toolUse")
+        self.add("chat", "de antes de arrancar", when_ms=int((self.started - 3600) * 1000))
+        self.add("chat", "Ya está listo.")
+        self.assertEqual(self.look(), ["Ya está listo."])
+
+    def test_questions_the_bridge_sent_are_not_announced_twice(self):
+        bridge._bridge_run_ids.append("run-1")
+        self.add("bridge", "respuesta por WebSocket", __openclaw={"runId": "run-1"})
+        self.assertEqual(self.look(), [])
+
+        with mock.patch.object(bridge, "_job_question", "pregunta pendiente"):
+            self.add("bridge", "respuesta por la CLI")
+            self.add("chat", "respuesta en su chat")
+            self.assertEqual(self.look(), ["respuesta en su chat"])
+
+        with mock.patch.object(bridge, "_last_answer", "ya  leída\n"):
+            self.add("bridge", "ya leída")
+            self.assertEqual(self.look(), [])
+
+    def test_announcement_asks_for_an_in_depth_summary_and_can_be_repeated(self):
+        player = mock.Mock()
+        bridge._announce_chat_answer("Terminé.", player)
+        instruction = player.request_announce.call_args.args[0]
+        self.assertTrue(instruction.startswith("[CHAT_FINISHED] OpenClaw"))
+        self.assertIn("[ANSWER_IN_DEPTH]\nTerminé.", instruction)
+        self.assertEqual(bridge._last_answer, "Terminé.")
 
 
 if __name__ == "__main__":

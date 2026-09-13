@@ -42,6 +42,7 @@ import subprocess
 import threading
 import time
 import uuid
+from collections import deque
 from concurrent.futures import Future, TimeoutError as FutureTimeout
 from typing import Any
 
@@ -93,7 +94,9 @@ PLUGIN = {
         "for 'what did Open Claw answer?' even at the start of a session: 'léeme la respuesta de Open Claw', "
         "'qué respondió Open Claw', 'read Open Claw's answer', 'what did OpenClaw say'. "
         "action='close' disconnects the bridge: 'desconéctate de Open Claw', 'cierra la conexión "
-        "con Open Claw', 'disconnect from Open Claw', 'close the OpenClaw connection'."
+        "con Open Claw', 'disconnect from Open Claw', 'close the OpenClaw connection'. "
+        "Answers the user gets in OpenClaw's own chat are announced by Lumina on her own as "
+        "soon as they arrive; no tool call is needed for that."
     ),
     "parameters": {
         "type": "OBJECT",
@@ -168,6 +171,9 @@ _ws_pending: dict[str, Future] = {}
 _ws_runs: dict[str, Future] = {}
 # The Gateway only sends a run's `chat` events to connections subscribed to it.
 _SESSION_SUBSCRIPTION_KEY = f"agent:{_AGENT_ID}:{_SESSION_KEY}"
+# Every run id this bridge has sent. OpenClaw stamps it on the answer it
+# stores, which is how the chat watcher knows _deliver already speaks that one.
+_bridge_run_ids: deque[str] = deque(maxlen=200)
 _TERMINAL_CHAT_STATES = frozenset({"final", "error", "aborted"})
 
 
@@ -737,6 +743,7 @@ def _ws_send_message(question: str, timeout: int) -> tuple[str, str, bool]:
     through the CLI, because that would carry out the same request twice.
     """
     run_id = str(uuid.uuid4())
+    _bridge_run_ids.append(run_id)
     run_future: Future = Future()
     with _ws_pending_lock:
         _ws_runs[run_id] = run_future
@@ -765,6 +772,7 @@ def _ws_send_message(question: str, timeout: int) -> tuple[str, str, bool]:
     accepted = receipt.get("payload")
     accepted_run = str(accepted.get("runId") or run_id) if isinstance(accepted, dict) else run_id
     if accepted_run != run_id:
+        _bridge_run_ids.append(accepted_run)
         with _ws_pending_lock:
             _ws_runs.pop(run_id, None)
             _ws_runs[accepted_run] = run_future
@@ -1049,6 +1057,179 @@ def _stored_answer() -> str:
                 connection.close()
             except Exception:
                 pass
+
+
+# ── announcing answers from OpenClaw's own chat ──────────────────────────────
+#
+# _deliver speaks the answers to questions Lumina sent. The user also works in
+# OpenClaw's own chat, and start() watches for those answers: each new finished
+# turn in the main agent's store is queued for Lumina to announce once she is
+# free.
+#
+# The store holds more than that chat, and most of it is nobody's news. Replies
+# the bot sends to Telegram contacts belong to a conversation with a channel,
+# scheduled jobs run under a ":cron:" session key, and OpenClaw's own Talk voice
+# marks what it said. Questions this bridge sent are skipped too: _deliver
+# already speaks them, and a second reading would say the same answer twice.
+# Every row is also checked against the watcher's start, so a store that
+# rewrites a transcript never replays old answers.
+
+_WATCH_SECONDS = 2.0
+_FINISHED_STOP_REASONS = frozenset({"stop", "end_turn"})
+
+_watch_lock = threading.Lock()
+_watch_thread: threading.Thread | None = None
+
+_NEW_ROWS_SQL = (
+    "select t.rowid, t.created_at, t.event_json, w.session_key,"
+    " (select c.channel from session_conversations sc join conversations c"
+    "   on c.conversation_id = sc.conversation_id"
+    "   where sc.session_id = t.session_id limit 1)"
+    " from transcript_events t left join session_windows w on w.session_id = t.session_id"
+    " where t.rowid > ? order by t.rowid limit 500"
+)
+
+
+def _chat_answer(event_json: str) -> tuple[str, str, float]:
+    """(text, run id, timestamp) of a finished assistant turn, or ("", "", 0.0)."""
+    try:
+        event = json.loads(event_json)
+    except (TypeError, ValueError):
+        return "", "", 0.0
+    message = event.get("message") if isinstance(event, dict) and event.get("type") == "message" else None
+    if not isinstance(message, dict) or message.get("role") != "assistant":
+        return "", "", 0.0
+    if message.get("stopReason") not in _FINISHED_STOP_REASONS:
+        return "", "", 0.0
+
+    provenance = message.get("provenance")
+    provenance = provenance if isinstance(provenance, dict) else {}
+    if (
+        message.get("api") == "realtime"
+        or str(message.get("idempotencyKey") or "").startswith("talk-")
+        or provenance.get("kind") == "realtime_voice"
+        or provenance.get("sourceChannel") == "talk"
+    ):
+        return "", "", 0.0    # OpenClaw's Talk voice said this out loud already
+
+    content = message.get("content")
+    text = content.strip() if isinstance(content, str) else _describe_parts(content)
+    marks = message.get("__openclaw")
+    run_id = str(marks.get("runId") or "") if isinstance(marks, dict) else ""
+    stamp = message.get("timestamp")
+    return text, run_id, stamp / 1000 if isinstance(stamp, (int, float)) else 0.0
+
+
+def _answered_through_bridge(session_key: str, text: str, run_id: str) -> bool:
+    """True when _deliver speaks this answer itself."""
+    if run_id and run_id in _bridge_run_ids:
+        return True
+    if session_key != _SESSION_SUBSCRIPTION_KEY:
+        return False
+    # The CLI fallback leaves no run id behind. A question still being waited
+    # on, or the answer _deliver has just spoken, is what gives it away.
+    with _job_lock:
+        waiting = bool(_job_question)
+    return waiting or " ".join(text.split()) == " ".join(_last_answer.split())
+
+
+def _finished_since(after_rowid: int | None, started: float) -> tuple[list[str], int | None]:
+    """New chat answers stored after ``after_rowid``, and the rowid to go on from.
+
+    ``None`` means this is the first look: the store's current end becomes the
+    starting point, so nothing already in it is announced.
+    """
+    store = _session_store()
+    if not store.exists():
+        return [], after_rowid
+
+    connection = sqlite3.connect(f"file:{store.as_posix()}?mode=ro", uri=True, timeout=2.0)
+    try:
+        newest = connection.execute(
+            "select coalesce(max(rowid), 0) from transcript_events"
+        ).fetchone()[0]
+        if after_rowid is None or newest < after_rowid:
+            return [], newest
+
+        answers: list[str] = []
+        for rowid, created_at, event_json, session_key, channel in connection.execute(
+            _NEW_ROWS_SQL, (after_rowid,)
+        ):
+            after_rowid = max(after_rowid, rowid)
+            if channel or ":cron:" in (session_key or ""):
+                continue
+            text, run_id, stamp = _chat_answer(event_json)
+            if not text or (stamp or (created_at or 0) / 1000) < started:
+                continue
+            if _answered_through_bridge(session_key or "", text, run_id):
+                continue
+            answers.append(text)
+        return answers, after_rowid
+    finally:
+        connection.close()
+
+
+def _announce_chat_answer(answer: str, player=None) -> None:
+    global _last_answer
+    _last_answer = answer    # so "read" repeats this one, not an older answer
+
+    spoken = answer
+    if len(spoken) > _SPOKEN_LIMIT:
+        spoken = spoken[:_SPOKEN_LIMIT].rsplit(" ", 1)[0] + "…"
+
+    print(f"[OpenClaw] finished a task in its chat ({len(answer)} chars); announcing")
+    try:
+        if player:
+            player.write_log(f"[OpenClaw] finished a task in its chat ({len(answer)} chars)")
+        announce = getattr(player, "request_announce", None)
+        if callable(announce):
+            announce(
+                "[CHAT_FINISHED] OpenClaw has just finished a task in its chat. "
+                "Its answer follows.\n\n" + _ANSWER_IN_DEPTH + spoken
+            )
+    except Exception as exc:
+        print(f"[OpenClaw] could not announce: {exc}")
+
+
+def _enabled() -> bool:
+    try:
+        from memory.config_manager import get_plugin_enabled
+        return get_plugin_enabled(PLUGIN["name"])
+    except Exception:
+        return True
+
+
+def _watch(player) -> None:
+    started = time.time()
+    after_rowid: int | None = None
+    last_error = ""
+    while True:
+        try:
+            # A disabled plugin still looks, so switching it back on does not
+            # announce everything that finished in the meantime.
+            answers, after_rowid = _finished_since(after_rowid, started)
+            if answers and _enabled():
+                for answer in answers:
+                    _announce_chat_answer(answer, player)
+            last_error = ""
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            if error != last_error:
+                print(f"[OpenClaw] chat watcher: {error}")
+            last_error = error
+        time.sleep(_WATCH_SECONDS)
+
+
+def start(player=None) -> None:
+    """Begin announcing answers from OpenClaw's own chat. Called once by the plugin loader."""
+    global _watch_thread
+    with _watch_lock:
+        if _watch_thread and _watch_thread.is_alive():
+            return
+        _watch_thread = threading.Thread(
+            target=_watch, args=(player,), name="openclaw-chat-watch", daemon=True
+        )
+        _watch_thread.start()
 
 
 def _act_read() -> str:

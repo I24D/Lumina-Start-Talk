@@ -43,3 +43,15 @@ def run(parameters: dict, player=None, session_memory=None) -> str:
         except Exception:
             pass
     return result_text
+
+
+# Optional, and only for a plugin that works in the background — noticing
+# something and announcing it without being asked:
+#
+# def start(player=None) -> None:
+#
+# Called once at startup, for disabled plugins too, so check
+# memory.config_manager.get_plugin_enabled(PLUGIN["name"]) before acting.
+# Return at once and do the watching on a daemon thread. Speak through
+# player.request_announce(instruction), which waits until the assistant is
+# free instead of cutting in.

@@ -116,6 +116,7 @@ import time
 import json
 import sys
 import traceback
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 
@@ -235,6 +236,13 @@ _DEAF_SILENCE_SECONDS = 25.0
 _DEAF_VOICE_LEVEL     = 0.40    # measured: this room idles at 0.23 and peaks at 0.33
 _DEAF_COOLDOWN        = 120.0   # never rebuild more often than this
 _DEAF_ECHO_TAIL       = 2.0     # her own voice keeps arriving after she stops
+
+# Plugin news nobody asked for (_run_announcements) waits for a quiet moment.
+_ANNOUNCE_USER_QUIET  = 10.0    # the user spoke this recently: do not cut in
+_ANNOUNCE_GAP         = 2.5     # a breath between her last words and the news
+_ANNOUNCE_ANSWER_WAIT = 30.0    # stop waiting for her answer to the last item to start
+_ANNOUNCE_MAX_AGE     = 900.0   # still unsaid after fifteen minutes, it is not news
+_ANNOUNCE_QUEUE_LIMIT = 20
 
 # Smart Vision compares each fresh sample with the last frame the model saw.
 # A keyframe still refreshes context periodically when the source is static.
@@ -1329,6 +1337,12 @@ class JarvisLive:
         )
         self.ui.get_plugins = self._plugin_registry.list_for_ui
         self.ui.request_say = self.plugin_say   # plugins: mid-task speech channel
+        # News a plugin noticed on its own, waiting for _run_announcements to
+        # find her free: (queued_at, instruction), oldest first.
+        self._announcements: deque[tuple[float, str]] = deque(maxlen=_ANNOUNCE_QUEUE_LIMIT)
+        self._announced_at = 0.0
+        self.ui.request_announce = self.plugin_announce
+        self._plugin_registry.start_all(player=self.ui)
 
     def plugin_say(self, instruction: str) -> None:
         """
@@ -1356,6 +1370,17 @@ class JarvisLive:
             asyncio.run_coroutine_threadsafe(_say(), loop)
         except Exception as e:
             print(f"[PluginSay] {e}")
+
+    def plugin_announce(self, instruction: str) -> None:
+        """
+        Thread-safe channel for news a plugin noticed on its own, such as
+        another assistant finishing a task. plugin_say speaks at once because
+        the user is waiting on that plugin; nobody is waiting on news, so it
+        must never cut in. The instruction is queued, and _run_announcements
+        delivers it once she is free.
+        """
+        self._announcements.append((time.monotonic(), instruction))
+        print(f"[Announce] queued ({len(self._announcements)} waiting)")
 
     def request_reconnect(self, keep_context: bool = True, reason: str = ""):
         """Thread-safe: ask the run loop to tear down and rebuild the Live
@@ -3387,6 +3412,50 @@ class JarvisLive:
             except Exception as e:
                 print(f"[Monitor] ⚠️ Could not send alert: {e}")
 
+    # ── Plugin announcements ────────────────────────────────────────────────────
+
+    async def _run_announcements(self) -> None:
+        """Background task: speak queued plugin news, one item at a time.
+
+        Waits until she is silent, no tool is running and the user has not
+        spoken for a while. Sending the next item before her answer to the last
+        one has started playing would stack two turns, so it waits for that too.
+        """
+        while True:
+            await asyncio.sleep(1)
+            if not self._announcements or not self.session:
+                continue
+            with self._speaking_lock:
+                speaking = self._is_speaking
+            now = time.monotonic()
+            if speaking or self._tool_running:
+                continue
+            if now - self._last_user_speech < _ANNOUNCE_USER_QUIET:
+                continue
+            if now - self._last_spoke_at < _ANNOUNCE_GAP:
+                continue
+            answer_pending = self._last_spoke_at < self._announced_at
+            if answer_pending and now - self._announced_at < _ANNOUNCE_ANSWER_WAIT:
+                continue
+
+            queued_at, instruction = self._announcements.popleft()
+            if now - queued_at > _ANNOUNCE_MAX_AGE:
+                print(f"[Announce] dropped news older than {_ANNOUNCE_MAX_AGE:.0f}s")
+                continue
+            try:
+                await self.session.send_client_content(
+                    turns={"parts": [{"text": instruction}]},
+                    turn_complete=True,
+                )
+            except Exception as e:
+                # The session is going away; the next one can still say it.
+                self._announcements.appendleft((queued_at, instruction))
+                print(f"[Announce] ⚠️ Could not send: {e}")
+                await asyncio.sleep(5)
+                continue
+            self._announced_at = now
+            self.ui.write_log("SYS: Announcing news from a plugin.")
+
     # ── Background monitor ──────────────────────────────────────────────────────
 
     async def _run_background_monitor(self) -> None:
@@ -3651,6 +3720,7 @@ class JarvisLive:
                     tg.create_task(self._run_system_monitor())
                     tg.create_task(self._run_background_monitor())
                     tg.create_task(self._run_proactive_mode())
+                    tg.create_task(self._run_announcements())
                     if self._dashboard:
                         tg.create_task(self._relay_phone_audio())
 

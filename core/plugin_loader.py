@@ -5,6 +5,10 @@ Discovery runs once (JarvisLive.__init__ calls discover_plugins()); the resultin
 PluginRegistry is cached for the process lifetime. Enable/disable state is re-read
 from config on every call to get_tool_declarations() / run() / list_for_ui(), so
 toggling a plugin does not require restarting the app or re-importing anything.
+
+A plugin that works in the background — noticing something and announcing it
+without being asked — also defines start(player). main.py calls start_all() once,
+right after discovery.
 """
 from __future__ import annotations
 
@@ -29,6 +33,7 @@ class PluginRecord:
     description: str = ""
     parameters: dict = field(default_factory=lambda: dict(_DEFAULT_PARAMS))
     run: Optional[Callable] = None
+    start: Optional[Callable] = None
     file: str = ""
     valid: bool = False
     error: str = ""
@@ -54,6 +59,23 @@ class PluginRegistry:
 
     def has(self, name: str) -> bool:
         return name in self._plugins
+
+    # -- called once by main.py, right after discovery --
+    def start_all(self, player=None) -> None:
+        """Let every plugin that defines start(player) begin its background work.
+
+        Disabled plugins are started too. Toggling never needs a restart, so a
+        plugin that works in the background checks get_plugin_enabled itself
+        before it acts. A start() that raises is logged and skipped, the same
+        as a run() that does."""
+        for name, rec in self._plugins.items():
+            if rec.start is None:
+                continue
+            try:
+                rec.start(player)
+            except Exception as e:
+                self._logger(f"Plugin '{name}' crashed during start(): {e}")
+                traceback.print_exc()
 
     # -- called by main.py from _execute_tool's else branch --
     def run(self, name: str, parameters: dict, player=None, session_memory=None) -> str:
@@ -125,8 +147,11 @@ def _validate(module, filename: str) -> PluginRecord:
         return PluginRecord(name=name, file=filename,
                              error="Missing callable run(parameters, ...) function.")
 
+    start_fn = getattr(module, "start", None)
+
     return PluginRecord(name=name, description=description.strip(), parameters=parameters,
-                         run=run_fn, file=filename, valid=True, error="")
+                         run=run_fn, start=start_fn if callable(start_fn) else None,
+                         file=filename, valid=True, error="")
 
 
 def discover_plugins(plugins_dir: Path, core_tool_names: set[str],
