@@ -1,9 +1,12 @@
 #web_search.py
 import json
+import re
 import sys
 import threading
 import time
+import xml.etree.ElementTree as ET
 from datetime import datetime
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 
 from memory.config_manager import get_tavily_key
@@ -221,6 +224,69 @@ def _tavily_search(
     return "\n".join(lines).strip()
 
 
+# ── Google News ───────────────────────────────────────────────────────────────
+# First backend for news. DDG news is a keyword search, so "top world news
+# today" came back as whatever mentioned "world" — a basketball World Cup, World
+# of Warcraft — some of it weeks old. Google News serves an edited front page,
+# and its search takes a when: window, so a topic gets the last day's coverage.
+#
+# It is a public RSS feed, not an official API: Google can change or throttle it
+# without notice, which is why the rest of the chain stays behind it. Like
+# Tavily, every failure returns an empty list rather than raising.
+
+_GNEWS_URL     = "https://news.google.com/rss"
+_GNEWS_LOCALE  = {"hl": "en-US", "gl": "US", "ceid": "US:en"}
+_GNEWS_TIMEOUT = 5.0
+
+
+def _google_news(topic: str = "", max_results: int = 8) -> list[dict]:
+    """The World front page when topic is empty, else the last day on topic."""
+    import requests
+
+    if topic:
+        url    = f"{_GNEWS_URL}/search"
+        params = {"q": f"{topic} when:1d", **_GNEWS_LOCALE}
+    else:
+        url    = f"{_GNEWS_URL}/headlines/section/topic/WORLD"
+        params = _GNEWS_LOCALE
+
+    try:
+        r = requests.get(url, params=params, timeout=_GNEWS_TIMEOUT)
+        r.raise_for_status()
+        items = ET.fromstring(r.content).findall("./channel/item")
+    except Exception as e:
+        print(f"[WebSearch] ⚠️ Google News failed ({e}) — using DDG instead")
+        return []
+
+    results = []
+    for item in items[:max_results]:
+        title  = (item.findtext("title")  or "").strip()
+        source = (item.findtext("source") or "").strip()
+        # Every title ends in " - Outlet", and the outlet has its own field.
+        if source and title.endswith(f" - {source}"):
+            title = title[: -len(f" - {source}")].rstrip()
+        results.append({
+            "title":     title,
+            "source":    source,
+            "published": _published(item.findtext("pubDate")),
+        })
+    return results
+
+
+def _published(stamp: str | None) -> datetime | None:
+    """Parse an article time: RFC 822 from Google News, ISO 8601 from DDG."""
+    if not stamp:
+        return None
+    try:
+        return parsedate_to_datetime(stamp)
+    except (TypeError, ValueError):
+        pass
+    try:
+        return datetime.fromisoformat(stamp)
+    except ValueError:
+        return None
+
+
 def _get_ddgs():
     """
     Returns the DDGS class.  The package was renamed duckduckgo-search -> ddgs;
@@ -265,10 +331,11 @@ def _ddg_news(query: str, max_results: int = 8) -> list[dict]:
         with DDGS() as ddgs:
             for r in ddgs.news(query, max_results=max_results):
                 results.append({
-                    "title":   r.get("title",  ""),
-                    "snippet": r.get("body",   ""),
-                    "url":     r.get("url",    ""),
-                    "source":  r.get("source", ""),
+                    "title":     r.get("title",  ""),
+                    "snippet":   r.get("body",   ""),
+                    "url":       r.get("url",    ""),
+                    "source":    r.get("source", ""),
+                    "published": _published(r.get("date")),
                 })
     except Exception as e:
         print(f"[WebSearch] ⚠️ DDG news() failed ({e}) — falling back to text search")
@@ -293,61 +360,27 @@ def _format_ddg(query: str, results: list[dict]) -> str:
 
 
 def _format_news(query: str, results: list[dict]) -> str:
-    if not results:
-        return f"No news found for: {query}"
-
+    # Headline, outlet and time. The panel is read at a glance and the assistant
+    # speaks from the same text: neither had any use for a 200-character link,
+    # and Google News links are opaque redirects that do not even name the site.
     lines = [f"Latest news: {query}", _searched_on(), ""]
-    for i, r in enumerate(results, 1):
+    count = 0
+    for r in results:
         title = r.get("title", "")
         if not title:
             continue
-        src = f"  [{r['source']}]" if r.get("source") else ""
-        lines.append(f"{i}. {title}{src}")
-        if r.get("snippet"):
-            lines.append(f"   {r['snippet'][:140]}")
-        if r.get("url"):
-            lines.append(f"   {r['url']}")
+        count += 1
+        lines.append(f"{count}. {title}")
+        meta = [r["source"]] if r.get("source") else []
+        if r.get("published"):
+            meta.append(r["published"].astimezone().strftime("%d %b, %H:%M"))
+        if meta:
+            lines.append(f"   {' · '.join(meta)}")
         lines.append("")
+
+    if not count:
+        return f"No news found for: {query}"
     return "\n".join(lines).strip()
-
-
-# ── Briefing helper ────────────────────────────────────────────────────────────
-
-def _gemini_headlines(n: int = 5) -> tuple[list[str], str]:
-    """
-    Fetches current headlines via Gemini grounded search.
-    Optimised for speed: minimal prompt + strict token cap.
-    Returns (headline_list, raw_text_for_display).
-    """
-    import re
-    from google import genai
-
-    client = genai.Client(api_key=_get_api_key())
-    response = client.models.generate_content(
-        model="gemini-flash-latest",
-        contents=f"Current world news: {n} headlines. Numbered list, titles only.",
-        config={"tools": [{"google_search": {}}]},
-    )
-
-    raw = ""
-    for part in response.candidates[0].content.parts:
-        if hasattr(part, "text") and part.text:
-            raw += part.text
-
-    headlines = []
-    for line in raw.strip().split("\n"):
-        line = line.strip()
-        if not line:
-            continue
-        # Only accept lines that begin with a number — skips preamble/closing sentences
-        if not re.match(r'^[\d]+[.\)\-]', line):
-            continue
-        clean = re.sub(r'^[\d]+[.\)\-]\s*', '', line)
-        clean = re.sub(r'^\*+\s*',          '', clean).strip()
-        if clean and len(clean) > 10:
-            headlines.append(clean)
-
-    return headlines[:n], raw.strip()
 
 
 # ── Modes ──────────────────────────────────────────────────────────────────────
@@ -366,9 +399,20 @@ def _search(query: str) -> str:
     return _format_ddg(query, _ddg_search(query))
 
 
+# Words that only ask for "the news". A query made of nothing else wants the
+# day's front page, not the articles that happen to contain the word "world".
+# Spanish too, because that is how the user talks to her.
+_HEADLINE_WORDS = {
+    "top", "latest", "breaking", "current", "today", "today's", "day", "world",
+    "global", "international", "news", "headlines", "the", "of", "in",
+    "noticias", "titulares", "principales", "últimas", "ultimas", "hoy", "mundo",
+    "mundiales", "internacionales", "de", "del", "en", "las", "los", "el", "la",
+}
+
+
 def _news(query: str) -> str:
     """
-    DDG first, Gemini as backup.
+    Google News first, then Tavily and DDG, with Gemini as the last backup.
 
     The old version raced both backends in parallel and kept the first answer.
     That burned one google_search grounding call on *every* news request —
@@ -377,21 +421,25 @@ def _news(query: str) -> str:
     then 429'd for everything else (research/compare), which are the modes that
     actually need a synthesised answer.
 
-    DDG news returns in well under a second and gives raw headlines, which is
-    exactly what the briefing wants, so it goes first and Gemini is only touched
-    when DDG comes back empty.
+    Google News answers in about a second and picks stories instead of matching
+    keywords, so it goes first. Tavily comes next: it returns a synthesised
+    answer on top of its sources, which DDG's raw snippets lack, and it spends
+    its own credit pool rather than the grounding quota.
 
-    Tavily sits between the two for the same reason DDG leads: it has its own
-    credit pool, so spending one there is cheaper than spending the grounding
-    call that research/compare cannot do without.
+    DDG news returns in well under a second and gives raw headlines, which still
+    make a usable briefing, so it follows Tavily, and Gemini is only touched when
+    all three come back empty.
     """
-    gemini_query = f"latest news today: {query}" if query else "top world news today"
-    ddg_query    = query if query else "world news today"
+    words        = re.findall(r"[\w']+", query.lower())
+    headlines    = all(w in _HEADLINE_WORDS for w in words)
+    label        = query or "top world news today"
+    gemini_query = "top world news today" if headlines else f"latest news today: {query}"
+    ddg_query    = "world news today" if headlines else query
 
-    def _ddg_attempt() -> str:
-        return _format_news(ddg_query, _ddg_news(ddg_query, max_results=8))
-
-    text = _run_bounded(_ddg_attempt, timeout=5.0, label="DDG news")
+    text = _run_bounded(
+        lambda: _format_news(label, _google_news("" if headlines else query)),
+        timeout=6.0, label="Google News",
+    )
     if text and len(text) > 60 and not text.startswith("No news found"):
         return text
 
@@ -400,6 +448,13 @@ def _news(query: str) -> str:
         timeout=9.0, label="Tavily news",
     )
     if text and len(text) > 60:
+        return text
+
+    def _ddg_attempt() -> str:
+        return _format_news(label, _ddg_news(ddg_query, max_results=8))
+
+    text = _run_bounded(_ddg_attempt, timeout=5.0, label="DDG news")
+    if text and len(text) > 60 and not text.startswith("No news found"):
         return text
 
     text = _run_bounded(
