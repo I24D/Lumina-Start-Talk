@@ -159,6 +159,18 @@ def save_brief_enabled(enabled: bool) -> None:
     CONFIG_FILE.write_text(json.dumps(data, indent=4), encoding="utf-8")
 
 
+# ── Live Vision privacy acknowledgement ────────────────────────────────────
+
+def get_vision_consent() -> bool:
+    """Return whether the user accepted the one-time Live Vision notice."""
+    return bool(load_api_keys().get("vision_consent", False))
+
+
+def save_vision_consent(accepted: bool) -> None:
+    """Persist the explicit opt-in without disturbing API keys or settings."""
+    _patch_config(vision_consent=bool(accepted))
+
+
 # ── Audio devices ────────────────────────────────────────────────────────────
 # Stored as device NAMES, not sounddevice indices. Indices shift every time a
 # USB device is plugged in or removed, so a saved index silently starts pointing

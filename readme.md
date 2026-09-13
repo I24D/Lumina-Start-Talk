@@ -84,7 +84,7 @@ It's not just an assistant — it's an extension of your digital life.
 | ♾️ Unlimited Sessions | Sliding-window context compression — one conversation can last for hours |
 | 🖥️ System Control | Launch apps, adjust volume/brightness, WiFi, shortcuts, power — all by voice |
 | 🧩 Autonomous Tasks | High-level planning for complex multi-step goals via agent mode |
-| 👁️ Visual Awareness | Real-time screen capture and webcam vision piped into your main Gemini session |
+| 👁️ Live Vision | Copilot-style screen sharing and camera vision in the main voice session, with visible source icons, status and STOP control |
 | 🧠 Persistent Memory | Deeply remembers projects, preferences, and personal context across sessions |
 | ⌨️ Hybrid Input | Seamlessly switch between keyboard typing and voice commands |
 | 🌅 Morning Briefing | On first boot: greets you, reads the time, recaps yesterday, and fetches live news |
@@ -136,6 +136,38 @@ The **🧩 Plugin System**, **💓 Affective Dialog**, **🤫 Proactive Audio**,
 These improvements form one reliable base across supported operating systems.
 
 No new dependencies. No bundled asset files. No hardcoded language, and nothing that assumes one operating system.
+
+### 👁️ Live Vision — screen and camera
+
+The **LIVE VISION** card beside the command input has the same explicit control
+pattern as Copilot Vision:
+
+1. Press **SELECT SOURCE** to open a visual share picker with **WINDOW** and
+   **ENTIRE SCREEN** tabs, real thumbnails, a selected-card state, and an
+   explicit **SHARE** button; or choose **CAMERA**.
+2. The chosen application window is captured at its current bounds and follows
+   every move or resize. A click-through yellow border marks exactly what Lumina
+   can see, while the border and controls are excluded from the model's frames.
+3. A compact always-on-top bar keeps the source, truthful microphone state,
+   **PAUSE / RESUME**, and **STOP** available even when Lumina is covered.
+4. Keep talking normally. Fresh frames enter the existing Gemini Live voice
+   session, so follow-up questions refer to what is visible now. Ask “show me
+   where” and Lumina can place a temporary pointer on the shared source without
+   clicking or controlling the computer.
+
+The **SHARE** action is the explicit screen-sharing opt-in and states that frames
+are sent to Gemini until Stop; camera has its own first-use consent notice.
+Windows are captured through their native window surface when supported, so a
+different foreground window does not replace the selected app in the stream;
+protected surfaces fall back to visible-region capture. Camera mode shows a
+fluid local preview, but the model feed never exceeds one frame per second.
+
+Smart capture compares each sample with the last frame the model received,
+skips visually unchanged frames, and sends a periodic keyframe so long static
+sessions do not lose context. Only the latest camera frame is retained—there is
+no backlog. Frames stay in memory and Live Vision never writes them to disk. If
+the voice transport reconnects, the source and paused state are restored and
+the status remains explicit throughout.
 
 ### 🧠 A memory that actually remembers
 
@@ -270,13 +302,13 @@ python main.py
 ```
 Lumina Start talk/
 ├── main.py                   # Core loop — Gemini Live session, audio I/O, live audio levels, tool dispatch
-├── ui.py                     # PyQt6 HUD — reactive waveform, boot animation, log panel, plugin manager, camera feed
+├── ui.py                     # PyQt6 HUD — waveform, Live Vision controls/consent, log, camera preview
 ├── setup.py                  # First-run configuration wizard
 ├── plugins/
 │   └── _template.py          # Copy this to write a new plugin — one file, drop in, done
 ├── actions/
 │   ├── web_search.py         # Gemini → Tavily → DDG fallback chain (news, research, price, compare)
-│   ├── screen_processor.py   # Screen & webcam capture — main.py sends the frame to Gemini
+│   ├── screen_processor.py   # Compressed screen & webcam capture used by Live Vision
 │   ├── background_monitor.py # User-configured topic watching — daily DDG check, no crypto
 │   ├── proactive.py          # Proactive 2.0 — time/context/rotation-aware check-ins
 │   ├── reminder.py           # OS-native scheduled notifications

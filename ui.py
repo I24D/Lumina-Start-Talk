@@ -19,7 +19,7 @@ else:
     _WIN_HIDE: dict = {}
 
 from PyQt6.QtCore import (
-    QEasingCurve, QMimeData, QObject, QPointF, QRectF, QSize, Qt,
+    QEasingCurve, QMimeData, QObject, QPoint, QPointF, QRectF, QSize, Qt,
     QTimer, QUrl, pyqtSignal,
 )
 from PyQt6.QtGui import (
@@ -28,9 +28,10 @@ from PyQt6.QtGui import (
     QPen, QPixmap, QRadialGradient, QShortcut,
 )
 from PyQt6.QtWidgets import (
-    QApplication, QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit,
-    QMainWindow, QPushButton, QScrollArea, QSizePolicy, QSplitter,
-    QStackedWidget, QTextEdit, QVBoxLayout, QWidget, QProgressBar,
+    QApplication, QComboBox, QFileDialog, QFrame, QGridLayout, QHBoxLayout,
+    QLabel, QLineEdit, QMainWindow, QPushButton, QProgressBar, QScrollArea,
+    QSizePolicy, QSplitter, QStackedWidget, QTabWidget, QTextEdit, QToolButton,
+    QVBoxLayout, QWidget,
 )
 
 def _base_dir() -> Path:
@@ -208,6 +209,83 @@ def retheme_all_widgets(old: dict[str, str], new: dict[str, str]) -> None:
 
 def qcol(h: str, a: int = 255) -> QColor:
     c = QColor(h); c.setAlpha(a); return c
+
+
+def _vision_icon(kind: str, color: str, size: int = 22) -> QIcon:
+    """Draw sharp, font-independent icons for the live Vision controls."""
+    px = QPixmap(size, size)
+    px.fill(Qt.GlobalColor.transparent)
+    p = QPainter(px)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    pen = QPen(QColor(color), 1.8)
+    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+    pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+    p.setPen(pen)
+    p.setBrush(Qt.BrushStyle.NoBrush)
+
+    if kind in {"screen", "monitor"}:
+        p.drawRoundedRect(QRectF(2.5, 3.5, 17.0, 12.0), 2.0, 2.0)
+        p.drawLine(QPointF(11.0, 15.5), QPointF(11.0, 18.5))
+        p.drawLine(QPointF(7.5, 18.5), QPointF(14.5, 18.5))
+        p.drawLine(QPointF(11.0, 12.0), QPointF(11.0, 7.0))
+        p.drawLine(QPointF(8.5, 9.3), QPointF(11.0, 6.8))
+        p.drawLine(QPointF(13.5, 9.3), QPointF(11.0, 6.8))
+    elif kind == "camera":
+        p.drawRoundedRect(QRectF(3.0, 6.0, 16.0, 11.5), 2.0, 2.0)
+        p.drawRoundedRect(QRectF(6.0, 3.8, 5.5, 3.2), 1.0, 1.0)
+        p.drawEllipse(QPointF(11.0, 11.7), 3.2, 3.2)
+    elif kind == "stop":
+        p.setBrush(QColor(color))
+        p.drawRoundedRect(QRectF(6.0, 6.0, 10.0, 10.0), 1.5, 1.5)
+    elif kind == "window":
+        p.drawRoundedRect(QRectF(3.0, 4.0, 16.0, 14.0), 2.0, 2.0)
+        p.drawLine(QPointF(3.0, 8.0), QPointF(19.0, 8.0))
+        p.drawEllipse(QPointF(6.0, 6.0), 0.7, 0.7)
+        p.drawEllipse(QPointF(8.5, 6.0), 0.7, 0.7)
+    elif kind == "pause":
+        p.setBrush(QColor(color))
+        p.drawRoundedRect(QRectF(5.0, 4.0, 4.0, 14.0), 1.0, 1.0)
+        p.drawRoundedRect(QRectF(13.0, 4.0, 4.0, 14.0), 1.0, 1.0)
+    elif kind == "resume":
+        p.setBrush(QColor(color))
+        path = QPainterPath()
+        path.moveTo(7.0, 4.0); path.lineTo(18.0, 11.0)
+        path.lineTo(7.0, 18.0); path.closeSubpath()
+        p.drawPath(path)
+    elif kind == "mic":
+        p.drawRoundedRect(QRectF(7.2, 2.5, 7.6, 11.0), 3.8, 3.8)
+        p.drawArc(QRectF(4.5, 7.0, 13.0, 10.0), 180 * 16, 180 * 16)
+        p.drawLine(QPointF(11.0, 17.0), QPointF(11.0, 20.0))
+        p.drawLine(QPointF(7.5, 20.0), QPointF(14.5, 20.0))
+    else:  # glasses / Vision entry point
+        p.drawEllipse(QRectF(2.5, 7.0, 7.0, 7.0))
+        p.drawEllipse(QRectF(12.5, 7.0, 7.0, 7.0))
+        p.drawLine(QPointF(9.5, 10.0), QPointF(12.5, 10.0))
+        p.drawLine(QPointF(3.0, 8.0), QPointF(1.5, 5.5))
+        p.drawLine(QPointF(19.0, 8.0), QPointF(20.5, 5.5))
+
+    p.end()
+    return QIcon(px)
+
+
+def _vision_source_kind(source_id: str) -> str:
+    if source_id == "camera":
+        return "camera"
+    if str(source_id).startswith("window:"):
+        return "window"
+    return "monitor"
+
+
+def _exclude_window_from_capture(widget: QWidget) -> None:
+    """Keep Lumina's controls out of the visual stream on supported Windows."""
+    if _OS != "Windows":
+        return
+    try:
+        import ctypes
+        # WDA_EXCLUDEFROMCAPTURE. Unsupported builds simply return false.
+        ctypes.windll.user32.SetWindowDisplayAffinity(int(widget.winId()), 0x11)
+    except Exception:
+        pass
 
 
 # ── Windows GPU via NVML DLL (no subprocess, no console window) ──────────────
@@ -1790,6 +1868,589 @@ class _HudOverlay(QWidget):
         super().closeEvent(e)
 
 
+class VisionConsentOverlay(_HudOverlay):
+    """One-time, human-controlled opt-in before continuous Vision is sent."""
+
+    answered = pyqtSignal(bool)
+    _OW = 460
+
+    def __init__(self, source: str, source_label: str = "", parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setStyleSheet(f"""
+            VisionConsentOverlay {{
+                background: rgba(7, 5, 18, 252);
+                border: 1px solid {C.PRI};
+                border-radius: 8px;
+            }}
+        """)
+        self.setFixedWidth(self._OW)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(20, 17, 20, 17)
+        lay.setSpacing(9)
+
+        hdr = QHBoxLayout(); hdr.setSpacing(9)
+        icon = QLabel()
+        icon.setPixmap(_vision_icon("glasses", C.PRI, 26).pixmap(26, 26))
+        icon.setStyleSheet("background: transparent;")
+        hdr.addWidget(icon)
+        title = QLabel("TURN ON LIVE VISION")
+        title.setFont(QFont("Courier New", 11, QFont.Weight.Bold))
+        title.setStyleSheet(f"color: {C.PRI}; background: transparent;")
+        hdr.addWidget(title)
+        hdr.addStretch()
+        lay.addLayout(hdr)
+
+        source_name = (
+            "your camera" if source == "camera"
+            else (source_label or "the selected screen or application")
+        )
+        body = QLabel(
+            f"Lumina will send snapshots from {source_name} to Gemini while "
+            "Vision is active so you can ask questions by voice in real time."
+        )
+        body.setWordWrap(True)
+        body.setFont(QFont("Courier New", 9))
+        body.setStyleSheet(f"color: {C.TEXT}; background: transparent;")
+        lay.addWidget(body)
+
+        privacy = QLabel(
+            "Vision is off by default. A permanent on-screen indicator and STOP "
+            "control remain visible while sharing. Lumina does not save the frames."
+        )
+        privacy.setWordWrap(True)
+        privacy.setFont(QFont("Courier New", 8))
+        privacy.setStyleSheet(f"color: {C.TEXT_MED}; background: transparent;")
+        lay.addWidget(privacy)
+
+        row = QHBoxLayout(); row.setSpacing(8)
+        cancel = QPushButton("CANCEL")
+        cancel.setFixedHeight(34)
+        cancel.setFont(QFont("Courier New", 9))
+        cancel.setCursor(Qt.CursorShape.PointingHandCursor)
+        cancel.setStyleSheet(f"""
+            QPushButton {{ background: transparent; color: {C.TEXT_MED};
+                border: 1px solid {C.BORDER}; border-radius: 4px; }}
+            QPushButton:hover {{ color: {C.TEXT}; border-color: {C.BORDER_B}; }}
+        """)
+        cancel.clicked.connect(lambda: self.answered.emit(False))
+        row.addWidget(cancel)
+
+        start = QPushButton("START VISION")
+        start.setIcon(_vision_icon(source, C.WHITE, 20))
+        start.setIconSize(QSize(20, 20))
+        start.setFixedHeight(34)
+        start.setFont(QFont("Courier New", 9, QFont.Weight.Bold))
+        start.setCursor(Qt.CursorShape.PointingHandCursor)
+        start.setStyleSheet(f"""
+            QPushButton {{ background: {C.PRI_DIM}; color: {C.WHITE};
+                border: 1px solid {C.PRI}; border-radius: 4px; }}
+            QPushButton:hover {{ background: {C.PRI}; }}
+        """)
+        start.clicked.connect(lambda: self.answered.emit(True))
+        row.addWidget(start)
+        lay.addLayout(row)
+
+        cancel.setDefault(True)
+        cancel.setFocus()
+
+
+class VisionSourceOverlay(_HudOverlay):
+    """Visual share picker with Window and Entire Screen thumbnail tabs."""
+
+    selected = pyqtSignal(str, str)
+    thumbnailReady = pyqtSignal(str, bytes)
+    _OW = 640
+    _OH = 535
+
+    def __init__(self, sources: list[dict[str, str]], parent=None):
+        super().__init__(parent)
+        self._sources = sources
+        self._choices: dict[str, QToolButton] = {}
+        self._selected_id = ""
+        self._selected_label = ""
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setFixedSize(self._OW, self._OH)
+        self.setStyleSheet(f"""
+            VisionSourceOverlay {{
+                background: rgba(7, 5, 18, 252);
+                border: 1px solid {C.PRI}; border-radius: 8px;
+            }}
+        """)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(18, 15, 18, 15)
+        root.setSpacing(9)
+
+        header = QHBoxLayout(); header.setSpacing(9)
+        icon = QLabel()
+        icon.setPixmap(_vision_icon("screen", C.PRI, 25).pixmap(25, 25))
+        header.addWidget(icon)
+        title = QLabel("CHOOSE WHAT TO SHARE WITH LUMINA")
+        title.setFont(QFont("Courier New", 11, QFont.Weight.Bold))
+        title.setStyleSheet(f"color: {C.PRI}; background: transparent;")
+        header.addWidget(title, stretch=1)
+        close = QPushButton("CLOSE")
+        close.setFixedSize(66, 27)
+        close.setCursor(Qt.CursorShape.PointingHandCursor)
+        close.setStyleSheet(f"""
+            QPushButton {{ color: {C.TEXT_MED}; background: transparent;
+                border: 1px solid {C.BORDER}; border-radius: 4px; }}
+            QPushButton:hover {{ color: {C.WHITE}; border-color: {C.PRI}; }}
+        """)
+        close.clicked.connect(self.hide)
+        header.addWidget(close)
+        root.addLayout(header)
+
+        monitors = [s for s in sources if s.get("kind") == "monitor"]
+        windows = [s for s in sources if s.get("kind") == "window"]
+        tabs = QTabWidget()
+        tabs.setDocumentMode(True)
+        tabs.setStyleSheet(f"""
+            QTabWidget::pane {{ background: {C.PANEL2}; border: 1px solid {C.BORDER};
+                border-radius: 6px; top: -1px; }}
+            QTabBar::tab {{ background: transparent; color: {C.TEXT_MED};
+                padding: 8px 24px; border: none; border-bottom: 2px solid transparent;
+                font-family: 'Courier New'; font-size: 9pt; font-weight: bold; }}
+            QTabBar::tab:selected {{ color: {C.WHITE}; border-bottom-color: {C.PRI}; }}
+            QTabBar::tab:hover {{ color: {C.PRI}; }}
+        """)
+        tabs.addTab(self._make_source_page(windows), "WINDOW")
+        tabs.addTab(self._make_source_page(monitors), "ENTIRE SCREEN")
+        root.addWidget(tabs, stretch=1)
+
+        footer = QHBoxLayout(); footer.setSpacing(8)
+        privacy = QLabel(
+            "Share sends frames to Gemini until Stop; Lumina does not save them. "
+            "A yellow border marks the source."
+        )
+        privacy.setWordWrap(True)
+        privacy.setFont(QFont("Courier New", 7))
+        privacy.setStyleSheet(f"color: {C.ACC2}; background: transparent;")
+        footer.addWidget(privacy, stretch=1)
+        cancel = QPushButton("CANCEL")
+        cancel.setFixedSize(78, 32)
+        cancel.setCursor(Qt.CursorShape.PointingHandCursor)
+        cancel.setStyleSheet(f"""
+            QPushButton {{ color: {C.TEXT_MED}; background: transparent;
+                border: 1px solid {C.BORDER}; border-radius: 5px; }}
+            QPushButton:hover {{ color: {C.WHITE}; border-color: {C.PRI}; }}
+        """)
+        cancel.clicked.connect(self.hide)
+        footer.addWidget(cancel)
+        self._share = QPushButton("SHARE")
+        self._share.setFixedSize(82, 32)
+        self._share.setEnabled(False)
+        self._share.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
+        self._share.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._share.setStyleSheet(f"""
+            QPushButton {{ color: {C.WHITE}; background: {C.PRI_DIM};
+                border: 1px solid {C.PRI}; border-radius: 5px; }}
+            QPushButton:hover {{ background: {C.PRI}; }}
+            QPushButton:disabled {{ color: {C.TEXT_DIM}; background: {C.PANEL};
+                border-color: {C.BORDER}; }}
+        """)
+        self._share.clicked.connect(self._share_selected)
+        footer.addWidget(self._share)
+        root.addLayout(footer)
+
+        self.thumbnailReady.connect(self._apply_thumbnail)
+        threading.Thread(
+            target=self._load_thumbnails, daemon=True, name="vision-thumbnails"
+        ).start()
+
+    def _make_source_page(self, sources: list[dict[str, str]]) -> QWidget:
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setStyleSheet(f"""
+            QScrollArea {{ background: transparent; border: none; }}
+            QScrollBar:vertical {{ background: {C.PANEL}; width: 8px; }}
+            QScrollBar::handle:vertical {{ background: {C.PRI_DIM}; min-height: 28px; }}
+        """)
+        content = QWidget()
+        content.setStyleSheet("background: transparent;")
+        grid = QGridLayout(content)
+        grid.setContentsMargins(10, 10, 10, 10)
+        grid.setHorizontalSpacing(12); grid.setVerticalSpacing(10)
+        for index, source in enumerate(sources):
+            source_id = str(source.get("id") or "")
+            label = str(source.get("label") or "Untitled")
+            detail = str(source.get("detail") or "")
+            button = QToolButton()
+            button.setObjectName("VisionSourceChoice")
+            button.setText(f"{label}\n{detail}" if detail else label)
+            button.setIcon(_vision_icon(source.get("kind", "window"), C.TEXT, 44))
+            button.setIconSize(QSize(244, 137))
+            button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextUnderIcon)
+            button.setCheckable(True)
+            button.setFixedSize(268, 190)
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            button.setFont(QFont("Courier New", 8))
+            button.setToolTip(label)
+            button.setAccessibleName(f"Share {label}")
+            button.setStyleSheet(f"""
+                QToolButton#VisionSourceChoice {{
+                    padding: 7px;
+                    color: {C.TEXT}; background: {C.PANEL2};
+                    border: 1px solid {C.BORDER}; border-radius: 5px;
+                }}
+                QToolButton#VisionSourceChoice:hover {{
+                    color: {C.WHITE}; background: {C.PRI_GHO};
+                    border-color: {C.PRI};
+                }}
+                QToolButton#VisionSourceChoice:checked {{
+                    color: {C.WHITE}; background: {C.PRI_GHO};
+                    border: 2px solid {C.ACC2};
+                }}
+            """)
+            button.clicked.connect(
+                lambda _checked=False, sid=source_id, lbl=label: self._choose(sid, lbl)
+            )
+            self._choices[source_id] = button
+            grid.addWidget(button, index // 2, index % 2)
+        if not sources:
+            empty = QLabel("No shareable sources found in this category.")
+            empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            empty.setStyleSheet(f"color: {C.TEXT_DIM}; padding: 30px;")
+            grid.addWidget(empty, 0, 0, 1, 2)
+        grid.setRowStretch((len(sources) + 1) // 2, 1)
+        scroll.setWidget(content)
+        return scroll
+
+    def _choose(self, source_id: str, label: str) -> None:
+        self._selected_id = source_id
+        self._selected_label = label
+        for sid, button in self._choices.items():
+            button.setChecked(sid == source_id)
+        self._share.setEnabled(bool(source_id))
+
+    def _share_selected(self) -> None:
+        if self._selected_id:
+            self.selected.emit(self._selected_id, self._selected_label)
+
+    def _load_thumbnails(self) -> None:
+        try:
+            from actions.screen_processor import capture_source_thumbnail
+            for source in self._sources:
+                if not self.parentWidget() or not self.parentWidget().isVisible():
+                    break
+                try:
+                    data = capture_source_thumbnail(str(source.get("id") or ""))
+                    if data:
+                        self.thumbnailReady.emit(str(source.get("id") or ""), data)
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+    def _apply_thumbnail(self, source_id: str, data: bytes) -> None:
+        button = self._choices.get(source_id)
+        if not button:
+            return
+        pixmap = QPixmap()
+        pixmap.loadFromData(data)
+        if not pixmap.isNull():
+            button.setIcon(QIcon(pixmap))
+
+
+class VisionFloatingBar(QWidget):
+    """Always-visible sharing controls, independent of Lumina's main window."""
+
+    pauseRequested = pyqtSignal(bool)
+    stopRequested = pyqtSignal()
+    micRequested = pyqtSignal()
+    sourceRequested = pyqtSignal()
+
+    def __init__(self):
+        flags = (
+            Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+        )
+        super().__init__(None, flags)
+        self.setObjectName("VisionFloatingBar")
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+        self.setFixedHeight(52)
+        self.setMinimumWidth(570)
+        self._paused = False
+        self._drag_offset: QPoint | None = None
+
+        root = QHBoxLayout(self)
+        root.setContentsMargins(10, 7, 10, 7)
+        root.setSpacing(7)
+
+        shell = QFrame()
+        shell.setObjectName("VisionBarShell")
+        shell.setStyleSheet(f"""
+            QFrame#VisionBarShell {{ background: rgba(12, 3, 6, 246);
+                border: 1px solid {C.PRI}; border-radius: 12px; }}
+            QLabel {{ background: transparent; border: none; }}
+        """)
+        row = QHBoxLayout(shell)
+        row.setContentsMargins(11, 5, 7, 5)
+        row.setSpacing(8)
+
+        self._dot = QLabel("●")
+        self._dot.setFont(QFont("Arial", 10, QFont.Weight.Bold))
+        row.addWidget(self._dot)
+        self._source_icon = QLabel()
+        self._source_icon.setFixedSize(19, 19)
+        row.addWidget(self._source_icon)
+        self._source = QLabel("VISION")
+        self._source.setMinimumWidth(150)
+        self._source.setMaximumWidth(250)
+        self._source.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
+        self._source.setStyleSheet(f"color: {C.WHITE};")
+        row.addWidget(self._source, stretch=1)
+
+        self._mic = QPushButton("LISTENING")
+        self._mic.setIcon(_vision_icon("mic", C.GREEN, 18))
+        self._mic.clicked.connect(self.micRequested.emit)
+        row.addWidget(self._mic)
+        self._pause = QPushButton("PAUSE")
+        self._pause.clicked.connect(self._toggle_pause)
+        row.addWidget(self._pause)
+        self._stop = QPushButton("STOP")
+        self._stop.setIcon(_vision_icon("stop", C.MUTED_C, 17))
+        self._stop.clicked.connect(self.stopRequested.emit)
+        row.addWidget(self._stop)
+        self._style_buttons()
+        root.addWidget(shell)
+
+    def _style_buttons(self) -> None:
+        common = f"""
+            QPushButton {{ background: transparent; color: {C.TEXT_MED};
+                border: 1px solid {C.BORDER}; border-radius: 6px;
+                padding: 4px 8px; font-family: 'Courier New';
+                font-size: 8pt; font-weight: bold; }}
+            QPushButton:hover {{ color: {C.WHITE}; border-color: {C.PRI};
+                background: {C.PRI_GHO}; }}
+        """
+        self._mic.setStyleSheet(common)
+        self._pause.setStyleSheet(common)
+        self._stop.setStyleSheet(common + f"""
+            QPushButton {{ color: {C.MUTED_C}; border-color: {C.MUTED_C}; }}
+        """)
+
+    def _toggle_pause(self) -> None:
+        self.pauseRequested.emit(not self._paused)
+
+    def update_state(self, source_id: str, source_label: str,
+                     state: str, detail: str) -> None:
+        self._paused = state == "paused"
+        kind = _vision_source_kind(source_id)
+        self._source_icon.setPixmap(_vision_icon(kind, C.WHITE, 18).pixmap(18, 18))
+        self._source.setText(source_label.upper()[:32] or kind.upper())
+        self._source.setToolTip(source_label)
+        self._source.setAccessibleName(f"Shared source: {source_label}")
+        self._pause.setText("RESUME" if self._paused else "PAUSE")
+        icon_kind = "resume" if self._paused else "pause"
+        self._pause.setIcon(_vision_icon(icon_kind, C.TEXT_MED, 17))
+        color = C.ACC2 if state in {"starting", "paused"} else C.GREEN
+        self._dot.setStyleSheet(f"color: {color};")
+        self.setToolTip(detail)
+        if not self.isVisible():
+            self._place_near_source(source_id)
+            self.show(); self.raise_()
+            _exclude_window_from_capture(self)
+
+    def update_mic(self, muted: bool, busy: str, mic_open: bool) -> None:
+        if muted:
+            text, color = "MIC MUTED", C.MUTED_C
+        elif busy and not mic_open:
+            text, color = "MIC OFF", C.ACC2
+        else:
+            text, color = "LISTENING", C.GREEN
+        self._mic.setText(text)
+        self._mic.setIcon(_vision_icon("mic", color, 18))
+        self._mic.setStyleSheet(f"""
+            QPushButton {{ background: transparent; color: {color};
+                border: 1px solid {color}; border-radius: 6px;
+                padding: 4px 8px; font-family: 'Courier New';
+                font-size: 8pt; font-weight: bold; }}
+            QPushButton:hover {{ background: {C.PRI_GHO}; }}
+        """)
+
+    def _place_near_source(self, source_id: str) -> None:
+        try:
+            if source_id != "camera":
+                from actions.screen_processor import capture_source_geometry
+                area = capture_source_geometry(source_id)
+                left, top = area["left"], area["top"]
+                width = area["width"]
+            else:
+                geo = QApplication.primaryScreen().availableGeometry()
+                left, top, width = geo.left(), geo.top(), geo.width()
+            self.adjustSize()
+            x = int(left + max(8, (width - self.width()) / 2))
+            self.move(x, int(top + 12))
+        except Exception:
+            geo = QApplication.primaryScreen().availableGeometry()
+            self.move(geo.center().x() - self.width() // 2, geo.top() + 12)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_offset = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._drag_offset is not None and event.buttons() & Qt.MouseButton.LeftButton:
+            self.move(event.globalPosition().toPoint() - self._drag_offset)
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        self._drag_offset = None
+        super().mouseReleaseEvent(event)
+
+
+class VisionCaptureBorderOverlay(QWidget):
+    """Yellow, click-through frame that follows the exact shared source."""
+
+    def __init__(self):
+        flags = (
+            Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+        )
+        super().__init__(None, flags)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+        try:
+            self.setWindowFlag(Qt.WindowType.WindowTransparentForInput, True)
+        except AttributeError:
+            pass
+        self._source_id = ""
+        self._paused = False
+        self._timer = QTimer(self)
+        self._timer.setInterval(180)
+        self._timer.timeout.connect(self._follow_source)
+
+    def track(self, source_id: str, state: str) -> None:
+        if not source_id or source_id == "camera" or state in {"off", "error"}:
+            self.stop()
+            return
+        self._source_id = source_id
+        self._paused = state == "paused"
+        self._follow_source()
+        self._timer.start()
+
+    def stop(self) -> None:
+        self._timer.stop()
+        self._source_id = ""
+        self.hide()
+
+    def _follow_source(self) -> None:
+        if not self._source_id:
+            return
+        try:
+            from actions.screen_processor import capture_source_geometry
+            area = capture_source_geometry(self._source_id)
+            margin = 0
+            geometry = (
+                int(area["left"]) - margin, int(area["top"]) - margin,
+                int(area["width"]) + margin * 2, int(area["height"]) + margin * 2,
+            )
+            if self.geometry().getRect() != geometry:
+                self.setGeometry(*geometry)
+            if not self.isVisible():
+                self.show(); self.raise_()
+                _exclude_window_from_capture(self)
+            self.update()
+        except Exception:
+            self.hide()
+
+    def paintEvent(self, _event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        color = QColor(C.ACC2)
+        color.setAlpha(150 if self._paused else 255)
+        pen = QPen(color, 4.0)
+        if self._paused:
+            pen.setStyle(Qt.PenStyle.DashLine)
+        p.setPen(pen)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawRect(2, 2, max(1, self.width() - 5), max(1, self.height() - 5))
+        p.end()
+
+
+class VisionHighlightOverlay(QWidget):
+    """Click-through animated pointer placed over a shared screen/window."""
+
+    def __init__(self):
+        flags = (
+            Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+        )
+        super().__init__(None, flags)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+        try:
+            self.setWindowFlag(Qt.WindowType.WindowTransparentForInput, True)
+        except AttributeError:
+            pass
+        self._target = QPointF(0, 0)
+        self._label = ""
+        self._phase = 0
+        self._timer = QTimer(self)
+        self._timer.setInterval(45)
+        self._timer.timeout.connect(self._animate)
+        self._hide_timer = QTimer(self)
+        self._hide_timer.setSingleShot(True)
+        self._hide_timer.timeout.connect(self.hide)
+
+    def show_highlight(self, geometry: dict[str, int], x: int, y: int,
+                       label: str = "") -> None:
+        width = max(2, int(geometry.get("width", 2)))
+        height = max(2, int(geometry.get("height", 2)))
+        self.setGeometry(
+            int(geometry.get("left", 0)), int(geometry.get("top", 0)), width, height
+        )
+        self._target = QPointF(
+            max(0.0, min(width - 1.0, width * max(0, min(1000, x)) / 1000.0)),
+            max(0.0, min(height - 1.0, height * max(0, min(1000, y)) / 1000.0)),
+        )
+        self._label = str(label or "Click here")[:48]
+        self._phase = 0
+        self.show(); self.raise_(); self.update()
+        _exclude_window_from_capture(self)
+        self._timer.start()
+        self._hide_timer.start(6000)
+
+    def _animate(self) -> None:
+        self._phase += 1
+        if not self.isVisible():
+            self._timer.stop()
+            return
+        self.update()
+
+    def paintEvent(self, _event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        pulse = 4.0 + 7.0 * (0.5 + 0.5 * math.sin(self._phase * 0.22))
+        center = self._target
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.setPen(QPen(qcol(C.PRI, 90), 3.0))
+        p.drawEllipse(center, 24.0 + pulse, 24.0 + pulse)
+        p.setPen(QPen(QColor(C.WHITE), 3.0))
+        p.drawEllipse(center, 18.0, 18.0)
+        p.setBrush(QColor(C.PRI))
+        p.setPen(QPen(QColor(C.WHITE), 2.0))
+        p.drawEllipse(center, 6.0, 6.0)
+
+        label_w = min(260, max(105, 18 + len(self._label) * 8))
+        left = min(max(8.0, center.x() + 28.0), max(8.0, self.width() - label_w - 8.0))
+        top = min(max(8.0, center.y() - 20.0), max(8.0, self.height() - 42.0))
+        box = QRectF(left, top, label_w, 34)
+        p.setBrush(qcol(C.DARK, 235)); p.setPen(QPen(QColor(C.PRI), 1.5))
+        p.drawRoundedRect(box, 7.0, 7.0)
+        p.setPen(QColor(C.WHITE)); p.setFont(QFont("Courier New", 9, QFont.Weight.Bold))
+        p.drawText(box.adjusted(10, 0, -8, 0), Qt.AlignmentFlag.AlignVCenter, self._label)
+        p.end()
+
+
 class ConfirmBanner(_HudOverlay):
     """The gate in front of an action that cannot be taken back.
 
@@ -2680,6 +3341,9 @@ class MainWindow(QMainWindow):
     _camera_sig     = pyqtSignal(bytes)      # show camera frame preview (small overlay)
     _cam_stream_sig = pyqtSignal(bool)       # True=start live stream, False=stop
     _cam_frame_sig  = pyqtSignal(bytes)      # live camera frame → HUD area
+    _cam_error_sig  = pyqtSignal(str)        # camera worker failed to open/read
+    _vision_state_sig = pyqtSignal(str, str, str)  # source, state, detail
+    _vision_highlight_sig = pyqtSignal(str, int, int, str)
     _clipboard_sig  = pyqtSignal(str)        # clipboard text changed (thread-safe)
     _confirm_sig    = pyqtSignal(str, str)   # (title, detail) — irreversible-action gate
     _confirm_hide_sig = pyqtSignal()
@@ -2717,9 +3381,21 @@ class MainWindow(QMainWindow):
         self.on_interrupt      = None   # callable: () -> None — stop JARVIS mid-speech
         self.on_voice_change   = None   # callable: () -> None — rebuild session with new voice
         self.on_audio_device_change = None  # callable: () -> None — reopen audio streams
+        self.on_vision_requested = None     # callable: stable source id -> None
+        self.on_vision_stop      = None     # callable: () -> None
+        self.on_vision_pause     = None     # callable: paused bool -> None
+        self.on_camera_frame     = None     # callable: (jpeg bytes) -> None
+        self.on_camera_error     = None     # callable: (message) -> None
         self._confirm_overlay  = None   # live ConfirmBanner, if one is on screen
         self.get_plugins       = None   # callable: () -> list[dict], set by JarvisLive
         self._muted            = False
+        self._vision_source    = ""
+        self._vision_source_label = ""
+        self._vision_source_labels: dict[str, str] = {}
+        self._vision_state     = "off"
+        self._vision_detail    = "Vision off"
+        self._vision_consent_overlay = None
+        self._vision_source_overlay = None
         # Why the app itself has the microphone shut, if it has: the
         # user's mute is theirs and is never overwritten by this.
         self._busy             = ""
@@ -2763,10 +3439,10 @@ class MainWindow(QMainWindow):
         _cam_v.setSpacing(0)
         _cam_hdr = QHBoxLayout()
         _cam_hdr.setContentsMargins(8, 5, 8, 5)
-        _cam_title = QLabel("◈  CAMERA FEED")
-        _cam_title.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
-        _cam_title.setStyleSheet(f"color: {C.PRI}; background: transparent;")
-        _cam_hdr.addWidget(_cam_title)
+        self._cam_title = QLabel("●  LIVE VISION — CAMERA")
+        self._cam_title.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
+        self._cam_title.setStyleSheet(f"color: {C.PRI}; background: transparent;")
+        _cam_hdr.addWidget(self._cam_title)
         _cam_hdr.addStretch()
         _cam_x = QPushButton("✕  CLOSE")
         _cam_x.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
@@ -2778,7 +3454,7 @@ class MainWindow(QMainWindow):
             }}
             QPushButton:hover {{ color: {C.PRI}; }}
         """)
-        _cam_x.clicked.connect(self.stop_camera_stream)
+        _cam_x.clicked.connect(self._request_stop_vision)
         _cam_hdr.addWidget(_cam_x)
         _cam_v.addLayout(_cam_hdr)
         self._cam_live_lbl = QLabel()
@@ -2866,8 +3542,24 @@ class MainWindow(QMainWindow):
         self._confirm_hide_sig.connect(self._hide_confirm_banner)
         self._cam_stream_sig.connect(self._on_cam_stream)
         self._cam_frame_sig.connect(self._on_cam_frame)
+        self._cam_error_sig.connect(self._on_cam_error)
+        self._vision_state_sig.connect(self._apply_vision_state)
+        self._vision_highlight_sig.connect(self._apply_vision_highlight)
         self._clipboard_sig.connect(self._show_clipboard_panel)
         self._cam_stop = threading.Event()
+        self._cam_thread = None
+        self._cam_lock = threading.Lock()
+        self._cam_desired = False
+        self._cam_restart_pending = False
+
+        # Persistent top-level sharing UI: it remains usable if the main
+        # window is obscured and is excluded from screen capture on Windows.
+        self._vision_bar = VisionFloatingBar()
+        self._vision_bar.pauseRequested.connect(self._request_pause_vision)
+        self._vision_bar.stopRequested.connect(self._request_stop_vision)
+        self._vision_bar.micRequested.connect(self._toggle_mute)
+        self._vision_border = VisionCaptureBorderOverlay()
+        self._vision_highlight = VisionHighlightOverlay()
 
         # Camera preview overlay (child of central widget, positioned in resizeEvent)
         self._cam_preview = _CameraPreview(self.centralWidget())
@@ -2922,12 +3614,47 @@ class MainWindow(QMainWindow):
                 )
 
     def start_camera_stream(self) -> None:
-        self._cam_stop.clear()
+        with self._cam_lock:
+            self._cam_desired = True
+            existing = self._cam_thread
+            if existing is not None and existing.is_alive():
+                if not self._cam_stop.is_set() or self._cam_restart_pending:
+                    return
+                # A fast camera → screen → camera switch can arrive before the
+                # device worker has released the webcam. Restart only after it has.
+                self._cam_restart_pending = True
+                threading.Thread(
+                    target=self._restart_camera_after,
+                    args=(existing,),
+                    daemon=True,
+                    name="cam-restart",
+                ).start()
+                return
+            stop_event = threading.Event()
+            self._cam_stop = stop_event
+            self._cam_thread = threading.Thread(
+                target=self._cam_loop,
+                args=(stop_event,),
+                daemon=True,
+                name="cam-stream",
+            )
+            thread = self._cam_thread
         self._cam_stream_sig.emit(True)
-        t = threading.Thread(target=self._cam_loop, daemon=True, name="cam-stream")
-        t.start()
+        thread.start()
 
-    def _cam_loop(self) -> None:
+    def _restart_camera_after(self, previous: threading.Thread) -> None:
+        previous.join(timeout=3.0)
+        with self._cam_lock:
+            self._cam_restart_pending = False
+            desired = self._cam_desired
+            still_alive = previous.is_alive()
+        if still_alive:
+            self._cam_error_sig.emit("The previous camera stream did not stop in time.")
+        elif desired:
+            self.start_camera_stream()
+
+    def _cam_loop(self, stop_event: threading.Event) -> None:
+        cap = None
         try:
             import cv2
             # Reuse camera index detected by screen_processor (cached in api_keys.json)
@@ -2944,25 +3671,62 @@ class MainWindow(QMainWindow):
                 backend = 0
             cap = cv2.VideoCapture(cam_idx, backend)
             if not cap.isOpened():
+                cap.release()
                 cap = cv2.VideoCapture(0)
             if not cap.isOpened():
-                return
+                raise RuntimeError("No camera could be opened. Check Windows camera permissions.")
             # warm-up frames
             for _ in range(5):
                 cap.read()
-            while not self._cam_stop.wait(0.033) and cap.isOpened():
+            last_vision_frame = 0.0
+            consecutive_failures = 0
+            while not stop_event.wait(0.033) and cap.isOpened():
                 ret, frame = cap.read()
                 if ret and frame is not None:
+                    consecutive_failures = 0
                     _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 65])
-                    self._cam_frame_sig.emit(buf.tobytes())
-            cap.release()
+                    data = buf.tobytes()
+                    self._cam_frame_sig.emit(data)
+                    # Gemini Live accepts at most one video frame per second.
+                    # The preview stays fluid at ~30 fps; only this callback is gated.
+                    now = time.monotonic()
+                    if now - last_vision_frame >= 1.0:
+                        last_vision_frame = now
+                        if self.on_camera_frame:
+                            self.on_camera_frame(data)
+                else:
+                    consecutive_failures += 1
+                    if consecutive_failures >= 30:
+                        raise RuntimeError("The camera stopped returning frames.")
+            if not stop_event.is_set() and not cap.isOpened():
+                raise RuntimeError("The camera was disconnected.")
         except Exception as e:
             print(f"[Camera] Stream error: {e}")
+            self._cam_error_sig.emit(str(e))
         finally:
-            self._cam_stream_sig.emit(False)
+            if cap is not None:
+                try:
+                    cap.release()
+                except Exception:
+                    pass
+            with self._cam_lock:
+                if self._cam_thread is threading.current_thread():
+                    self._cam_thread = None
+                    is_current = True
+                else:
+                    is_current = False
+            if is_current:
+                self._cam_stream_sig.emit(False)
 
     def stop_camera_stream(self) -> None:
-        self._cam_stop.set()
+        with self._cam_lock:
+            self._cam_desired = False
+            self._cam_stop.set()
+
+    def _on_cam_error(self, message: str) -> None:
+        self._log.append_log(f"ERR: Camera Vision — {message}")
+        if self.on_camera_error:
+            self.on_camera_error(message)
 
     # ------------------------------------------------------------------
     # Icon generation — Lumina mascot rendered into a multi-resolution ICO
@@ -3256,6 +4020,10 @@ class MainWindow(QMainWindow):
                 (cw.height() - oh) // 2,
                 ow, oh,
             )
+        if self._vision_consent_overlay and self._vision_consent_overlay.isVisible():
+            self._centre_overlay(self._vision_consent_overlay)
+        if self._vision_source_overlay and self._vision_source_overlay.isVisible():
+            self._centre_overlay(self._vision_source_overlay)
         # Camera preview — bottom-right corner of the center/HUD area
         pw = _CameraPreview._W
         ph = self._cam_preview.height() or _CameraPreview._H
@@ -3526,6 +4294,13 @@ class MainWindow(QMainWindow):
         self._file_hint.setWordWrap(True)
         lay.addWidget(self._file_hint)
 
+        sep_vision = QFrame(); sep_vision.setFrameShape(QFrame.Shape.HLine)
+        sep_vision.setStyleSheet(f"color: {C.BORDER}; margin: 2px 0;")
+        lay.addWidget(sep_vision)
+
+        lay.addWidget(_sec("LIVE VISION"))
+        lay.addWidget(self._build_vision_controls())
+
         sep2 = QFrame(); sep2.setFrameShape(QFrame.Shape.HLine)
         sep2.setStyleSheet(f"color: {C.BORDER}; margin: 2px 0;")
         lay.addWidget(sep2)
@@ -3561,6 +4336,78 @@ class MainWindow(QMainWindow):
         lay.addWidget(self._mute_btn)
 
         return w
+
+    def _build_vision_controls(self) -> QWidget:
+        """Visible, explicit screen/camera controls modelled on Copilot Vision."""
+        card = QWidget()
+        card.setObjectName("VisionCard")
+        card.setStyleSheet(f"""
+            QWidget#VisionCard {{
+                background: {C.PANEL2}; border: 1px solid {C.BORDER};
+                border-radius: 5px;
+            }}
+        """)
+        lay = QVBoxLayout(card)
+        lay.setContentsMargins(7, 7, 7, 7)
+        lay.setSpacing(6)
+
+        source_row = QHBoxLayout(); source_row.setSpacing(6)
+        self._vision_screen_btn = QPushButton("SELECT SOURCE")
+        self._vision_camera_btn = QPushButton("CAMERA")
+        for button, source, tip in (
+            (self._vision_screen_btn, "screen",
+             "Choose a display or application window for Lumina Vision"),
+            (self._vision_camera_btn, "camera",
+             "Share the camera with Lumina Vision"),
+        ):
+            button.setCheckable(True)
+            button.setFixedHeight(34)
+            button.setFont(QFont("Courier New", 7, QFont.Weight.Bold))
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            button.setToolTip(tip)
+            button.setAccessibleName(tip)
+            source_row.addWidget(button)
+        self._vision_screen_btn.clicked.connect(self._open_vision_source_selector)
+        self._vision_camera_btn.clicked.connect(
+            lambda _checked=False: self._request_vision("camera", "Camera")
+        )
+        lay.addLayout(source_row)
+
+        smart = QLabel("✦ SMART CAPTURE · SENDS CHANGES")
+        smart.setFont(QFont("Courier New", 7, QFont.Weight.Bold))
+        smart.setToolTip("Static frames are skipped; periodic context refreshes remain enabled.")
+        smart.setStyleSheet(
+            f"color: {C.ACC2}; background: transparent; border: none;"
+        )
+        lay.addWidget(smart)
+
+        status_row = QHBoxLayout(); status_row.setSpacing(6)
+        self._vision_status_icon = QLabel()
+        self._vision_status_icon.setFixedSize(20, 20)
+        self._vision_status_icon.setStyleSheet("background: transparent;")
+        status_row.addWidget(self._vision_status_icon)
+
+        self._vision_status_lbl = QLabel("VISION OFF")
+        self._vision_status_lbl.setFont(QFont("Courier New", 7, QFont.Weight.Bold))
+        self._vision_status_lbl.setStyleSheet(
+            f"color: {C.TEXT_DIM}; background: transparent; border: none;"
+        )
+        status_row.addWidget(self._vision_status_lbl, stretch=1)
+
+        self._vision_stop_btn = QPushButton("STOP")
+        self._vision_stop_btn.setIcon(_vision_icon("stop", C.MUTED_C, 18))
+        self._vision_stop_btn.setIconSize(QSize(18, 18))
+        self._vision_stop_btn.setFixedHeight(25)
+        self._vision_stop_btn.setFont(QFont("Courier New", 7, QFont.Weight.Bold))
+        self._vision_stop_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._vision_stop_btn.setToolTip("Stop sharing visual input")
+        self._vision_stop_btn.setAccessibleName("Stop Live Vision")
+        self._vision_stop_btn.clicked.connect(self._request_stop_vision)
+        status_row.addWidget(self._vision_stop_btn)
+        lay.addLayout(status_row)
+
+        self._style_vision_controls()
+        return card
 
     def _build_quick_drawer(self) -> QWidget:
         """Floating overlay panel shown when the ⚙ header button is toggled."""
@@ -4355,6 +5202,229 @@ class MainWindow(QMainWindow):
 
     # ────────────────────────────────────────────────────────────────────────────
 
+    def _open_vision_source_selector(self) -> None:
+        try:
+            from actions.screen_processor import list_capture_sources
+            sources = list_capture_sources()
+        except Exception as exc:
+            self._log.append_log(f"ERR: Screen source list failed — {exc}")
+            sources = []
+        self._vision_source_labels = {
+            str(item.get("id") or ""): str(item.get("label") or "")
+            for item in sources
+        }
+        old = self._vision_source_overlay
+        if old is not None:
+            old.hide(); old.deleteLater()
+        overlay = VisionSourceOverlay(sources, parent=self.centralWidget())
+        overlay.selected.connect(self._on_vision_source_selected)
+        self._vision_source_overlay = overlay
+        self._centre_overlay(overlay)
+
+    def _on_vision_source_selected(self, source: str, label: str) -> None:
+        overlay = self._vision_source_overlay
+        if overlay is not None:
+            overlay.hide(); overlay.deleteLater()
+            self._vision_source_overlay = None
+        self._vision_source_labels[source] = label
+        # Pressing the enabled SHARE button after choosing a concrete source is
+        # the explicit opt-in. Keep the separate consent panel for camera,
+        # whose button does not pass through this picker.
+        from memory.config_manager import get_vision_consent, save_vision_consent
+        if not get_vision_consent():
+            save_vision_consent(True)
+        self._begin_vision_request(source)
+        if source.startswith("window:"):
+            def _focus_selected():
+                try:
+                    from actions.screen_processor import focus_capture_source
+                    focus_capture_source(source)
+                except Exception:
+                    pass
+            QTimer.singleShot(120, _focus_selected)
+
+    def _request_vision(self, source: str, source_label: str = "") -> None:
+        source = "camera" if source == "camera" else str(source or "monitor:1")
+        if source_label:
+            self._vision_source_labels[source] = source_label
+        if self._vision_source == source and self._vision_state in {"starting", "active"}:
+            return
+        if self._vision_source == source and self._vision_state == "paused":
+            self._request_pause_vision(False)
+            return
+
+        from memory.config_manager import get_vision_consent
+        if not get_vision_consent():
+            if self._vision_consent_overlay:
+                self._vision_consent_overlay.hide()
+            label = self._label_for_vision_source(source)
+            ov = VisionConsentOverlay(source, label, parent=self.centralWidget())
+            ov.answered.connect(
+                lambda accepted, s=source, lbl=label: self._on_vision_consent(
+                    s, lbl, accepted
+                )
+            )
+            self._centre_overlay(ov)
+            ov.show(); ov.raise_()
+            self._vision_consent_overlay = ov
+            return
+
+        self._begin_vision_request(source)
+
+    def _on_vision_consent(self, source: str, source_label: str,
+                           accepted: bool) -> None:
+        if self._vision_consent_overlay:
+            self._vision_consent_overlay.hide()
+            self._vision_consent_overlay.deleteLater()
+            self._vision_consent_overlay = None
+        if not accepted:
+            self._log.append_log("SYS: Live Vision was not started.")
+            return
+        from memory.config_manager import save_vision_consent
+        save_vision_consent(True)
+        if source_label:
+            self._vision_source_labels[source] = source_label
+        self._begin_vision_request(source)
+
+    def _begin_vision_request(self, source: str) -> None:
+        if not self.on_vision_requested:
+            self._apply_vision_state("", "error", "VOICE SESSION OFFLINE")
+            self._log.append_log("ERR: Live Vision is unavailable until voice connects.")
+            return
+        self._apply_vision_state(source, "starting", "CONNECTING…")
+        self.on_vision_requested(source)
+
+    def _request_pause_vision(self, paused: bool) -> None:
+        if self.on_vision_pause:
+            self.on_vision_pause(bool(paused))
+        elif self._vision_source:
+            state = "paused" if paused else "starting"
+            detail = "VISION PAUSED · VOICE ACTIVE" if paused else "RESUMING VISION…"
+            self._apply_vision_state(self._vision_source, state, detail)
+
+    def _request_stop_vision(self) -> None:
+        if self.on_vision_stop:
+            self.on_vision_stop()
+        else:
+            self.stop_camera_stream()
+            self._apply_vision_state("", "off", "VISION OFF")
+
+    def _apply_vision_state(self, source: str, state: str, detail: str) -> None:
+        self._vision_source = str(source or "")
+        self._vision_state = (
+            state if state in {"off", "starting", "active", "paused", "error"}
+            else "off"
+        )
+        self._vision_detail = detail or ""
+        self._style_vision_controls()
+
+    def _label_for_vision_source(self, source: str) -> str:
+        if source == "camera":
+            return "Camera"
+        known = self._vision_source_labels.get(source)
+        if known:
+            return known
+        try:
+            from actions.screen_processor import describe_capture_source
+            known = describe_capture_source(source)
+        except Exception:
+            known = "Selected window" if source.startswith("window:") else "Display"
+        self._vision_source_labels[source] = known
+        return known
+
+    def _apply_vision_highlight(self, source: str, x: int, y: int,
+                                label: str) -> None:
+        if source != self._vision_source or source == "camera":
+            return
+        try:
+            from actions.screen_processor import capture_source_geometry
+            geometry = capture_source_geometry(source)
+            self._vision_highlight.show_highlight(geometry, x, y, label)
+        except Exception as exc:
+            self._log.append_log(f"ERR: Vision highlight failed — {exc}")
+
+    def _style_vision_controls(self) -> None:
+        if not hasattr(self, "_vision_screen_btn"):
+            return
+        active = self._vision_state in {"starting", "active", "paused"}
+        selected = self._vision_source if active else ""
+        selected_kind = _vision_source_kind(selected) if selected else ""
+        base = f"""
+            QPushButton {{
+                background: transparent; color: {C.TEXT_MED};
+                border: 1px solid {C.BORDER}; border-radius: 4px;
+            }}
+            QPushButton:hover {{ color: {C.PRI}; border-color: {C.PRI_DIM};
+                background: {C.PRI_GHO}; }}
+            QPushButton:checked {{ color: {C.WHITE}; border-color: {C.PRI};
+                background: {C.PRI_DIM}; }}
+        """
+        for button, source_kind in (
+            (self._vision_screen_btn, "monitor"),
+            (self._vision_camera_btn, "camera"),
+        ):
+            is_selected = (
+                selected_kind == source_kind
+                or (source_kind == "monitor" and selected_kind == "window")
+            )
+            button.setChecked(is_selected)
+            button.setStyleSheet(base)
+            icon_color = C.WHITE if is_selected else C.TEXT_MED
+            button.setIcon(_vision_icon(source_kind, icon_color, 20))
+            button.setIconSize(QSize(20, 20))
+
+        self._vision_stop_btn.setVisible(active)
+        self._vision_stop_btn.setStyleSheet(f"""
+            QPushButton {{ background: #180008; color: {C.MUTED_C};
+                border: 1px solid {C.MUTED_C}; border-radius: 4px; }}
+            QPushButton:hover {{ background: #26000c; color: {C.WHITE}; }}
+        """)
+
+        if self._vision_state == "active":
+            label = self._vision_detail or (
+                "SHARING CAMERA" if selected_kind == "camera" else "SHARING SOURCE"
+            )
+            color = C.GREEN
+            icon_kind = selected_kind or "glasses"
+        elif self._vision_state == "paused":
+            label = self._vision_detail or "VISION PAUSED · VOICE ACTIVE"
+            color = C.ACC2
+            icon_kind = "pause"
+        elif self._vision_state == "starting":
+            label = self._vision_detail or "CONNECTING…"
+            color = C.ACC2
+            icon_kind = selected_kind or "glasses"
+        elif self._vision_state == "error":
+            label = self._vision_detail or "VISION ERROR"
+            color = C.MUTED_C
+            icon_kind = "glasses"
+        else:
+            label = "VISION OFF"
+            color = C.TEXT_DIM
+            icon_kind = "glasses"
+
+        self._vision_status_icon.setPixmap(
+            _vision_icon(icon_kind, color, 18).pixmap(18, 18)
+        )
+        self._vision_status_lbl.setText(label.upper()[:34])
+        self._vision_status_lbl.setToolTip(self._vision_detail)
+        self._vision_status_lbl.setStyleSheet(
+            f"color: {color}; background: transparent; border: none;"
+        )
+        if active and hasattr(self, "_vision_bar"):
+            source_label = self._label_for_vision_source(selected)
+            self._vision_bar.update_state(
+                selected, source_label, self._vision_state, self._vision_detail
+            )
+            self._vision_bar.update_mic(
+                self._muted, self._busy, self._busy_mic_open
+            )
+            self._vision_border.track(selected, self._vision_state)
+        elif hasattr(self, "_vision_bar"):
+            self._vision_bar.hide()
+            self._vision_border.stop()
+            self._vision_highlight.hide()
+
     def _do_interrupt(self):
         if self.on_interrupt:
             self.on_interrupt()
@@ -4432,6 +5502,10 @@ class MainWindow(QMainWindow):
                 }}
                 QPushButton:hover {{ background: #001f10; }}
             """)
+        if hasattr(self, "_vision_bar"):
+            self._vision_bar.update_mic(
+                self._muted, self._busy, self._busy_mic_open
+            )
 
     def _send(self):
         txt = self._input.text().strip()
@@ -4465,6 +5539,14 @@ class MainWindow(QMainWindow):
         ov.done.connect(self._on_setup_done)
         ov.show()
         self._overlay = ov
+
+    def closeEvent(self, event):
+        self.stop_camera_stream()
+        for widget_name in ("_vision_bar", "_vision_border", "_vision_highlight"):
+            widget = getattr(self, widget_name, None)
+            if widget is not None:
+                widget.close()
+        super().closeEvent(event)
 
     def _on_setup_done(self, key: str, os_name: str):
         os.makedirs(CONFIG_DIR, exist_ok=True)
@@ -4558,6 +5640,46 @@ class JarvisUI:
     def on_audio_device_change(self, cb):
         self._win.on_audio_device_change = cb
 
+    @property
+    def on_vision_requested(self):
+        return self._win.on_vision_requested
+
+    @on_vision_requested.setter
+    def on_vision_requested(self, cb):
+        self._win.on_vision_requested = cb
+
+    @property
+    def on_vision_stop(self):
+        return self._win.on_vision_stop
+
+    @on_vision_stop.setter
+    def on_vision_stop(self, cb):
+        self._win.on_vision_stop = cb
+
+    @property
+    def on_vision_pause(self):
+        return self._win.on_vision_pause
+
+    @on_vision_pause.setter
+    def on_vision_pause(self, cb):
+        self._win.on_vision_pause = cb
+
+    @property
+    def on_camera_frame(self):
+        return self._win.on_camera_frame
+
+    @on_camera_frame.setter
+    def on_camera_frame(self, cb):
+        self._win.on_camera_frame = cb
+
+    @property
+    def on_camera_error(self):
+        return self._win.on_camera_error
+
+    @on_camera_error.setter
+    def on_camera_error(self, cb):
+        self._win.on_camera_error = cb
+
     def show_confirm(self, title: str, detail: str) -> None:
         """Thread-safe: raise the irreversible-action gate. Called from action
         handlers running in executor threads, so it goes through a signal."""
@@ -4637,6 +5759,18 @@ class JarvisUI:
     def stop_camera_stream(self) -> None:
         """Thread-safe: stop the live camera feed."""
         self._win.stop_camera_stream()
+
+    def set_vision_state(self, source: str = "", state: str = "off",
+                         detail: str = "") -> None:
+        """Thread-safe: update the persistent Live Vision controls."""
+        self._win._vision_state_sig.emit(source or "", state or "off", detail or "")
+
+    def show_vision_highlight(self, source: str, x: int, y: int,
+                              label: str = "") -> None:
+        """Thread-safe: point at normalized coordinates on the shared source."""
+        self._win._vision_highlight_sig.emit(
+            str(source or ""), int(x), int(y), str(label or "")
+        )
 
     @property
     def assistant_name(self) -> str:

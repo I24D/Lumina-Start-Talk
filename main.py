@@ -142,7 +142,10 @@ from actions.weather_report    import weather_action
 from actions.send_message      import send_message
 from actions.reminder          import reminder
 from actions.computer_settings import computer_settings
-from actions.screen_processor  import _capture_camera, _capture_screen
+from actions.screen_processor import (
+    _capture_camera, _capture_screen, _normalise_capture_source,
+    describe_capture_source, frame_change_score, frame_fingerprint,
+)
 from actions.youtube_video     import youtube_video
 from actions.desktop           import desktop_control
 from actions.browser_control   import browser_control
@@ -232,6 +235,12 @@ _DEAF_SILENCE_SECONDS = 25.0
 _DEAF_VOICE_LEVEL     = 0.40    # measured: this room idles at 0.23 and peaks at 0.33
 _DEAF_COOLDOWN        = 120.0   # never rebuild more often than this
 _DEAF_ECHO_TAIL       = 2.0     # her own voice keeps arriving after she stops
+
+# Smart Vision compares each fresh sample with the last frame the model saw.
+# A keyframe still refreshes context periodically when the source is static.
+_VISION_SCREEN_CHANGE = 0.006
+_VISION_CAMERA_CHANGE = 0.014
+_VISION_KEYFRAME_SECS = 12.0
 
 # Full duplex: whether the microphone may stay open while she speaks.
 #
@@ -655,12 +664,12 @@ TOOL_DECLARATIONS = [
     {
         "name": "screen_process",
         "description": (
-            "Captures the screen or webcam image and lets you analyze it. "
-            "MUST be called when user asks what is on screen, what you see, "
-            "look at camera, analyze my screen, etc. "
-            "You have NO visual ability without this tool. "
+            "Takes one screen or webcam image when Live Vision is OFF. "
+            "Call it when the user asks what is on screen or camera and no live "
+            "video frames are already present. If Live Vision frames are present, "
+            "answer directly from them and do NOT call this tool. "
             "After the image is captured it is sent directly to you — describe what you see and answer the user's question. "
-            "When using camera: the live view stays open until user says close it or calls close_camera."
+            "A one-shot camera preview closes after the answer."
         ),
         "parameters": {
             "type": "OBJECT",
@@ -674,11 +683,31 @@ TOOL_DECLARATIONS = [
     {
         "name": "close_camera",
         "description": (
-            "Closes the live camera view shown on screen. "
-            "Call when user says: close camera, stop camera, turn off camera, "
-            "cierra la cámara, apaga la cámara, quita la cámara, creepy, etc."
+            "Stops Live Vision or closes the one-shot camera preview without "
+            "ending the voice conversation. Call when the user says stop vision, "
+            "stop sharing, close camera, turn off camera, cierra la cámara, "
+            "deja de compartir la pantalla, apaga la cámara, etc."
         ),
         "parameters": {"type": "OBJECT", "properties": {}, "required": []}
+    },
+    {
+        "name": "vision_highlight",
+        "description": (
+            "Shows a temporary visual pointer on the currently shared display or "
+            "application window. Use only while Live Vision is active and the user "
+            "asks where something is, where to click, or says 'show me'. Locate the "
+            "target in the newest frame, then provide coordinates normalized from "
+            "0 to 1000 relative to that frame. This points only; it never clicks."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "x": {"type": "INTEGER", "description": "Horizontal target coordinate, 0 left to 1000 right"},
+                "y": {"type": "INTEGER", "description": "Vertical target coordinate, 0 top to 1000 bottom"},
+                "label": {"type": "STRING", "description": "Short label shown beside the pointer"},
+            },
+            "required": ["x", "y", "label"],
+        },
     },
     {
         "name": "computer_settings",
@@ -1185,12 +1214,31 @@ class JarvisLive:
         self._vision_close_pending = False   # True after vision injected; next turn_complete closes camera
         self._vision_last_time     = 0.0     # monotonic time of last screen_process call (cooldown guard)
         self._vision_busy          = False   # True while a vision capture/inject cycle is in flight
+        # User-controlled, Copilot-style continuous Vision. This is deliberately
+        # separate from screen_process above: that tool answers one request;
+        # Live Vision keeps sending a selected source until the user presses STOP.
+        self._live_vision_source   = ""      # "screen" | "camera" | ""
+        self._live_vision_epoch    = 0       # invalidates an in-flight capture on switch/stop
+        self._live_vision_latest   = None    # (jpeg bytes, mime, timestamp, epoch)
+        self._live_vision_announced = False
+        self._live_vision_should_greet = False
+        self._live_vision_frames   = 0
+        self._live_vision_paused   = False
+        self._live_vision_fingerprint = None
+        self._live_vision_last_sent_at = 0.0
+        self._live_vision_skipped  = 0
+        self._live_vision_label    = ""
         self._interrupted          = False   # True while draining audio after user interrupt
         self.ui.on_text_command   = self._on_text_command
         self.ui.on_remote_clicked = self._make_remote_key
         self.ui.on_interrupt      = self.interrupt
         self.ui.on_voice_change   = self._on_voice_change     # voice picker → rebuild session
         self.ui.on_audio_device_change = self._on_audio_device_change
+        self.ui.on_vision_requested = self.start_live_vision
+        self.ui.on_vision_stop      = self.stop_live_vision
+        self.ui.on_vision_pause     = self.pause_live_vision
+        self.ui.on_camera_frame     = self._on_live_camera_frame
+        self.ui.on_camera_error     = self._on_live_camera_error
         self._reconnect_event: asyncio.Event | None = None
         self._reconnect_keep = True   # False → next rebuild drops the resumption handle
         # Transcripts arrive in fragments, so the wake phrase is seen on several
@@ -1387,6 +1435,142 @@ class JarvisLive:
         but the conversation is kept, which is the whole reason resumption
         landed before this feature did."""
         self.request_reconnect(keep_context=True, reason="audio device")
+
+    def start_live_vision(self, source: str) -> None:
+        """Thread-safe UI entrypoint for persistent screen/camera sharing."""
+        source = (
+            "camera" if str(source).lower() == "camera"
+            else _normalise_capture_source(source)
+        )
+        loop = getattr(self, "_loop", None)
+        if not loop or not self.session:
+            self.ui.set_vision_state("", "error", "VOICE SESSION OFFLINE")
+            self.ui.write_log("ERR: Live Vision needs an active voice session.")
+            return
+        loop.call_soon_threadsafe(self._activate_live_vision, source, True)
+
+    def stop_live_vision(self) -> None:
+        """Thread-safe UI/tool entrypoint. Stops frames, not the voice chat."""
+        loop = getattr(self, "_loop", None)
+        if loop:
+            loop.call_soon_threadsafe(self._deactivate_live_vision, "", False)
+        else:
+            self.ui.stop_camera_stream()
+            self.ui.set_vision_state("", "off", "VISION OFF")
+
+    def pause_live_vision(self, paused: bool) -> None:
+        """Thread-safe pause/resume that never ends the voice conversation."""
+        loop = getattr(self, "_loop", None)
+        if loop:
+            loop.call_soon_threadsafe(self._set_live_vision_paused, bool(paused))
+
+    def _set_live_vision_paused(self, paused: bool) -> None:
+        if not self._live_vision_source or self._live_vision_paused == paused:
+            return
+        self._live_vision_paused = paused
+        self._live_vision_epoch += 1
+        self._live_vision_latest = None
+        self._live_vision_fingerprint = None
+        self._live_vision_last_sent_at = 0.0
+        if self._live_vision_source == "camera":
+            if paused:
+                self.ui.stop_camera_stream()
+            else:
+                self.ui.start_camera_stream()
+        if paused:
+            self.ui.set_vision_state(
+                self._live_vision_source, "paused", "VISION PAUSED · VOICE ACTIVE"
+            )
+            self.ui.write_log("SYS: Live Vision paused. Voice is still active.")
+            print("[VISION LIVE] ⏸ paused", flush=True)
+        else:
+            self._live_vision_announced = False
+            self.ui.set_vision_state(
+                self._live_vision_source, "starting", "RESUMING VISION…"
+            )
+            self.ui.write_log("SYS: Live Vision resuming.")
+            print("[VISION LIVE] ▶ resumed", flush=True)
+
+    def _activate_live_vision(self, source: str, greet: bool = True) -> None:
+        """Apply a source change on the Live session's asyncio thread."""
+        source = "camera" if source == "camera" else _normalise_capture_source(source)
+        previous = self._live_vision_source
+        if previous == source:
+            return
+        if previous == "camera":
+            self.ui.stop_camera_stream()
+
+        self._live_vision_epoch += 1
+        self._live_vision_source = source
+        self._live_vision_latest = None
+        self._live_vision_announced = False
+        self._live_vision_should_greet = bool(greet)
+        self._live_vision_frames = 0
+        self._live_vision_paused = False
+        self._live_vision_fingerprint = None
+        self._live_vision_last_sent_at = 0.0
+        self._live_vision_skipped = 0
+        self._live_vision_label = (
+            "Camera" if source == "camera" else describe_capture_source(source)
+        )
+        detail = "OPENING CAMERA…" if source == "camera" else "CAPTURING SCREEN…"
+        self.ui.set_vision_state(source, "starting", detail)
+        self.ui.write_log(
+            "SYS: Live Vision starting — "
+            + ("camera." if source == "camera" else f"{self._live_vision_label}.")
+        )
+        print(f"[VISION LIVE] ▶ source={source} epoch={self._live_vision_epoch}", flush=True)
+        if source == "camera":
+            # One owner opens the device: the UI worker supplies both the fluid
+            # local preview and the one-frame-per-second model feed.
+            self.ui.start_camera_stream()
+
+    def _deactivate_live_vision(self, detail: str = "", failed: bool = False) -> None:
+        """Stop the current source immediately while leaving Voice connected."""
+        previous = self._live_vision_source
+        self._live_vision_epoch += 1
+        self._live_vision_source = ""
+        self._live_vision_latest = None
+        self._live_vision_announced = False
+        self._live_vision_should_greet = False
+        self._live_vision_paused = False
+        self._live_vision_fingerprint = None
+        self._live_vision_last_sent_at = 0.0
+        self._live_vision_label = ""
+        if previous == "camera":
+            self.ui.stop_camera_stream()
+
+        if failed:
+            message = detail or "VISION SOURCE FAILED"
+            self.ui.set_vision_state("", "error", message)
+            self.ui.write_log(f"ERR: Live Vision stopped — {message}")
+            print(f"[VISION LIVE] ⛔ {message}", flush=True)
+        else:
+            self.ui.set_vision_state("", "off", "VISION OFF")
+            if previous:
+                self.ui.write_log("SYS: Live Vision stopped. Voice is still active.")
+                print(f"[VISION LIVE] ■ stopped source={previous}", flush=True)
+
+    def _on_live_camera_frame(self, data: bytes) -> None:
+        """Receive the UI camera worker's rate-limited JPEG without blocking it."""
+        if self._live_vision_source != "camera" or not data:
+            return
+        # A tuple assignment is atomic under CPython. Keeping only the newest
+        # frame prevents latency/backlog if the network stalls.
+        self._live_vision_latest = (
+            bytes(data), "image/jpeg", time.monotonic(), self._live_vision_epoch
+        )
+
+    def _on_live_camera_error(self, message: str) -> None:
+        if self._live_vision_source != "camera":
+            return
+        loop = getattr(self, "_loop", None)
+        if loop:
+            loop.call_soon_threadsafe(
+                self._deactivate_live_vision,
+                str(message)[:100] or "CAMERA UNAVAILABLE",
+                True,
+            )
 
     async def _watch_reconnect(self):
         """Session-scoped task: when a voluntary reconnect is requested, raise a
@@ -1698,14 +1882,20 @@ class JarvisLive:
                 import time as _t_mod
                 _now = _t_mod.monotonic()
                 _cooldown = 4.0  # seconds — covers echo window after speaking ends
-                if self._vision_busy or (_now - self._vision_last_time) < _cooldown:
+                angle = "camera" if args.get("angle", "screen").lower() == "camera" else "screen"
+                if self._live_vision_source == angle:
+                    result = (
+                        f"[VISION_ALREADY_ACTIVE] Live {angle} frames are already available. "
+                        "Answer the user's question directly from the newest visual context. "
+                        "Do not call screen_process again."
+                    )
+                elif self._vision_busy or (_now - self._vision_last_time) < _cooldown:
                     _wait = max(0, _cooldown - (_now - self._vision_last_time))
                     print(f"[Vision] ⏳ Cooldown active ({_wait:.1f}s remaining) — ignoring duplicate call")
                     result = "Vision is still processing the previous request. I will not call this again."
                 else:
                     self._vision_busy      = True
                     self._vision_last_time = _now
-                    angle     = args.get("angle", "screen").lower()
                     user_text = args.get("text", "What do you see?")
                     if angle == "camera":
                         img_b, mime_t = await loop.run_in_executor(None, _capture_camera)
@@ -1726,8 +1916,32 @@ class JarvisLive:
                     )
 
             elif name == "close_camera":
-                self.ui.stop_camera_stream()
-                result = "Camera closed."
+                if self._live_vision_source:
+                    self._deactivate_live_vision()
+                    result = "Live Vision stopped. The voice conversation remains active."
+                else:
+                    self.ui.stop_camera_stream()
+                    result = "Camera closed."
+
+            elif name == "vision_highlight":
+                source = self._live_vision_source
+                if not source or source == "camera" or self._live_vision_paused:
+                    result = (
+                        "A display or application window must be actively shared "
+                        "before I can show a visual pointer."
+                    )
+                else:
+                    try:
+                        x = max(0, min(1000, int(args.get("x", 500))))
+                        y = max(0, min(1000, int(args.get("y", 500))))
+                    except (TypeError, ValueError):
+                        x, y = 500, 500
+                    label = str(args.get("label") or "Click here")[:48]
+                    self.ui.show_vision_highlight(source, x, y, label)
+                    result = (
+                        f"Pointer shown at ({x}, {y}) on the shared source. "
+                        "It does not click or control the computer."
+                    )
 
             elif name == "computer_settings":
                 r = await loop.run_in_executor(None, lambda: computer_settings(parameters=args, response=None, player=self.ui))
@@ -1897,6 +2111,138 @@ class JarvisLive:
                 print(f"[JARVIS] ⇢ {self._sent_blocks} audio blocks sent "
                       f"({_audio:.0f}s of audio in {_wall:.0f}s)",
                       flush=True)
+
+    async def _run_live_vision(self) -> None:
+        """Send the explicitly selected visual source to the main Live session.
+
+        Gemini's documented ceiling is one video frame per second. Screen
+        capture runs off the event loop; the camera preview worker supplies its
+        newest JPEG. There is intentionally no backlog of stale visual frames.
+        """
+        print("[VISION LIVE] Stream worker ready", flush=True)
+        last_camera_stamp = 0.0
+        observed_epoch = -1
+
+        while True:
+            source = self._live_vision_source
+            epoch = self._live_vision_epoch
+            if not source or self._live_vision_paused:
+                await asyncio.sleep(0.10)
+                continue
+            if epoch != observed_epoch:
+                observed_epoch = epoch
+                last_camera_stamp = 0.0
+
+            frame_started = time.monotonic()
+            try:
+                if source != "camera":
+                    img_bytes, mime_type = await asyncio.to_thread(
+                        _capture_screen, source
+                    )
+                else:
+                    latest = self._live_vision_latest
+                    if not latest:
+                        await asyncio.sleep(0.05)
+                        continue
+                    img_bytes, mime_type, stamp, frame_epoch = latest
+                    if frame_epoch != epoch or stamp <= last_camera_stamp:
+                        await asyncio.sleep(0.05)
+                        continue
+                    last_camera_stamp = stamp
+
+                # A stop or source switch while capture was running invalidates
+                # the frame before it can leave the machine.
+                if (source != self._live_vision_source
+                        or epoch != self._live_vision_epoch
+                        or self._live_vision_paused):
+                    continue
+
+                fingerprint = await asyncio.to_thread(frame_fingerprint, img_bytes)
+                change = frame_change_score(
+                    self._live_vision_fingerprint, fingerprint
+                )
+                now = time.monotonic()
+                threshold = (
+                    _VISION_CAMERA_CHANGE if source == "camera"
+                    else _VISION_SCREEN_CHANGE
+                )
+                keyframe_due = (
+                    not self._live_vision_last_sent_at
+                    or now - self._live_vision_last_sent_at >= _VISION_KEYFRAME_SECS
+                )
+                if self._live_vision_fingerprint is not None and not keyframe_due:
+                    if change < threshold:
+                        self._live_vision_skipped += 1
+                        if self._live_vision_skipped % 30 == 0:
+                            print(
+                                f"[VISION LIVE] smart capture skipped "
+                                f"{self._live_vision_skipped} unchanged frames",
+                                flush=True,
+                            )
+                        elapsed = time.monotonic() - frame_started
+                        await asyncio.sleep(max(0.05, 1.0 - elapsed))
+                        continue
+
+                if (source != self._live_vision_source
+                        or epoch != self._live_vision_epoch
+                        or self._live_vision_paused):
+                    continue
+
+                await self.session.send_realtime_input(
+                    video=types.Blob(data=img_bytes, mime_type=mime_type)
+                )
+                self._live_vision_frames += 1
+                self._live_vision_fingerprint = fingerprint
+                self._live_vision_last_sent_at = time.monotonic()
+
+                if not self._live_vision_announced:
+                    self._live_vision_announced = True
+                    kind = (
+                        "CAMERA" if source == "camera"
+                        else ("WINDOW" if source.startswith("window:") else "DISPLAY")
+                    )
+                    detail = f"SHARING {kind} · SMART · VOICE ACTIVE"
+                    self.ui.set_vision_state(source, "active", detail)
+                    self.ui.write_log(
+                        "SYS: Live Vision active — ask follow-up questions by voice."
+                    )
+                    print(
+                        f"[VISION LIVE] ● active source={source} "
+                        f"frame={len(img_bytes):,} bytes",
+                        flush=True,
+                    )
+                    if self._live_vision_should_greet:
+                        self._live_vision_should_greet = False
+                        source_label = (
+                            "camera" if source == "camera" else self._live_vision_label
+                        )
+                        await self.session.send_client_content(
+                            turns={"parts": [{"text": (
+                                f"[VISION_SESSION_STARTED] The user explicitly enabled live "
+                                f"{source_label} sharing from the interface. You can now see "
+                                f"fresh frames continuously. In one short sentence in the "
+                                f"user's language, confirm that Vision is active and ask what "
+                                f"they want help with. Do not call screen_process."
+                            )}]},
+                            turn_complete=True,
+                        )
+                elif self._live_vision_frames % 15 == 0:
+                    print(
+                        f"[VISION LIVE] ⇢ {self._live_vision_frames} frames sent "
+                        f"(source={source}, skipped={self._live_vision_skipped})",
+                        flush=True,
+                    )
+
+            except Exception as exc:
+                if source == self._live_vision_source and epoch == self._live_vision_epoch:
+                    self._deactivate_live_vision(
+                        f"{type(exc).__name__}: {str(exc)[:80]}", failed=True
+                    )
+                await asyncio.sleep(0.25)
+                continue
+
+            elapsed = time.monotonic() - frame_started
+            await asyncio.sleep(max(0.05, 1.0 - elapsed))
 
     async def _listen_audio(self):
         print("[JARVIS] 🎤 Mic started")
@@ -2567,7 +2913,12 @@ class JarvisLive:
                                 self._vision_busy = False
                                 async def _cam_close():
                                     await asyncio.sleep(2.0)
-                                    self.ui.stop_camera_stream()
+                                    # A user may have enabled persistent camera
+                                    # Vision while the one-shot answer was being
+                                    # spoken. Never let the old preview timer turn
+                                    # off the newly selected live source.
+                                    if self._live_vision_source != "camera":
+                                        self.ui.stop_camera_stream()
                                 asyncio.create_task(_cam_close())
 
                     if response.tool_call:
@@ -3262,12 +3613,37 @@ class JarvisLive:
                     self.ui.set_state("LISTENING")
                     self.ui.write_log(f"SYS: {self._asst_name} online.")
 
+                    if self._live_vision_source:
+                        # A transport rotation must not silently turn sharing
+                        # off. Invalidate any old frame and let the new session's
+                        # worker prove it is active with its first successful send.
+                        self._live_vision_epoch += 1
+                        self._live_vision_latest = None
+                        self._live_vision_announced = False
+                        self._live_vision_should_greet = False
+                        self._live_vision_frames = 0
+                        self._live_vision_fingerprint = None
+                        self._live_vision_last_sent_at = 0.0
+                        if self._live_vision_paused:
+                            self.ui.set_vision_state(
+                                self._live_vision_source, "paused",
+                                "VISION PAUSED · VOICE ACTIVE",
+                            )
+                        else:
+                            self.ui.set_vision_state(
+                                self._live_vision_source, "starting",
+                                "RESTORING VISION…",
+                            )
+                        if self._live_vision_source == "camera" and not self._live_vision_paused:
+                            self.ui.start_camera_stream()
+
                     if self._dashboard:
                         await self._dashboard.broadcast({"type": "status", "state": "active"})
 
                     self._reconnect_event.clear()  # ignore requests from before this session
                     tg.create_task(self._watch_reconnect())
                     tg.create_task(self._send_realtime())
+                    tg.create_task(self._run_live_vision())
                     tg.create_task(self._listen_audio())
                     tg.create_task(self._receive_audio())
                     tg.create_task(self._play_audio())
@@ -3376,6 +3752,13 @@ class JarvisLive:
                     self._conn_backoff = 3
             finally:
                 self.session = None
+                if self._live_vision_source:
+                    state = "paused" if self._live_vision_paused else "starting"
+                    detail = (
+                        "VISION PAUSED · VOICE RECONNECTING"
+                        if self._live_vision_paused else "VOICE RECONNECTING…"
+                    )
+                    self.ui.set_vision_state(self._live_vision_source, state, detail)
                 # Only save if there was a real conversation (≥3 turns)
                 if len(self._session_log) >= 3:
                     asyncio.create_task(self._save_session_summary())
