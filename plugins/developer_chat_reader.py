@@ -41,6 +41,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
+from plugins._spoken_answer import spoken_answer
+
 
 PLUGIN = {
     "name": "developer_chat_reader",
@@ -89,7 +91,6 @@ PLUGIN = {
 }
 
 
-_SPOKEN_LIMIT = 2200
 _MAX_FILES_PER_SOURCE = 40
 _FINAL_CODEX_PHASES = {"final", "final_answer"}
 _FINAL_CLAUDE_REASONS = {"end_turn", "max_tokens", "stop_sequence"}
@@ -265,20 +266,8 @@ def _speech_text(text: str) -> str:
     return text
 
 
-def _shorten(text: str, limit: int) -> str:
-    if len(text) <= limit:
-        return text
-    shortened = text[:limit].rsplit(" ", 1)[0].rstrip()
-    return shortened + "... That is as far as I will read aloud."
-
-
-def _format_reply(reply: ChatReply | None, limit: int) -> str:
-    if reply is None:
-        return ""
-    text = _speech_text(reply.text)
-    if not text:
-        return ""
-    return _shorten(text, limit)
+def _format_reply(reply: ChatReply | None) -> str:
+    return _speech_text(reply.text) if reply is not None else ""
 
 
 def _normalize_source(value: Any) -> str:
@@ -294,17 +283,19 @@ def _normalize_source(value: Any) -> str:
 
 def _read_source(source: str) -> str:
     if source == "codex":
-        reply = _latest_codex_reply()
-        text = _format_reply(reply, _SPOKEN_LIMIT)
-        return text or "I could not find a completed Codex response in the local chat history."
+        text = _format_reply(_latest_codex_reply())
+        if not text:
+            return "I could not find a completed Codex response in the local chat history."
+        return spoken_answer(text)
 
     if source == "claude":
-        reply = _latest_claude_reply()
-        text = _format_reply(reply, _SPOKEN_LIMIT)
-        return text or "I could not find a completed Claude Code response in the local chat history."
+        text = _format_reply(_latest_claude_reply())
+        if not text:
+            return "I could not find a completed Claude Code response in the local chat history."
+        return spoken_answer(text)
 
-    codex = _format_reply(_latest_codex_reply(), _SPOKEN_LIMIT // 2)
-    claude = _format_reply(_latest_claude_reply(), _SPOKEN_LIMIT // 2)
+    codex = _format_reply(_latest_codex_reply())
+    claude = _format_reply(_latest_claude_reply())
     if not codex and not claude:
         return "I could not find completed Codex or Claude Code responses in the local chat history."
     parts = []
@@ -312,7 +303,7 @@ def _read_source(source: str) -> str:
         parts.append(f"Latest Codex response: {codex}")
     if claude:
         parts.append(f"Latest Claude Code response: {claude}")
-    return "\n\n".join(parts)
+    return spoken_answer("\n\n".join(parts))
 
 
 # ── announcing finished answers ──────────────────────────────────────────────
@@ -330,10 +321,6 @@ def _read_source(source: str) -> str:
 # machine, 218 of 693 — so a message id is announced once.
 
 _WATCH_SECONDS = 2.0
-_ANNOUNCE_LIMIT = 12_000
-
-# Recognised by the "Answering in depth" rule in core/prompt.txt.
-_ANSWER_IN_DEPTH = "[ANSWER_IN_DEPTH]\n"
 
 _watch_lock = threading.Lock()
 _watch_thread: threading.Thread | None = None
@@ -443,8 +430,6 @@ def _announce(player, label: str, text: str) -> None:
     spoken = _speech_text(text)
     if not spoken:
         return
-    if len(spoken) > _ANNOUNCE_LIMIT:
-        spoken = spoken[:_ANNOUNCE_LIMIT].rsplit(" ", 1)[0] + "…"
     print(f"[DeveloperChat] {label} finished a task ({len(text)} chars); announcing")
     try:
         if player:
@@ -453,7 +438,7 @@ def _announce(player, label: str, text: str) -> None:
         if callable(announce):
             announce(
                 f"[CHAT_FINISHED] {label} has just finished a task in its chat. "
-                "Its answer follows.\n\n" + _ANSWER_IN_DEPTH + spoken
+                "Its answer follows.\n\n" + spoken_answer(spoken)
             )
     except Exception as exc:
         print(f"[DeveloperChat] could not announce: {exc}")

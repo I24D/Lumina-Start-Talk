@@ -36,6 +36,8 @@ import subprocess
 import threading
 import time
 
+from plugins._spoken_answer import spoken_answer
+
 _IMPORT_ERROR = ""
 if platform.system() == "Windows":
     try:
@@ -116,30 +118,17 @@ _SETTLE_SECONDS = 2.5
 _POLL_SECONDS = 1.2
 _DEFAULT_TIMEOUT = 90
 
-# A runaway guard, not an editorial limit. It was 1500, which cut a real Copilot
-# explanation off mid-sentence: the user asked for Copilot's answer, not for the
-# first page of it. Nothing legitimate comes near this; a transcript scrape that
-# went wrong does.
-_SPOKEN_LIMIT = 12_000
-
-
 class _Detailed(str):
-    """A Copilot answer, to be covered properly rather than skimmed.
+    """A Copilot answer, as opposed to one of the plugin's own status lines.
 
     Everything this plugin returns reaches Gemini as a tool result, and a model
     handed a long tool result compresses it to a sentence or two by default —
-    which turns "ask Copilot to explain quantum computing" into a headline. The
-    opposite extreme, reading three thousand characters out word for word, is a
-    three-minute monologue nobody wants either. Marking the string lets run()
-    add the directive core/prompt.txt recognises, which asks for the middle:
-    every substantial point, in the user's language, then a pointer to the full
-    text in Copilot's own chat. The plugin's short status lines ("Copilot is
-    closed, sir.") stay unmarked and get spoken naturally.
+    which turns "ask Copilot to explain quantum computing" into a headline.
+    Marking the string lets run() pass it through spoken_answer, which tells the
+    model to read it whole or, past two thousand words, to summarise it. The
+    short status lines ("Copilot is closed, sir.") stay unmarked and get spoken
+    naturally.
     """
-
-
-# Recognised by the "Answering in depth" rule in core/prompt.txt.
-_ANSWER_IN_DEPTH = "[ANSWER_IN_DEPTH]\n"
 
 
 # ── window plumbing ──────────────────────────────────────────────────────────
@@ -532,8 +521,5 @@ def run(parameters: dict, player=None, session_memory=None) -> str:
             pass
 
     if isinstance(result, _Detailed):
-        result = _ANSWER_IN_DEPTH + result
-
-    if len(result) > _SPOKEN_LIMIT:
-        return result[:_SPOKEN_LIMIT].rsplit(" ", 1)[0] + "… That is as far as I will read, sir."
+        return spoken_answer(result)
     return result

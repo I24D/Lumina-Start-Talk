@@ -46,6 +46,8 @@ from collections import deque
 from concurrent.futures import Future, TimeoutError as FutureTimeout
 from typing import Any
 
+from plugins._spoken_answer import spoken_answer
+
 # ── Optional WebSocket support ────────────────────────────────────────────────
 # The persistent connection uses the `websockets` library when available.
 # It is a common dependency, but we fall back to the CLI if it is missing
@@ -127,15 +129,6 @@ _GATEWAY_PORT = 18789
 _GATEWAY_START_TIMEOUT = 180
 _GATEWAY_OWNERSHIP_WAIT = 90
 _DEFAULT_ANSWER_TIMEOUT = 180
-
-# A runaway guard, not an editorial limit: a real OpenClaw answer that got cut
-# at 1500 characters was the user asking a question and receiving its first
-# page.
-_SPOKEN_LIMIT = 12_000
-
-# Recognised by the "Answering in depth" rule in core/prompt.txt: cover every
-# substantial point rather than reducing the answer to a headline.
-_ANSWER_IN_DEPTH = "[ANSWER_IN_DEPTH]\n"
 
 _ACTIONS = {"ask", "connect", "open", "read", "close", "disconnect"}
 
@@ -935,10 +928,6 @@ def _deliver(question: str, answer: str, player=None) -> None:
     global _last_answer
     _last_answer = answer
 
-    spoken = answer
-    if len(spoken) > _SPOKEN_LIMIT:
-        spoken = spoken[:_SPOKEN_LIMIT].rsplit(" ", 1)[0] + "…"
-
     print(f"[OpenClaw] answered after the fact: {len(answer)} chars")
     if player:
         try:
@@ -950,7 +939,7 @@ def _deliver(question: str, answer: str, player=None) -> None:
         player,
         "[DELAYED_ANSWER] OpenClaw has finished the question you sent it "
         f"earlier ('{question[:120]}'). Its answer follows.\n\n"
-        + _ANSWER_IN_DEPTH + spoken,
+        + spoken_answer(answer),
     )
 
 
@@ -1173,10 +1162,6 @@ def _announce_chat_answer(answer: str, player=None) -> None:
     global _last_answer
     _last_answer = answer    # so "read" repeats this one, not an older answer
 
-    spoken = answer
-    if len(spoken) > _SPOKEN_LIMIT:
-        spoken = spoken[:_SPOKEN_LIMIT].rsplit(" ", 1)[0] + "…"
-
     print(f"[OpenClaw] finished a task in its chat ({len(answer)} chars); announcing")
     try:
         if player:
@@ -1185,7 +1170,7 @@ def _announce_chat_answer(answer: str, player=None) -> None:
         if callable(announce):
             announce(
                 "[CHAT_FINISHED] OpenClaw has just finished a task in its chat. "
-                "Its answer follows.\n\n" + _ANSWER_IN_DEPTH + spoken
+                "Its answer follows.\n\n" + spoken_answer(answer)
             )
     except Exception as exc:
         print(f"[OpenClaw] could not announce: {exc}")
@@ -1244,7 +1229,7 @@ def _act_read() -> str:
         )
         if not _last_answer:
             return note
-        return note + " The previous answer was:\n" + _ANSWER_IN_DEPTH + _last_answer
+        return note + " The previous answer was:\n" + spoken_answer(_last_answer)
 
     if not _last_answer:
         recovered = _stored_answer()
@@ -1252,9 +1237,9 @@ def _act_read() -> str:
             globals()["_last_answer"] = recovered
             print(f"[OpenClaw] recovered the last answer from its session store "
                   f"({len(recovered)} chars)")
-            return _ANSWER_IN_DEPTH + recovered
+            return spoken_answer(recovered)
         return "OpenClaw has not answered a question in this Lumina session yet."
-    return _ANSWER_IN_DEPTH + _last_answer
+    return spoken_answer(_last_answer)
 
 
 def _act_close() -> str:
@@ -1305,7 +1290,4 @@ def run(parameters: dict, player=None, session_memory=None) -> str:
         except Exception:
             pass
 
-    if len(result) > _SPOKEN_LIMIT:
-        shortened = result[:_SPOKEN_LIMIT].rsplit(" ", 1)[0]
-        return shortened + "... That is as far as I will read aloud."
     return result

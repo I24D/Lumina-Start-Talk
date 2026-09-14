@@ -157,13 +157,20 @@ class FinishedAnswerWatcherTests(unittest.TestCase):
 
         self.assertEqual(self.look(), [("Codex", "Terminé la tarea.")])
 
-    def test_announcement_asks_for_an_in_depth_summary(self):
+    def test_a_short_announcement_is_read_in_full(self):
         player = mock.Mock()
         reader._announce(player, "Claude Code", "## Hecho\nMira [main.py](main.py#L1).")
 
         instruction = player.request_announce.call_args.args[0]
         self.assertTrue(instruction.startswith("[CHAT_FINISHED] Claude Code"))
-        self.assertIn("[ANSWER_IN_DEPTH]\nHecho\nMira main.py.", instruction)
+        self.assertIn("[READ_IN_FULL]\nHecho\nMira main.py.", instruction)
+
+    def test_reading_on_request_is_no_longer_cut_at_2200_characters(self):
+        reply = reader.ChatReply("Claude Code", "palabra " * 1_500, 0.0, pathlib.Path("x"))
+        with mock.patch.object(reader, "_latest_claude_reply", return_value=reply):
+            result = reader._read_source("claude")
+        self.assertTrue(result.startswith("[READ_IN_FULL]\n"))
+        self.assertEqual(len(result.split()), 1_500 + 1)
 
 
 if __name__ == "__main__":

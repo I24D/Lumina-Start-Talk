@@ -39,6 +39,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from plugins._spoken_answer import spoken_answer
+
 
 _IMPORT_ERROR = ""
 if platform.system() == "Windows":
@@ -121,14 +123,12 @@ _DEFAULT_TIMEOUT = 120
 _BACKGROUND_TIMEOUT = 900
 _POLL_SECONDS = 0.8
 _SETTLE_SECONDS = 1.8
-_SPOKEN_LIMIT = 12_000
-_ANSWER_IN_DEPTH = "[ANSWER_IN_DEPTH]\n"
 _ACTIONS = {
     "ask", "connect", "open", "read", "notifications", "notification",
     "new", "new_chat", "close", "disconnect",
 }
 class _Detailed(str):
-    """A desktop answer that Lumina should cover without reducing to a headline."""
+    """A ChatGPT answer, as opposed to a status line; run() passes it through spoken_answer."""
 
 
 def _process_name(pid: int) -> str:
@@ -717,10 +717,6 @@ _job_started = 0.0
 
 def _deliver(question: str, answer: str, player=None) -> None:
     """Speak an answer that arrived long after its tool call returned."""
-    spoken = _speech_text(answer)
-    if len(spoken) > _SPOKEN_LIMIT:
-        spoken = spoken[:_SPOKEN_LIMIT].rsplit(" ", 1)[0] + "…"
-
     print(f"[ChatGPT] answered after the fact: {len(answer)} chars")
     if player:
         try:
@@ -737,7 +733,7 @@ def _deliver(question: str, answer: str, player=None) -> None:
         player,
         "[DELAYED_ANSWER] ChatGPT has finished the message you sent it earlier "
         f"('{question[:120]}'). Its answer follows.\n\n"
-        + _ANSWER_IN_DEPTH + spoken,
+        + spoken_answer(_speech_text(answer)),
     )
 
 
@@ -987,8 +983,5 @@ def run(parameters: dict, player=None, session_memory=None) -> str:
         except Exception:
             pass
     if isinstance(result, _Detailed):
-        result = _ANSWER_IN_DEPTH + _speech_text(result)
-    if len(result) > _SPOKEN_LIMIT:
-        result = result[:_SPOKEN_LIMIT].rsplit(" ", 1)[0]
-        return result + "... That is as far as I will read aloud."
+        return spoken_answer(_speech_text(result))
     return result

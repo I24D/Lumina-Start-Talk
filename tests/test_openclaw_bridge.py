@@ -270,12 +270,12 @@ class ChatWatcherTests(unittest.TestCase):
             self.add("bridge", "ya leída")
             self.assertEqual(self.look(), [])
 
-    def test_announcement_asks_for_an_in_depth_summary_and_can_be_repeated(self):
+    def test_a_short_announcement_is_read_in_full_and_can_be_repeated(self):
         player = mock.Mock()
         bridge._announce_chat_answer("Terminé.", player)
         instruction = player.request_announce.call_args.args[0]
         self.assertTrue(instruction.startswith("[CHAT_FINISHED] OpenClaw"))
-        self.assertIn("[ANSWER_IN_DEPTH]\nTerminé.", instruction)
+        self.assertIn("[READ_IN_FULL]\nTerminé.", instruction)
         self.assertEqual(bridge._last_answer, "Terminé.")
 
 
