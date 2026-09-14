@@ -498,12 +498,20 @@ def _ws_fail_waiters(reason: str) -> None:
             future.set_exception(ConnectionError(reason))
 
 
+# Last assistant message seen on the subscribed session, keyed by runId.
+# The Gateway delivers the answer text as a session.message event and only
+# signals run completion in the chat event — so we keep the latest assistant
+# text and hand it to the waiter when the terminal chat event arrives.
+_ws_last_assistant: dict[str, str] = {}
+
+
 def _dispatch_ws_message(msg: dict[str, Any]) -> None:
     """Route one Gateway frame to whoever is waiting for it.
 
     A ``res`` frame only answers the request with the same id. For ``chat.send``
-    that is the acceptance receipt ({runId, status}), never the answer: the
-    answer is the run's terminal ``chat`` event, matched by runId.
+    that is the acceptance receipt ({runId, status}), never the answer.
+    The answer text arrives as ``session.message`` events; the run's terminal
+    ``chat`` event signals completion.
     """
     kind = msg.get("type")
     if kind == "res":
@@ -512,15 +520,36 @@ def _dispatch_ws_message(msg: dict[str, Any]) -> None:
         if future is not None and not future.done():
             future.set_result(msg)
         return
-    if kind != "event" or msg.get("event") != "chat":
+    if kind != "event":
         return
+
+    event_name = msg.get("event")
     payload = msg.get("payload")
-    if not isinstance(payload, dict) or payload.get("state") not in _TERMINAL_CHAT_STATES:
+    if not isinstance(payload, dict):
         return
-    with _ws_pending_lock:
-        future = _ws_runs.pop(str(payload.get("runId") or ""), None)
-    if future is not None and not future.done():
-        future.set_result(payload)
+
+    # Capture assistant messages from session.message events
+    if event_name == "session.message":
+        message = payload.get("message")
+        if isinstance(message, dict) and message.get("role") == "assistant":
+            content = message.get("content")
+            said = content.strip() if isinstance(content, str) else _describe_parts(content)
+            if said:
+                run_id = str(payload.get("runId") or "")
+                with _ws_pending_lock:
+                    _ws_last_assistant[run_id] = said
+        return
+
+    # Terminal chat event: resolve the waiter with the captured answer
+    if event_name == "chat" and payload.get("state") in _TERMINAL_CHAT_STATES:
+        run_id = str(payload.get("runId") or "")
+        with _ws_pending_lock:
+            future = _ws_runs.pop(run_id, None)
+            last_text = _ws_last_assistant.pop(run_id, "")
+        if last_text:
+            payload["message"] = {"content": last_text}
+        if future is not None and not future.done():
+            future.set_result(payload)
 
 
 def _answer_from_chat_event(payload: dict[str, Any]) -> tuple[str, str, bool]:
@@ -532,6 +561,28 @@ def _answer_from_chat_event(payload: dict[str, Any]) -> tuple[str, str, bool]:
     said = content.strip() if isinstance(content, str) else _describe_parts(content)
     if said:
         return said, "", True
+    # No message in the terminal event — fetch the last assistant reply from history
+    session_key = str(payload.get("sessionKey") or "")
+    if session_key:
+        try:
+            history = _ws_request(
+                "chat.history",
+                {"sessionKey": session_key, "limit": 5},
+                timeout=15,
+            )
+            if history.get("ok"):
+                messages = history.get("payload", {}).get("messages", [])
+                for entry in reversed(messages):
+                    if isinstance(entry, dict) and entry.get("role") == "assistant":
+                        text = entry.get("text", "")
+                        if text:
+                            return text.strip(), "", True
+                        parts = entry.get("content")
+                        said2 = _describe_parts(parts)
+                        if said2:
+                            return said2, "", True
+        except Exception as exc:
+            print(f"[OpenClaw] chat.history fallback failed: {exc}")
     if payload.get("state") == "aborted":
         return "", "OpenClaw stopped before it answered.", True
     return "", "OpenClaw finished without an answer to read out.", True
