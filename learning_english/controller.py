@@ -4,7 +4,11 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
-from .catalog import build_catalog, find_listening_activity, find_scenario, find_unit
+from . import activities, placement
+from .catalog import (
+    AUDIENCES, audience_of, build_catalog, find_listening_activity, find_scenario,
+    next_step,
+)
 from .store import LearningProgressStore
 from .types import LearningEnglishState, TutorResponse
 
@@ -25,6 +29,9 @@ class LearningEnglishController:
         self.current_mode = "conversation"
         self.last_response: TutorResponse | None = None
         self.last_summary = ""
+        # Generated activities waiting for answers, answer keys included. They
+        # live only in this process and only for the class that created them.
+        self._activities: dict[str, dict[str, Any]] = {}
         self._event_sink = event_sink
 
     def _emit(self, name: str, payload: dict[str, Any] | None = None) -> None:
@@ -58,7 +65,7 @@ class LearningEnglishController:
     def set_mode(self, mode: str) -> dict[str, Any]:
         allowed = {
             "conversation", "pronunciation", "grammar", "vocabulary",
-            "listening", "quick-lesson", "assessment",
+            "listening", "reading", "writing", "quick-lesson", "assessment",
         }
         if mode not in allowed:
             raise ValueError("Unsupported learning mode")
@@ -76,6 +83,17 @@ class LearningEnglishController:
         self.current_mode = scenario["mode"]
         self.state = LearningEnglishState.LESSON
         self._emit("learningEnglish.scenarioStarted", {"scenario": scenario["id"]})
+        return self.snapshot()
+
+    def end_scenario(self) -> dict[str, Any]:
+        self.store.clear_scenario()
+        self._emit("learningEnglish.scenarioEnded", {})
+        return self.snapshot()
+
+    def set_audience(self, audience: str) -> dict[str, Any]:
+        if audience not in AUDIENCES:
+            raise ValueError("Audience must be kids, teens or adults")
+        self.store.update_profile({"audience": audience})
         return self.snapshot()
 
     def select_unit(self, unit_id: str) -> dict[str, Any]:
@@ -99,6 +117,38 @@ class LearningEnglishController:
             {"activity": activity["id"]},
         )
         return self.snapshot()
+
+    def placement_step(self, answers: Any) -> dict[str, Any]:
+        """One step of the written placement test; the last one saves the level."""
+        audience = audience_of(self.store.snapshot()["profile"])
+        step = placement.advance(answers, audience=audience)
+        if step["done"]:
+            self.store.apply_placement(
+                step["level"], correct=step["correct"], answered=step["answered"]
+            )
+            self._emit("learningEnglish.placementCompleted", {"level": step["level"]})
+        return step
+
+    def register_activity(self, activity: dict[str, Any]) -> dict[str, Any]:
+        """Keep a generated activity's answer key and give back its public side."""
+        if not self.active:
+            raise RuntimeError("Learning English is not active")
+        self._activities[activity["id"]] = activity
+        while len(self._activities) > 6:
+            self._activities.pop(next(iter(self._activities)))
+        return activities.public(activity)
+
+    def submit_activity(self, activity_id: str, answers: Any) -> dict[str, Any]:
+        activity = self._activities.pop(str(activity_id or ""), None)
+        if activity is None:
+            raise ValueError("This activity is no longer open; create a new one")
+        result = activities.grade(activity, answers)
+        self.store.record_activity(result)
+        self._emit(
+            "learningEnglish.activityCompleted",
+            {"kind": result["kind"], "score": result["score"]},
+        )
+        return result
 
     def set_paused(self, paused: bool) -> dict[str, Any]:
         if not self.active:
@@ -142,6 +192,7 @@ class LearningEnglishController:
         self.state = LearningEnglishState.COMPLETING
         self.last_summary = self.summary_text()
         completed = self.store.complete_session(self.last_summary)
+        self._activities.clear()
         self._emit("learningEnglish.sessionCompleted", {"summary": self.last_summary})
         self.state = LearningEnglishState.EXITING
         self.active = False
@@ -153,12 +204,20 @@ class LearningEnglishController:
 
     def snapshot(self) -> dict[str, Any]:
         progress = self.store.snapshot()
+        profile = progress.get("profile", {})
         curriculum = progress.get("curriculum", {})
-        active_scenario = find_scenario(progress.get("active_scenario_id", ""))
-        current_unit = find_unit(curriculum.get("current_unit_id", ""))
-        listening_activity = find_listening_activity(
-            curriculum.get("listening_activity_id", "")
+        catalog = build_catalog(profile, curriculum)
+        # Taken from the catalog so the current unit carries its lesson count.
+        current_unit = next(
+            (
+                {**unit, "level": level["id"]}
+                for level in catalog["levels"]
+                for unit in level["units"]
+                if unit["current"]
+            ),
+            None,
         )
+        review_queue = self.store.due_reviews()
         return {
             "active": self.active,
             "state": self.state.value,
@@ -168,10 +227,13 @@ class LearningEnglishController:
             "currentMode": self.current_mode,
             "lastSummary": self.last_summary,
             "lastResponse": self.last_response.to_dict() if self.last_response else None,
-            "activeScenario": active_scenario,
+            "activeScenario": find_scenario(progress.get("active_scenario_id", "")),
             "currentUnit": current_unit,
-            "activeListeningActivity": listening_activity,
-            "catalog": build_catalog(progress.get("profile", {}), curriculum),
-            "reviewQueue": self.store.due_reviews(),
+            "activeListeningActivity": find_listening_activity(
+                curriculum.get("listening_activity_id", "")
+            ),
+            "catalog": catalog,
+            "reviewQueue": review_queue,
+            "nextStep": next_step(profile, catalog, reviews_due=len(review_queue)),
             **progress,
         }

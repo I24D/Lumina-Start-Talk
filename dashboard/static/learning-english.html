@@ -27,7 +27,7 @@
         <span class="fact"><small>Nivel</small><strong id="header-level">A1</strong></span>
         <span class="fact fact-objective"><small>Objetivo</small><strong id="header-goal">Configurando perfil</strong></span>
         <span class="fact progress-fact"><small>Lección</small><strong id="header-progress">0%</strong></span>
-        <span class="fact"><small>XP</small><strong id="header-xp">0</strong></span>
+        <span class="fact"><small id="xp-label">XP</small><strong id="header-xp">0</strong></span>
         <span class="fact"><small>Racha</small><strong id="header-streak">0 días</strong></span>
       </div>
       <div class="connection-cluster">
@@ -45,22 +45,34 @@
           <div><span class="section-kicker">Tu recorrido</span><h2 id="profile-goal">Inglés práctico</h2><p id="lesson-label">Preparando la primera lección</p></div>
         </section>
 
+        <section class="next-step" id="next-step" aria-live="polite">
+          <span class="section-kicker">Tu siguiente paso</span>
+          <h3 id="next-step-title">Preparando tu plan</h3>
+          <p id="next-step-detail">Lumina elige qué practicar según tu progreso.</p>
+          <button type="button" id="next-step-button">Empezar</button>
+        </section>
+
         <section class="learning-shortcuts" aria-label="Herramientas del curso">
+          <button type="button" data-open-dialog="placement-dialog"><span>◎</span><b>Prueba de nivel</b><small id="placement-current">Sin hacer</small></button>
+          <button type="button" data-open-dialog="roadmap-dialog"><span>⌁</span><b>Ruta CEFR</b><small id="roadmap-current">A1 · Unidad actual</small></button>
+          <button type="button" data-activity="reading"><span>☰</span><b>Lectura guiada</b><small>Toca las palabras nuevas</small></button>
+          <button type="button" data-activity="checkpoint"><span>✓</span><b>Prueba de unidad</b><small id="checkpoint-current">Unidad actual</small></button>
           <button type="button" data-open-dialog="scenario-dialog"><span>◫</span><b>Escenarios</b><small>Situaciones reales</small></button>
           <button type="button" data-open-dialog="listening-dialog"><span>◉</span><b>Listening Lab</b><small id="listening-current">Opción correcta</small></button>
-          <button type="button" data-open-dialog="roadmap-dialog"><span>⌁</span><b>Ruta CEFR</b><small id="roadmap-current">A1 · Unidad actual</small></button>
           <button type="button" data-open-dialog="review-dialog"><span>↻</span><b>Repasar</b><small id="review-count">0 pendientes</small></button>
           <button type="button" data-open-dialog="history-dialog"><span>◷</span><b>Historial</b><small id="history-count">0 clases</small></button>
         </section>
 
         <section>
-          <div class="section-heading"><h3>Modos de aprendizaje</h3><span>7 modos</span></div>
+          <div class="section-heading"><h3>Modos de aprendizaje</h3><span>9 modos</span></div>
           <nav class="mode-list" id="mode-list" aria-label="Modos de aprendizaje">
             <button data-mode="conversation" class="active"><span>◌</span><b>Conversación</b></button>
             <button data-mode="pronunciation"><span>◎</span><b>Pronunciación</b></button>
             <button data-mode="grammar"><span>⌁</span><b>Gramática</b></button>
             <button data-mode="vocabulary"><span>◇</span><b>Vocabulario</b></button>
             <button data-mode="listening"><span>◉</span><b>Comprensión auditiva</b></button>
+            <button data-mode="reading"><span>☰</span><b>Lectura</b></button>
+            <button data-mode="writing"><span>✎</span><b>Escritura</b></button>
             <button data-mode="quick-lesson"><span>ϟ</span><b>Lección rápida</b></button>
             <button data-mode="assessment"><span>✓</span><b>Evaluación de nivel</b></button>
           </nav>
@@ -77,8 +89,8 @@
         </section>
 
         <section class="compact-section">
-          <div class="section-heading"><h3>Actividad semanal</h3><span id="week-total">0 clases</span></div>
-          <div class="week-chart" id="week-chart" aria-label="Actividad semanal"></div>
+          <div class="section-heading"><h3>Meta semanal</h3><span id="week-total">0 de 3 clases</span></div>
+          <div class="week-chart" id="week-chart" aria-label="Clases de los últimos siete días"></div>
         </section>
       </aside>
 
@@ -89,7 +101,7 @@
             <div class="tutor-orb" id="tutor-orb"><span></span></div>
           </div>
           <span class="tutor-state" id="tutor-state"><i></i>Conectando</span>
-          <span class="scenario-pill hidden" id="scenario-pill"></span>
+          <div class="scenario-pill hidden" id="scenario-pill"><span id="scenario-title"></span><button type="button" id="scenario-end" title="Salir del escenario" aria-label="Salir del escenario">✕</button></div>
           <h2 id="lesson-objective">Construyamos tu plan de aprendizaje</h2>
           <p class="lesson-subtitle" id="next-action">Lumina hará una pregunta a la vez y guardará tu progreso.</p>
           <button class="dialog-save hidden" id="start-button" type="button">Empezar clase</button>
@@ -112,12 +124,16 @@
         <div class="onboarding-card" id="onboarding-card">
           <span class="section-kicker">Primeros pasos</span>
           <h3>Una configuración breve, conversando</h3>
-          <p>Responde por voz. También puedes usar una opción rápida; Lumina preguntará solamente lo que falte.</p>
+          <p>Responde por voz. También puedes tocar una opción; Lumina preguntará solamente lo que falte. No necesitas saber inglés para empezar.</p>
           <div class="quick-options">
+            <button data-audience="kids" data-message="La clase es para un niño o una niña.">Es para un niño</button>
+            <button data-audience="teens" data-message="La clase es para un adolescente.">Es para un adolescente</button>
+            <button data-audience="adults" data-message="La clase es para un adulto.">Es para un adulto</button>
             <button data-message="Mi idioma principal es español.">Mi idioma es español</button>
-            <button data-message="Quiero comenzar desde cero, nivel A1.">Comenzar desde cero</button>
-            <button data-message="Quiero hacer una evaluación rápida de nivel.">Evaluar mi nivel</button>
-            <button data-message="Mi objetivo principal es conversar con confianza.">Conversación</button>
+            <button data-message="No sé nada de inglés, quiero empezar desde cero.">No sé nada de inglés</button>
+            <button type="button" data-open-dialog="placement-dialog">Prueba de nivel escrita</button>
+            <button data-message="Mi objetivo principal es conversar con confianza.">Conversar</button>
+            <button data-message="Mi objetivo es mejorar en la escuela.">Escuela</button>
             <button data-message="Mi objetivo es usar inglés en el trabajo.">Trabajo</button>
             <button data-message="Mi objetivo es viajar y comunicarme.">Viajes</button>
           </div>
@@ -164,23 +180,36 @@
   <dialog id="settings-dialog">
     <form method="dialog">
       <div class="dialog-heading"><div><span class="section-kicker">Learning English</span><h2>Preferencias de la clase</h2></div><button value="cancel" aria-label="Cerrar">×</button></div>
+      <label>La clase es para<select id="audience-select"><option value="kids">Un niño o una niña (6 a 12 años)</option><option value="teens">Un adolescente (13 a 17 años)</option><option value="adults" selected>Un adulto</option></select></label>
       <label>Velocidad preferida<select id="speed-select"><option value="slow">Lenta</option><option value="normal" selected>Normal</option><option value="natural">Natural</option></select></label>
       <label>Mostrar traducciones<select id="translation-select"><option value="true">Cuando sean necesarias</option><option value="false">Solo inglés</option></select></label>
+      <label>Meta semanal<select id="weekly-select"><option value="1">1 clase</option><option value="2">2 clases</option><option value="3" selected>3 clases</option><option value="4">4 clases</option><option value="5">5 clases</option><option value="7">Todos los días</option></select></label>
       <p>La evaluación fonética avanzada está desacoplada. Con la transcripción actual, Lumina evalúa inteligibilidad sin fingir puntuaciones por fonema.</p>
       <div class="provider-list" id="provider-list"></div>
       <button class="dialog-save" id="save-settings" value="default">Guardar</button>
     </form>
   </dialog>
 
+  <dialog id="placement-dialog" class="review-dialog">
+    <div class="dialog-heading"><div><span class="section-kicker">Nivel provisional</span><h2>Prueba de nivel</h2></div><button type="button" data-close-dialog="placement-dialog" aria-label="Cerrar">×</button></div>
+    <div id="placement-body" class="quiz-body"></div>
+  </dialog>
+
+  <dialog id="activity-dialog" class="wide-dialog">
+    <div class="dialog-heading"><div><span class="section-kicker" id="activity-kicker">Práctica</span><h2 id="activity-title">Preparando…</h2></div><button type="button" data-close-dialog="activity-dialog" aria-label="Cerrar">×</button></div>
+    <div id="activity-body" class="quiz-body"></div>
+  </dialog>
+
   <dialog id="scenario-dialog" class="wide-dialog">
     <div class="dialog-heading"><div><span class="section-kicker">Práctica situada</span><h2>Elige un escenario real</h2></div><button type="button" data-close-dialog="scenario-dialog" aria-label="Cerrar">×</button></div>
-    <p>La maestra asumirá un rol, ajustará el vocabulario a tu nivel y evaluará el objetivo concreto de la situación.</p>
+    <p>La maestra asumirá un rol, ajustará el vocabulario a tu nivel y evaluará el objetivo concreto de la situación. Primero aparecen los pensados para tu edad.</p>
     <div class="scenario-grid" id="scenario-grid"></div>
   </dialog>
 
   <dialog id="roadmap-dialog" class="wide-dialog">
-    <div class="dialog-heading"><div><span class="section-kicker">Currículo propio de Lumina</span><h2>Ruta de aprendizaje A1–C2</h2></div><button type="button" data-close-dialog="roadmap-dialog" aria-label="Cerrar">×</button></div>
-    <p>Cada unidad define qué practicar y en qué orden; Gemini enseña dentro de esos límites.</p>
+    <div class="dialog-heading"><div><span class="section-kicker">Currículo propio de Lumina</span><h2>Ruta de aprendizaje desde cero hasta C2</h2></div><button type="button" data-close-dialog="roadmap-dialog" aria-label="Cerrar">×</button></div>
+    <p>Cada unidad define qué practicar y en qué orden; Gemini enseña dentro de esos límites. Una unidad se completa al terminar sus lecciones o al aprobar su prueba.</p>
+    <div class="roadmap-note hidden" id="roadmap-note"><p id="roadmap-note-copy"></p><button type="button" data-mode-shortcut="assessment">Evaluación de nivel</button></div>
     <div class="roadmap" id="roadmap"></div>
   </dialog>
 

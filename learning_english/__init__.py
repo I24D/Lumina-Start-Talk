@@ -1,8 +1,9 @@
 """Learning English mode for Lumina Start Talk.
 
-The package intentionally owns educational state, validation and persistence.
-Audio capture/playback stays in :mod:`main`, where the proven Gemini Live path
-already guarantees that only one microphone and one speaker stream exist.
+The package owns the course: curriculum, placement test, generated practice,
+validation and persistence. The class itself talks through its own Gemini Live
+session in the studio page, with the browser's microphone; Lumina's server only
+mints that session's token and keeps the progress.
 """
 
 from .controller import LearningEnglishController

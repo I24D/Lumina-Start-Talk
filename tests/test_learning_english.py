@@ -218,8 +218,11 @@ class LearningCatalogAndReviewTests(unittest.TestCase):
             {"level": "B1", "goal": "I need English for travel"},
             {"current_unit_id": "b1-work", "completed_units": ["a1-foundations"]},
         )
-        self.assertEqual([item["id"] for item in catalog["levels"]], ["A1", "A2", "B1", "B2", "C1", "C2"])
-        self.assertEqual(sum(len(item["units"]) for item in catalog["levels"]), 18)
+        self.assertEqual(
+            [item["id"] for item in catalog["levels"]],
+            ["PRE-A1", "A1", "A2", "B1", "B2", "C1", "C2"],
+        )
+        self.assertEqual(sum(len(item["units"]) for item in catalog["levels"]), 21)
         self.assertEqual(catalog["recommendedScenarioId"], "hotel-checkin")
         self.assertEqual(
             [item["id"] for item in catalog["listeningActivities"]],
@@ -342,11 +345,14 @@ class LearningProgressTests(unittest.TestCase):
         controller = LearningEnglishController(self.store)
         controller.enter("test")
         self.store.update_profile({"level": "B1"})
-        controller.select_scenario("job-interview")
+        self.assertEqual(
+            controller.select_scenario("job-interview")["activeScenario"]["id"], "job-interview"
+        )
         snapshot = controller.select_unit("b1-work")
         snapshot = controller.select_listening_activity("missing-word")
         session = snapshot["sessions"][-1]
-        self.assertEqual(snapshot["activeScenario"]["id"], "job-interview")
+        # A unit lesson ends the role-play; the class keeps its record of it.
+        self.assertIsNone(snapshot["activeScenario"])
         self.assertEqual(snapshot["currentUnit"]["id"], "b1-work")
         self.assertEqual(session["scenario_id"], "job-interview")
         self.assertEqual(session["unit_id"], "b1-work")
@@ -435,7 +441,8 @@ class LearningWebApiTests(unittest.TestCase):
         page = self.client.get("/learning-english")
         self.assertEqual(page.status_code, 200)
         self.assertIn("English Learning Studio", page.text)
-        self.assertIn("Ruta de aprendizaje A1–C2", page.text)
+        self.assertIn("Ruta de aprendizaje desde cero hasta C2", page.text)
+        self.assertIn("Prueba de nivel", page.text)
         self.assertIn("Repaso inteligente", page.text)
         self.assertIn("Elige un escenario real", page.text)
         self.assertNotIn("gemini_api_key", page.text)

@@ -1,9 +1,10 @@
-"""Gemini services for the English tutor: the browser's live session token and
-the structured analysis of each finished turn."""
+"""Gemini services for the English tutor: the browser's live session token,
+the structured analysis of each finished turn, and generated practice."""
 
 from __future__ import annotations
 
 import json
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -12,6 +13,8 @@ from google import genai
 from google.genai import types
 
 from memory.config_manager import get_gemini_key
+from .activities import build_request as build_activity_request
+from .activities import schema_for, validate as validate_activity
 from .providers import LanguageToolProvider, OpenPronounceProvider
 from .types import Correction, TutorResponse
 
@@ -20,9 +23,14 @@ PROMPT_PATH = Path(__file__).parent / "prompts" / "english_tutor.txt"
 # The tutor talks through its own Live session in the browser. 3.1 Flash Live is
 # the newest live voice model this key can open: measured on 2026-09-13 through
 # an ephemeral token, first audio came 0.80 s after the speech ended, against
-# 1.43 s for 2.5 native audio. 3.6 Flash has no live voice, so it analyses turns.
+# 1.43 s for 2.5 native audio. 3.6 Flash has no live voice, so it analyses turns
+# and writes the practice activities.
 LIVE_MODEL = "models/gemini-3.1-flash-live-preview"
 MODEL = "gemini-3.6-flash"
+# Free-tier text quotas are per model and per day: 3.6 Flash allowed 20 requests
+# a day on 2026-09-14, and every analysed turn spends one. When a model's quota
+# is spent, the next lighter model takes over instead of the corrections stopping.
+TEXT_MODELS = (MODEL, "gemini-3.5-flash-lite", "gemini-2.5-flash-lite")
 
 _RESPONSE_SCHEMA = {
     "type": "object",
@@ -32,7 +40,10 @@ _RESPONSE_SCHEMA = {
         "uiLanguage": {"type": "string"},
         "exerciseType": {
             "type": "string",
-            "enum": ["conversation", "pronunciation", "grammar", "vocabulary", "listening", "quick-lesson", "assessment"],
+            "enum": [
+                "conversation", "pronunciation", "grammar", "vocabulary", "listening",
+                "reading", "writing", "quick-lesson", "assessment",
+            ],
         },
         "corrections": {
             "type": "array",
@@ -68,7 +79,8 @@ _RESPONSE_SCHEMA = {
             "type": "object",
             "properties": {
                 "primary_language": {"type": "string"},
-                "level": {"type": "string", "enum": ["A1", "A2", "B1", "B2", "C1", "C2"]},
+                "audience": {"type": "string", "enum": ["kids", "teens", "adults"]},
+                "level": {"type": "string", "enum": ["PRE-A1", "A1", "A2", "B1", "B2", "C1", "C2"]},
                 "goal": {"type": "string"},
                 "strengths": {"type": "string"},
                 "difficulties": {"type": "string"},
@@ -85,6 +97,14 @@ _RESPONSE_SCHEMA = {
 }
 
 
+def _quota_spent(exc: Exception) -> bool:
+    return getattr(exc, "code", None) == 429 or "RESOURCE_EXHAUSTED" in str(exc)
+
+
+def _busy(exc: Exception) -> bool:
+    return getattr(exc, "code", None) in (500, 503) or "UNAVAILABLE" in str(exc)
+
+
 class LearningEnglishService:
     def __init__(
         self,
@@ -92,15 +112,19 @@ class LearningEnglishService:
         api_key_loader: Callable[[], str | None] = get_gemini_key,
         generator: Callable[..., Any] | None = None,
         token_factory: Callable[[dict[str, Any]], str] | None = None,
+        client_factory: Callable[[str], Any] | None = None,
         grammar_provider: LanguageToolProvider | None = None,
         pronunciation_provider: OpenPronounceProvider | None = None,
     ):
         self._api_key_loader = api_key_loader
         self._generator = generator
         self._token_factory = token_factory
+        self._client_factory = client_factory or (lambda key: genai.Client(api_key=key))
         self._grammar = grammar_provider or LanguageToolProvider()
         self._pronunciation = pronunciation_provider or OpenPronounceProvider()
         self._system_prompt = PROMPT_PATH.read_text(encoding="utf-8")
+        # Text models whose quota ran out, and until when they are skipped.
+        self._spent_until: dict[str, float] = {}
 
     def provider_status(self) -> list[dict[str, Any]]:
         return [self._grammar.status(), self._pronunciation.status()]
@@ -124,6 +148,7 @@ class LearningEnglishService:
             "last_lesson": last_lesson,
             "active_scenario": snapshot.get("activeScenario"),
             "current_unit": snapshot.get("currentUnit"),
+            "level_complete": bool((snapshot.get("catalog") or {}).get("levelComplete")),
             "listening_activity": snapshot.get("activeListeningActivity"),
             "reviews_due": [
                 {"word": item.get("word"), "meaning": item.get("meaning")}
@@ -202,6 +227,53 @@ class LearningEnglishService:
             "opening": "" if resume_handle else self.opening_instruction(snapshot),
         }
 
+    def _generate_json(
+        self,
+        request: dict[str, Any],
+        schema: dict[str, Any],
+        *,
+        system_instruction: str,
+        temperature: float,
+        max_output_tokens: int,
+    ) -> str:
+        """JSON text from the first text model that still has quota."""
+        key = self._api_key_loader()
+        if not key:
+            raise RuntimeError("Gemini API key is not configured")
+        client = self._client_factory(key)
+        failure: Exception | None = None
+        for model in TEXT_MODELS:
+            if self._spent_until.get(model, 0.0) > time.monotonic():
+                continue
+            try:
+                response = client.models.generate_content(
+                    model=model,
+                    contents=json.dumps(request, ensure_ascii=False),
+                    config=types.GenerateContentConfig(
+                        system_instruction=system_instruction,
+                        response_mime_type="application/json",
+                        response_json_schema=schema,
+                        temperature=temperature,
+                        max_output_tokens=max_output_tokens,
+                    ),
+                )
+            except Exception as exc:
+                if _quota_spent(exc):
+                    # A daily limit stays spent for hours; a per-minute one clears fast.
+                    wait = 3600 if "PerDay" in str(exc) else 60
+                    self._spent_until[model] = time.monotonic() + wait
+                    print(f"[Learning English] {model} is out of quota; trying the next model")
+                elif _busy(exc):
+                    # Overloaded for this request only (measured: a 503 from
+                    # 3.5 Flash-Lite that the next request did not repeat).
+                    print(f"[Learning English] {model} is busy; trying the next model")
+                else:
+                    raise
+                failure = exc
+                continue
+            return response.text
+        raise failure or RuntimeError("RESOURCE_EXHAUSTED: every Gemini text model is out of quota")
+
     def analyze_turn(
         self,
         *,
@@ -217,7 +289,9 @@ class LearningEnglishService:
             lesson_progress=self._current_progress(snapshot),
             next_action="Continúa con una pregunta o ejercicio breve.",
         )
-        if not user_text and not assistant_text:
+        if not user_text:
+            # Only the tutor spoke: there is nothing to correct, and skipping
+            # it keeps the daily model quota for the student's own turns.
             return fallback
 
         grammar_findings = self._grammar.check(user_text)
@@ -238,6 +312,8 @@ class LearningEnglishService:
                 "Use pronunciation only for intelligibility or an approximate reading aid.",
                 "Copy actualTutorText into assistantText and speechText.",
                 "Profile updates must contain only facts clearly supplied by the student.",
+                "Set profileUpdates.audience only when the student said the class is "
+                "for a child, a teenager or an adult.",
                 "lessonProgress must never be lower than currentProgress.",
             ],
         }
@@ -245,26 +321,17 @@ class LearningEnglishService:
             if self._generator:
                 raw = self._generator(request=request, schema=_RESPONSE_SCHEMA)
             else:
-                key = self._api_key_loader()
-                if not key:
-                    return fallback
-                client = genai.Client(api_key=key)
-                response = client.models.generate_content(
-                    model=MODEL,
-                    contents=json.dumps(request, ensure_ascii=False),
-                    config=types.GenerateContentConfig(
-                        system_instruction=(
-                            "You are the structured evaluator for Lumina Learning. "
-                            "Return only the requested JSON. The live tutor already spoke; "
-                            "analyze that turn without creating a second answer."
-                        ),
-                        response_mime_type="application/json",
-                        response_json_schema=_RESPONSE_SCHEMA,
-                        temperature=0.1,
-                        max_output_tokens=1800,
+                raw = self._generate_json(
+                    request,
+                    _RESPONSE_SCHEMA,
+                    system_instruction=(
+                        "You are the structured evaluator for Lumina Learning. "
+                        "Return only the requested JSON. The live tutor already spoke; "
+                        "analyze that turn without creating a second answer."
                     ),
+                    temperature=0.1,
+                    max_output_tokens=1800,
                 )
-                raw = response.text
             if isinstance(raw, str):
                 raw = json.loads(raw)
             parsed = TutorResponse.from_mapping(raw, fallback_assistant_text=assistant_text)
@@ -295,6 +362,32 @@ class LearningEnglishService:
                 if correction:
                     fallback.corrections.append(correction)
             return fallback
+
+    def generate_activity(self, kind: str, snapshot: dict[str, Any]) -> dict[str, Any]:
+        """A checkpoint or guided reading for the current unit, validated.
+
+        Raises ValueError when the content cannot be used. The returned activity
+        still carries its answer key, which only Lumina's server keeps."""
+        request = build_activity_request(kind, snapshot)
+        schema = schema_for(kind)
+        if self._generator:
+            raw = self._generator(request=request, schema=schema)
+        else:
+            raw = self._generate_json(
+                request,
+                schema,
+                system_instruction=(
+                    "You write practice material for Lumina Learning, an English "
+                    "course for children, teenagers and adults. Return only the "
+                    "requested JSON."
+                ),
+                temperature=0.7,
+                max_output_tokens=6000,
+            )
+        if isinstance(raw, str):
+            raw = json.loads(raw)
+        unit = snapshot.get("currentUnit") or {}
+        return validate_activity(kind, raw, unit_id=str(unit.get("id") or ""))
 
     def analyze_pronunciation_file(
         self, audio_path: str, expected_text: str

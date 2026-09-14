@@ -24,6 +24,8 @@ EXERCISE_TYPES = {
     "grammar",
     "vocabulary",
     "listening",
+    "reading",
+    "writing",
     "quick-lesson",
     "assessment",
 }
@@ -148,6 +150,7 @@ class TutorResponse:
         if isinstance(updates, dict):
             allowed = {
                 "primary_language",
+                "audience",
                 "level",
                 "goal",
                 "strengths",

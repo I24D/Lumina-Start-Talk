@@ -9,12 +9,16 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
 from memory.memory_manager import load_memory, save_memory
-from .catalog import build_catalog, find_listening_activity, find_scenario, find_unit
+from .activities import PASS_SCORE
+from .catalog import (
+    AUDIENCES, build_catalog, find_listening_activity, find_scenario, find_unit,
+    next_unit_id,
+)
 from .review import ReviewScheduler
 from .types import TutorResponse
 
 
-_LEVELS = {"A1", "A2", "B1", "B2", "C1", "C2"}
+_LEVELS = {"PRE-A1", "A1", "A2", "B1", "B2", "C1", "C2"}
 _REVIEW_SCHEDULER = ReviewScheduler()
 
 
@@ -27,6 +31,8 @@ def _default_document() -> dict[str, Any]:
         "version": 2,
         "profile": {
             "primary_language": "",
+            # kids, teens or adults; empty until the student says.
+            "audience": "",
             "level": "A1",
             "level_confirmed": False,
             "goal": "",
@@ -47,12 +53,19 @@ def _default_document() -> dict[str, Any]:
             "grammar": 0,
             "vocabulary": 0,
             "listening": 0,
+            "reading": 0,
+            "writing": 0,
         },
         "weekly_activity": [],
         "curriculum": {
             "current_unit_id": "a1-foundations",
             "listening_activity_id": "multiple-choice",
             "completed_units": [],
+            # Lessons finished per unit; a unit completes at its lesson count.
+            "unit_lessons": {},
+            "completed_scenarios": [],
+            # Best checkpoint score per unit; passing one completes the unit.
+            "checkpoints": {},
             "weekly_target": 3,
         },
         "metrics": {
@@ -63,6 +76,8 @@ def _default_document() -> dict[str, Any]:
             "successful_reviews": 0,
             "last_activity_date": "",
         },
+        "placement": None,
+        "activity_log": [],
         "last_lesson": None,
     }
 
@@ -73,15 +88,30 @@ def _normalise_document(raw: Any) -> dict[str, Any]:
         return default
     result = copy.deepcopy(default)
     for key in result:
-        if key in raw and isinstance(raw[key], type(result[key])):
-            result[key] = copy.deepcopy(raw[key])
+        if key not in raw:
+            continue
+        value = raw[key]
+        # None marks an optional record (last lesson, placement) that is saved
+        # as a dict; comparing types alone dropped it on every reload.
+        if isinstance(value, type(result[key])) or (result[key] is None and isinstance(value, dict)):
+            result[key] = copy.deepcopy(value)
     result["profile"] = {**default["profile"], **result.get("profile", {})}
+    result["skill_progress"] = {**default["skill_progress"], **result["skill_progress"]}
     result["curriculum"] = {
         **default["curriculum"], **result.get("curriculum", {})
     }
+    curriculum = result["curriculum"]
+    for key in ("unit_lessons", "checkpoints"):
+        if not isinstance(curriculum.get(key), dict):
+            curriculum[key] = {}
+    for key in ("completed_units", "completed_scenarios"):
+        if not isinstance(curriculum.get(key), list):
+            curriculum[key] = []
     result["metrics"] = {**default["metrics"], **result.get("metrics", {})}
     level = str(result["profile"].get("level", "A1")).upper()
     result["profile"]["level"] = level if level in _LEVELS else "A1"
+    if result["profile"].get("audience") not in AUDIENCES:
+        result["profile"]["audience"] = ""
     result["version"] = 2
     for item in result.get("vocabulary", []):
         if isinstance(item, dict) and not isinstance(item.get("srs"), dict):
@@ -90,6 +120,17 @@ def _normalise_document(raw: Any) -> dict[str, Any]:
             item["review_count"] = int(item.get("review_count", 0))
             item["last_rating"] = str(item.get("last_rating", ""))
     return result
+
+
+def _profile_value(key: str, value: Any) -> Any:
+    """A validated profile value, or None when it must be ignored."""
+    if key == "level":
+        value = str(value).upper()
+        return value if value in _LEVELS else None
+    if key == "audience":
+        value = str(value).lower()
+        return value if value in AUDIENCES else None
+    return value
 
 
 class LearningProgressStore:
@@ -172,29 +213,36 @@ class LearningProgressStore:
         if not isinstance(updates, dict):
             return
         allowed = {
-            "primary_language", "level", "goal", "strengths", "difficulties",
-            "preferred_speed", "current_objective",
+            "primary_language", "audience", "level", "goal", "strengths",
+            "difficulties", "preferred_speed", "current_objective",
         }
         with self._lock:
-            profile = self._load()["profile"]
+            doc = self._load()
+            profile = doc["profile"]
+            level_before = profile.get("level")
             for key in allowed:
                 value = updates.get(key)
                 if value in (None, "", []):
                     continue
+                value = _profile_value(key, value)
+                if value is None:
+                    continue
                 if key == "level":
-                    value = str(value).upper()
-                    if value not in _LEVELS:
-                        continue
                     profile["level_confirmed"] = True
                 profile[key] = value
+            if profile.get("level") != level_before:
+                self._advance_unit(doc)
             self._commit()
 
     def set_mode(self, mode: str) -> None:
         with self._lock:
+            doc = self._load()
+            # A new mode ends any role-play; the session keeps its scenario_id.
+            doc["active_scenario_id"] = ""
             session = self._current_session()
             if session:
                 session["mode"] = str(mode or "conversation")
-                self._commit()
+            self._commit()
 
     def set_scenario(self, scenario_id: str) -> dict[str, Any]:
         scenario = find_scenario(str(scenario_id or ""))
@@ -218,6 +266,13 @@ class LearningProgressStore:
             self._commit()
         return scenario
 
+    def clear_scenario(self) -> None:
+        with self._lock:
+            doc = self._load()
+            if doc.get("active_scenario_id"):
+                doc["active_scenario_id"] = ""
+                self._commit()
+
     def set_unit(self, unit_id: str) -> dict[str, Any]:
         unit = find_unit(str(unit_id or ""))
         if not unit:
@@ -235,6 +290,8 @@ class LearningProgressStore:
                 raise ValueError("This unit is locked for the current CEFR level")
             doc["curriculum"]["current_unit_id"] = unit["id"]
             doc["profile"]["current_objective"] = unit["objective"]
+            # A unit lesson replaces any role-play.
+            doc["active_scenario_id"] = ""
             session = self._current_session()
             if session:
                 session["unit_id"] = unit["id"]
@@ -249,11 +306,74 @@ class LearningProgressStore:
         with self._lock:
             doc = self._load()
             doc["curriculum"]["listening_activity_id"] = activity["id"]
+            doc["active_scenario_id"] = ""
             session = self._current_session()
             if session:
                 session["mode"] = "listening"
             self._commit()
         return activity
+
+    def set_weekly_target(self, target: Any) -> None:
+        try:
+            value = int(target)
+        except (TypeError, ValueError):
+            raise ValueError("Weekly target must be a number of classes") from None
+        if not 1 <= value <= 7:
+            raise ValueError("Weekly target must be between 1 and 7 classes")
+        with self._lock:
+            self._load()["curriculum"]["weekly_target"] = value
+            self._commit()
+
+    def apply_placement(self, level: str, *, correct: int, answered: int) -> None:
+        """The written placement test's level, and the first unit of that level."""
+        level = str(level or "").upper()
+        if level not in _LEVELS:
+            raise ValueError("Unknown CEFR level")
+        with self._lock:
+            doc = self._load()
+            doc["profile"]["level"] = level
+            doc["profile"]["level_confirmed"] = True
+            doc["placement"] = {
+                "level": level, "correct": int(correct), "answered": int(answered), "at": _now(),
+            }
+            self._advance_unit(doc)
+            self._touch_activity(doc)
+            self._commit()
+
+    def record_activity(self, result: dict[str, Any]) -> None:
+        """Keep a graded checkpoint or reading; a passed checkpoint completes its unit."""
+        with self._lock:
+            doc = self._load()
+            kind = str(result.get("kind") or "")
+            unit_id = str(result.get("unitId") or "")
+            score = max(0, min(100, int(result.get("score", 0))))
+            doc["activity_log"].append({
+                "kind": kind,
+                "title": str(result.get("title") or "")[:120],
+                "unit_id": unit_id,
+                "score": score,
+                "at": _now(),
+            })
+            doc["activity_log"] = doc["activity_log"][-20:]
+            doc["metrics"]["xp"] = int(doc["metrics"].get("xp", 0)) + 2 + score // 10
+            self._touch_activity(doc)
+            if kind == "reading":
+                skills = doc["skill_progress"]
+                skills["reading"] = max(int(skills.get("reading", 0)), score)
+            unit = find_unit(unit_id)
+            if kind == "checkpoint" and unit:
+                curriculum = doc["curriculum"]
+                previous = curriculum["checkpoints"].get(unit_id)
+                previous = previous if isinstance(previous, dict) else {}
+                curriculum["checkpoints"][unit_id] = {
+                    "best": max(score, int(previous.get("best", 0))),
+                    "passed": bool(previous.get("passed")) or score >= PASS_SCORE,
+                    "at": _now(),
+                }
+                if score >= PASS_SCORE and unit_id not in curriculum["completed_units"]:
+                    curriculum["completed_units"].append(unit_id)
+                    self._advance_unit(doc)
+            self._commit()
 
     def _current_session(self) -> dict[str, Any] | None:
         doc = self._load()
@@ -293,19 +413,24 @@ class LearningProgressStore:
                 int(session.get("progress", 0)), response.lesson_progress
             )
             session["mode"] = response.exercise_type
-            self._touch_activity(doc)
-            doc["metrics"]["total_turns"] = int(doc["metrics"].get("total_turns", 0)) + 1
-            doc["metrics"]["xp"] = int(doc["metrics"].get("xp", 0)) + 5
+            # Only the student's own turns count as practice.
+            if str(user_text or "").strip():
+                self._touch_activity(doc)
+                doc["metrics"]["total_turns"] = int(doc["metrics"].get("total_turns", 0)) + 1
+                doc["metrics"]["xp"] = int(doc["metrics"].get("xp", 0)) + 5
 
             if response.profile_updates:
                 profile = doc["profile"]
+                level_before = profile.get("level")
                 for key, value in response.profile_updates.items():
+                    value = _profile_value(key, value)
+                    if value is None:
+                        continue
                     if key == "level":
-                        value = str(value).upper()
-                        if value not in _LEVELS:
-                            continue
                         profile["level_confirmed"] = True
                     profile[key] = value
+                if profile.get("level") != level_before:
+                    self._advance_unit(doc)
 
             for item in response.new_vocabulary:
                 self._upsert_vocabulary(doc, item.word, item.meaning, item.example)
@@ -333,12 +458,54 @@ class LearningProgressStore:
             if skill in doc["skill_progress"]:
                 old = int(doc["skill_progress"].get(skill, 0))
                 doc["skill_progress"][skill] = max(old, response.lesson_progress)
-            if response.lesson_progress >= 100:
-                current_unit = str(doc.get("curriculum", {}).get("current_unit_id") or "")
-                completed = doc["curriculum"].setdefault("completed_units", [])
-                if current_unit and current_unit not in completed:
-                    completed.append(current_unit)
+            # A placement test reaching 100% sets the level; it is not a lesson.
+            if response.lesson_progress >= 100 and response.exercise_type != "assessment":
+                self._finish_lesson(doc, session)
             self._commit()
+
+    @classmethod
+    def _finish_lesson(cls, doc: dict[str, Any], session: dict[str, Any]) -> None:
+        """Credit a lesson that reached 100% once per class: to the role-play
+        when a scenario is running, otherwise to the unit this class works on.
+
+        The class's own unit_id is used, not the curriculum's current unit, so
+        a unit that just completed and moved the route on cannot credit the next
+        unit from the same finished lesson."""
+        curriculum = doc["curriculum"]
+        counted = session.setdefault("counted_lessons", [])
+        scenario_id = str(doc.get("active_scenario_id") or "")
+        if scenario_id:
+            if f"scenario:{scenario_id}" not in counted:
+                counted.append(f"scenario:{scenario_id}")
+                if scenario_id not in curriculum["completed_scenarios"]:
+                    curriculum["completed_scenarios"].append(scenario_id)
+            return
+        unit_id = str(session.get("unit_id") or "")
+        unit = find_unit(unit_id)
+        if not unit or f"unit:{unit_id}" in counted:
+            return
+        counted.append(f"unit:{unit_id}")
+        lessons = curriculum["unit_lessons"]
+        lessons[unit_id] = min(unit["lessons"], int(lessons.get(unit_id, 0)) + 1)
+        completed = curriculum["completed_units"]
+        if lessons[unit_id] >= unit["lessons"] and unit_id not in completed:
+            completed.append(unit_id)
+            cls._advance_unit(doc)
+
+    @staticmethod
+    def _advance_unit(doc: dict[str, Any]) -> None:
+        """Keep the current unit on the student's level: move on from a finished
+        unit, or to the level's first unfinished unit after a level change."""
+        curriculum = doc["curriculum"]
+        completed = curriculum["completed_units"]
+        level = doc["profile"].get("level", "A1")
+        current = find_unit(str(curriculum.get("current_unit_id") or ""))
+        if current and current["level"] == level and current["id"] not in completed:
+            return
+        next_id = next_unit_id(level, completed)
+        if next_id:
+            curriculum["current_unit_id"] = next_id
+            doc["profile"]["current_objective"] = find_unit(next_id)["objective"]
 
     @staticmethod
     def _upsert_vocabulary(doc: dict[str, Any], word: str, meaning: str, example: str) -> None:
@@ -463,6 +630,8 @@ class LearningProgressStore:
                 doc["weekly_activity"] = doc["weekly_activity"][-7:]
                 doc["metrics"]["xp"] = int(doc["metrics"].get("xp", 0)) + 20
                 self._touch_activity(doc)
+            # A role-play belongs to its class: the next class opens as the teacher.
+            doc["active_scenario_id"] = ""
             doc["profile"]["last_class_at"] = _now()
             doc["current_session_id"] = ""
             self._commit()

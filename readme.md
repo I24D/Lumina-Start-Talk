@@ -68,7 +68,7 @@ It's not just an assistant — it's an extension of your digital life.
 ### Core Features
 | Feature | Description |
 |---|---|
-| 🎓 Learning English | Dedicated browser studio with Gemini Live voice lessons, CEFR profile, structured corrections, vocabulary and persistent progress |
+| 🎓 Learning English | Browser studio for children, teens and adults, from zero English to C2: Gemini Live voice lessons, placement test, CEFR route, scenarios, guided reading, corrections and FSRS reviews |
 | 🎙️ Voice Picker | Choose from 5 native Gemini voices and switch live from the UI — no restart |
 | 🎨 Live Theming | Recolour the entire HUD from a hue wheel or hex — applied instantly across every panel |
 | 〰️ Reactive HUD | Waveform and reactor core pulse to real audio — your mic while listening, LUMINA while speaking |
@@ -150,15 +150,47 @@ cancellation, the tutor's own voice, and no tools. Lumina's server only mints a
 single-use ephemeral token — model, teacher prompt, voice and transcription are
 locked inside it, and the API key never reaches the browser. While a class is
 open, Lumina's general assistant keeps its tools but pauses its microphone and
-voice. Each finished turn is analysed on `gemini-3.6-flash` into validated
-structured corrections, vocabulary and progress.
+voice. Each finished student turn is analysed into validated structured
+corrections, vocabulary and progress.
 
-The studio now adds an original Lumina curriculum with 18 units across CEFR
-A1–C2, nine role-play scenarios, course history, XP, streaks and four Listening
-Lab mechanics. Vocabulary is scheduled with the official Python FSRS package,
-so review dates come from a real spaced-repetition algorithm rather than from
-Gemini. The browser microphone and the tutor's Live session remain separate by
-design; the general assistant still pauses its own input for the whole class.
+**For every learner.** The class adapts to a child (6–12), a teenager (13–17)
+or an adult: tone, topics, scenarios and pace change, children are never asked
+for personal data, and the studio switches to larger type and stars. Nobody
+needs to know any English: the route starts at **Pre-A1 “Desde cero”** (sounds,
+first words, greetings) with explanations in the student's own language, and
+climbs through an original Lumina curriculum of 21 units up to C2.
+
+**Course tools in the studio:**
+
+- **Tu siguiente paso** — one recommendation decided by the course, not by
+  Gemini: the placement test, due reviews, the current unit or the level
+  assessment.
+- **Prueba de nivel** — an adaptive written placement test (Pre-A1 to C1) that
+  settles in a few questions. The answer key and the grading stay on Lumina's
+  server; the tutor then confirms the level by conversation.
+- **Ruta CEFR** — a unit completes after its lessons (one per class that reaches
+  100%) or when its **Prueba de unidad** is passed with 80%. Finishing a level's
+  units never promotes on its own; the level assessment does.
+- **Lectura guiada** — a graded reading with a tappable glossary, a translation
+  on demand, the tutor reading it aloud and comprehension questions. Tapped
+  words go straight into review.
+- **Escenarios** — 16 role-plays, from the classroom and pets for children to
+  online gaming for teenagers and job interviews for adults. Choosing a mode,
+  unit or activity, the ✕ on the scenario pill, or the end of the class ends the
+  role-play.
+- **Repasar** — flashcards scheduled by the official Python FSRS package; the
+  meaning stays hidden until the student has tried to recall it.
+- **Listening Lab**, nine learning modes including reading and writing, class
+  history, XP (stars for children), streaks and a weekly goal.
+
+Checkpoints and readings are written by Gemini inside the unit's limits, then
+validated and graded by Lumina, so a score never comes from the model's opinion.
+Free-tier text quotas are per model and per day (`gemini-3.6-flash` allowed 20
+requests a day), so analysis and activities move on to `gemini-3.5-flash-lite`
+and then `gemini-2.5-flash-lite` when a quota is spent, and turns where only the
+tutor spoke are not analysed at all. The browser microphone and the tutor's Live
+session remain separate by design; the general assistant still pauses its own
+input for the whole class.
 
 Two local providers are optional and isolated behind Lumina-owned adapters:
 

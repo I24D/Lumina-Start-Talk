@@ -1836,10 +1836,52 @@ class JarvisLive:
             raise RuntimeError(
                 "OpenPronounce is not installed or its local service is unavailable"
             )
-        self._broadcast_learning({
-            "type": "learning.pronunciation", "result": result
-        })
         return result
+
+    async def _learning_placement(self, answers: list) -> dict:
+        """One step of the studio's written placement test."""
+        if not self._learning.active:
+            raise RuntimeError("Learning English is not active")
+        step = self._learning.placement_step(answers)
+        snapshot = self._learning_snapshot()
+        if step["done"]:
+            self._broadcast_learning({"type": "learning.snapshot", "state": snapshot})
+        return {"step": step, "state": snapshot}
+
+    async def _learning_activity(self, op: str, body: dict) -> dict:
+        """Create a generated checkpoint or reading, or grade the answers to one."""
+        if not self._learning.active:
+            raise RuntimeError("Learning English is not active")
+        if op == "submit":
+            result = self._learning.submit_activity(
+                str(body.get("activity_id") or ""), body.get("answers")
+            )
+            snapshot = self._learning_snapshot()
+            self._broadcast_learning({"type": "learning.snapshot", "state": snapshot})
+            return {"result": result, "state": snapshot}
+        kind = str(body.get("kind") or "")
+        snapshot = self._learning_snapshot()
+        try:
+            activity = await asyncio.get_running_loop().run_in_executor(
+                None, lambda: self._learning_service.generate_activity(kind, snapshot)
+            )
+        except ValueError as exc:
+            # Unusable content; the provider's text is never logged.
+            print(f"[Learning English] Activity rejected ({type(exc).__name__}: {exc})")
+            raise RuntimeError(
+                "Lumina no pudo preparar la actividad. Inténtalo de nuevo."
+            ) from None
+        except Exception as exc:
+            print(f"[Learning English] Activity generation failed ({type(exc).__name__})")
+            # The analysis of every spoken turn shares this model's quota.
+            if "RESOURCE_EXHAUSTED" in str(exc) or "429" in str(exc):
+                raise RuntimeError(
+                    "Gemini llegó a su límite de uso por ahora. Espera un minuto y vuelve a intentarlo."
+                ) from None
+            raise RuntimeError(
+                "Lumina no pudo preparar la actividad. Inténtalo de nuevo."
+            ) from None
+        return {"activity": self._learning.register_activity(activity)}
 
     async def _learning_web_action(self, action: str, body: dict) -> dict:
         if action == "enter":
@@ -1856,6 +1898,8 @@ class JarvisLive:
             self._learning.set_mode(str(body.get("mode") or ""))
         elif action == "scenario":
             self._learning.select_scenario(str(body.get("scenario_id") or ""))
+        elif action == "scenario-end":
+            self._learning.end_scenario()
         elif action == "unit":
             self._learning.select_unit(str(body.get("unit_id") or ""))
         elif action == "listening-activity":
@@ -1872,10 +1916,16 @@ class JarvisLive:
             self._learning.review_word(
                 str(body.get("word") or ""), str(body.get("rating") or "")
             )
+        elif action == "audience":
+            self._learning.set_audience(str(body.get("audience") or ""))
         elif action == "settings":
             preferred = str(body.get("preferred_speed") or "normal")
             if preferred not in {"slow", "normal", "natural"}:
                 raise ValueError("Invalid preferred speed")
+            if "audience" in body:
+                self._learning.set_audience(str(body.get("audience") or ""))
+            if "weekly_target" in body:
+                self._learning.store.set_weekly_target(body.get("weekly_target"))
             self._learning.translation_enabled = bool(body.get("translation_enabled", True))
             self._learning.store.update_profile({"preferred_speed": preferred})
         snapshot = self._learning_snapshot()
@@ -4006,6 +4056,8 @@ class JarvisLive:
                 session=self._learning_live_session,
                 turn=self._learning_turn,
                 pronunciation=self._learning_pronunciation,
+                placement=self._learning_placement,
+                activity=self._learning_activity,
             )
             self._dashboard_task = asyncio.create_task(
                 self._dashboard.serve(), name="lumina-dashboard-lifecycle"

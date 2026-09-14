@@ -481,7 +481,9 @@ class DashboardServer:
         self._learning_session_callback   = None
         self._learning_turn_callback      = None
         self._learning_pronunciation_callback = None
-        self._startup_event               = asyncio.Event()
+        self._learning_placement_callback = None
+        self._learning_activity_callback  = None
+        self._startup_event              = asyncio.Event()
         self._server_ready                = False
         self._startup_error: str | None   = None
         self._main_server                 = None
@@ -576,13 +578,16 @@ class DashboardServer:
         self._connect_callback = fn
 
     def set_learning_callbacks(
-        self, *, state=None, action=None, session=None, turn=None, pronunciation=None
+        self, *, state=None, action=None, session=None, turn=None, pronunciation=None,
+        placement=None, activity=None,
     ) -> None:
         self._learning_state_callback = state
         self._learning_action_callback = action
         self._learning_session_callback = session
         self._learning_turn_callback = turn
         self._learning_pronunciation_callback = pronunciation
+        self._learning_placement_callback = placement
+        self._learning_activity_callback = activity
 
     # ── broadcast ────────────────────────────────────────────────────────
 
@@ -865,6 +870,51 @@ class DashboardServer:
                     {"error": f"Pronunciation failed ({type(exc).__name__})"}, status_code=503
                 )
 
+        @app.post("/api/learning/placement")
+        async def learning_placement(req: Request):
+            if not _auth(req):
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
+            try:
+                answers = (await req.json()).get("answers") or []
+            except Exception:
+                answers = None
+            if not isinstance(answers, list) or len(answers) > 40:
+                return JSONResponse({"error": "Invalid placement answers"}, status_code=400)
+            try:
+                result = await _invoke(self._learning_placement_callback, answers)
+                return JSONResponse({"ok": True, **result})
+            except ValueError as exc:
+                return JSONResponse({"error": str(exc)[:160]}, status_code=400)
+            except RuntimeError as exc:
+                return JSONResponse({"error": str(exc)[:160]}, status_code=409)
+            except Exception as exc:
+                return JSONResponse(
+                    {"error": f"Placement failed ({type(exc).__name__})"}, status_code=503
+                )
+
+        @app.post("/api/learning/activity")
+        async def learning_activity(req: Request):
+            if not _auth(req):
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
+            try:
+                body = await req.json()
+                op = str(body.get("op") or "").strip().lower()
+            except Exception:
+                return JSONResponse({"error": "Invalid request"}, status_code=400)
+            if op not in {"create", "submit"}:
+                return JSONResponse({"error": "Unsupported activity operation"}, status_code=400)
+            try:
+                result = await _invoke(self._learning_activity_callback, op, body)
+                return JSONResponse({"ok": True, **result})
+            except ValueError as exc:
+                return JSONResponse({"error": str(exc)[:160]}, status_code=400)
+            except RuntimeError as exc:
+                return JSONResponse({"error": str(exc)[:160]}, status_code=409)
+            except Exception as exc:
+                return JSONResponse(
+                    {"error": f"Activity failed ({type(exc).__name__})"}, status_code=503
+                )
+
         @app.post("/api/learning/action")
         async def learning_action(req: Request):
             if not _auth(req):
@@ -876,8 +926,8 @@ class DashboardServer:
             action_name = str(body.get("action") or "").strip().lower()
             allowed = {
                 "enter", "exit", "pause", "resume", "mute", "unmute",
-                "translation", "mode", "scenario", "unit", "save-word",
-                "review-word", "listening-activity", "settings",
+                "translation", "mode", "scenario", "scenario-end", "unit", "save-word",
+                "review-word", "listening-activity", "audience", "settings",
             }
             if action_name not in allowed:
                 return JSONResponse({"error": "Unsupported action"}, status_code=400)
