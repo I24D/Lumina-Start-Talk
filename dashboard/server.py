@@ -630,7 +630,8 @@ class DashboardServer:
         @app.get("/static/learning-english.css")
         async def learning_css():
             return FileResponse(
-                str(STATIC_DIR / "learning-english.css"), media_type="text/css"
+                str(STATIC_DIR / "learning-english.css"), media_type="text/css",
+                headers={"Cache-Control": "no-store, max-age=0"},
             )
 
         @app.get("/static/learning-english.js")
@@ -638,6 +639,7 @@ class DashboardServer:
             return FileResponse(
                 str(STATIC_DIR / "learning-english.js"),
                 media_type="application/javascript",
+                headers={"Cache-Control": "no-store, max-age=0"},
             )
 
         @app.get("/login", response_class=HTMLResponse)
@@ -658,7 +660,10 @@ class DashboardServer:
         async def learning_english_page():
             # The document contains no credentials. API and WebSocket requests
             # still require the same bearer token as the remote dashboard.
-            return HTMLResponse(self._learning_html)
+            return HTMLResponse(
+                self._learning_html,
+                headers={"Cache-Control": "no-store, max-age=0"},
+            )
 
         @app.post("/login")
         async def login(req: Request):

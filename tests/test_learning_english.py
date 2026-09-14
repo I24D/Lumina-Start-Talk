@@ -5,6 +5,8 @@ from __future__ import annotations
 import copy
 import base64
 import json
+import subprocess
+import textwrap
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
@@ -445,6 +447,7 @@ class LearningWebApiTests(unittest.TestCase):
     def test_studio_and_authenticated_api_are_available(self):
         page = self.client.get("/learning-english")
         self.assertEqual(page.status_code, 200)
+        self.assertEqual(page.headers["cache-control"], "no-store, max-age=0")
         self.assertIn("English Learning Studio", page.text)
         self.assertIn("Ruta de aprendizaje desde cero hasta C2", page.text)
         self.assertIn("Prueba de nivel", page.text)
@@ -454,6 +457,14 @@ class LearningWebApiTests(unittest.TestCase):
         self.assertEqual(self.client.get("/api/learning/state").status_code, 401)
         state = self.client.get("/api/learning/state", headers=self.headers)
         self.assertEqual(state.json()["state"], "lesson")
+
+        for asset in (
+            "/static/learning-english.css?v=browser-test",
+            "/static/learning-english.js?v=browser-test",
+        ):
+            response = self.client.get(asset)
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.headers["cache-control"], "no-store, max-age=0")
 
     def test_session_turn_and_exit_flow_reach_backend_callbacks(self):
         self.assertEqual(self.client.post("/api/learning/live-session", json={}).status_code, 401)
@@ -513,6 +524,103 @@ class LearningWebApiTests(unittest.TestCase):
 
 
 class LearningDesktopLaunchTests(unittest.TestCase):
+    def test_all_eight_course_shortcuts_have_working_browser_handlers(self):
+        harness = textwrap.dedent(r"""
+            const fs = require("fs");
+            const vm = require("vm");
+            const assert = require("assert");
+
+            class FakeElement {
+              constructor(dataset = {}) {
+                this.dataset = dataset;
+                this.listeners = {};
+                this.open = false;
+                this.innerHTML = "";
+                this.textContent = "";
+                this.style = {};
+                this.classList = {add(){}, remove(){}, toggle(){}};
+                this.lastChild = {textContent: ""};
+                this.childNodes = [{textContent: ""}, this.lastChild];
+                this.parentElement = {querySelectorAll: () => []};
+              }
+              addEventListener(name, listener) {
+                (this.listeners[name] ||= []).push(listener);
+              }
+              setAttribute(name) { if (name === "open") this.open = true; }
+              removeAttribute(name) { if (name === "open") this.open = false; }
+              showModal() { this.open = true; }
+              close() { this.open = false; }
+              focus() {}
+              requestSubmit() {}
+              querySelectorAll() { return []; }
+              closest(selector) {
+                if (selector === "[data-open-dialog]" && this.dataset.openDialog) return this;
+                if (selector === "[data-activity]" && this.dataset.activity) return this;
+                return null;
+              }
+            }
+
+            const specs = [
+              {openDialog: "placement-dialog"},
+              {openDialog: "roadmap-dialog"},
+              {activity: "reading"},
+              {activity: "checkpoint"},
+              {openDialog: "scenario-dialog"},
+              {openDialog: "listening-dialog"},
+              {openDialog: "review-dialog"},
+              {openDialog: "history-dialog"},
+            ];
+            const shortcuts = specs.map(spec => new FakeElement(spec));
+            const elements = new Map();
+            const getElement = id => {
+              if (!elements.has(id)) elements.set(id, new FakeElement());
+              return elements.get(id);
+            };
+
+            global.document = {
+              querySelector: selector => getElement(selector.startsWith("#") ? selector.slice(1) : selector),
+              querySelectorAll: selector => selector.startsWith(".learning-shortcuts") ? shortcuts : [],
+              getElementById: getElement,
+              addEventListener() {},
+              body: {classList: {toggle(){}}},
+            };
+            global.window = {addEventListener(){}, close(){}};
+            global.sessionStorage = {getItem: key => key === "jarvis_token" ? "test-token" : "", setItem(){}, removeItem(){}};
+            global.localStorage = {getItem: () => "", setItem(){}};
+            global.location = {protocol: "http:", host: "127.0.0.1:8002", replace(){}};
+            global.WebSocket = class { close() {} };
+            global.fetch = url => String(url).includes("/api/learning/activity")
+              ? Promise.reject(new Error("expected smoke-test stop"))
+              : new Promise(() => {});
+
+            const source = fs.readFileSync("dashboard/static/learning-english.js", "utf8");
+            vm.runInThisContext(source, {filename: "learning-english.js"});
+
+            (async () => {
+              assert.equal(shortcuts.length, 8);
+              for (const button of shortcuts) {
+                assert.equal(button.listeners.click?.length, 1, JSON.stringify(button.dataset));
+                const event = {preventDefault(){}, stopPropagation(){}};
+                button.listeners.click[0](event);
+                const dialogId = button.dataset.openDialog || "activity-dialog";
+                assert.equal(getElement(dialogId).open, true, JSON.stringify(button.dataset));
+                getElement(dialogId).close();
+                await new Promise(resolve => setImmediate(resolve));
+              }
+              process.stdout.write("8 course shortcuts opened their dialogs");
+            })().catch(error => { console.error(error); process.exitCode = 1; });
+        """)
+        result = subprocess.run(
+            ["node", "-e", harness],
+            cwd=Path.cwd(),
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        self.assertIn("8 course shortcuts opened their dialogs", result.stdout)
+
     def test_learning_keeps_the_user_requested_separate_browser_microphone(self):
         browser_source = Path("dashboard/static/learning-english.js").read_text(encoding="utf-8")
         desktop_source = Path("main.py").read_text(encoding="utf-8")

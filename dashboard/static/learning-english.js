@@ -571,16 +571,63 @@
     else sendTeacherControl("Pregunta al estudiante en una frase qué quiere practicar hoy.");
   }
 
+  function showCourseDialog(id) {
+    const dialog = document.getElementById(id);
+    if (!dialog) {
+      toast("Esta herramienta no está disponible en esta versión de la interfaz.", true);
+      return false;
+    }
+    if (dialog.open) return true;
+    try {
+      if (typeof dialog.showModal === "function") dialog.showModal();
+      else dialog.setAttribute("open", "");
+      return true;
+    } catch (error) {
+      // A stale page can briefly disagree with the freshly served script. Keep
+      // the tool usable as a non-modal dialog instead of swallowing the click.
+      dialog.setAttribute("open", "");
+      return true;
+    }
+  }
+
+  function closeCourseDialog(id) {
+    const dialog = document.getElementById(id);
+    if (!dialog) return;
+    try {
+      if (typeof dialog.close === "function" && dialog.open) dialog.close();
+      else dialog.removeAttribute("open");
+    } catch (_) {
+      dialog.removeAttribute("open");
+    }
+  }
+
+  function activateCourseTool(button, event = null) {
+    event?.preventDefault();
+    // Shortcut cards get their own listener. Stopping propagation prevents the
+    // generic handler below from opening the same tool a second time.
+    event?.stopPropagation();
+    const activity = button?.dataset?.activity;
+    if (activity) {
+      openPractice(activity);
+      return;
+    }
+    const id = button?.dataset?.openDialog;
+    if (!id) return;
+    if (id === "placement-dialog") openPlacement();
+    else if (id === "review-dialog") openReview();
+    else showCourseDialog(id);
+  }
+
   function openReview() {
     reviewIndex = 0; reviewRevealed = false;
     renderReview(state?.reviewQueue || []);
-    const dialog = $("#review-dialog"); if (!dialog.open) dialog.showModal();
+    showCourseDialog("review-dialog");
   }
 
   function openPlacement() {
     placement.answers = []; placement.question = null;
     $("#placement-body").innerHTML = '<p>Responde sin prisa. Si no sabes una respuesta, elige la que te parezca: la prueba se adapta a ti y termina en pocas preguntas. No importa si no sabes nada de inglés.</p><button type="button" class="dialog-save" data-placement-start>Empezar la prueba</button>';
-    const dialog = $("#placement-dialog"); if (!dialog.open) dialog.showModal();
+    showCourseDialog("placement-dialog");
   }
 
   async function placementStep() {
@@ -613,7 +660,7 @@
     $("#activity-kicker").textContent = kind === "reading" ? "Lectura guiada" : "Prueba de unidad";
     $("#activity-title").textContent = "Lumina está preparando tu actividad…";
     $("#activity-body").innerHTML = '<p class="quiz-loading">Creando contenido para tu nivel. Tarda unos segundos.</p>';
-    const dialog = $("#activity-dialog"); if (!dialog.open) dialog.showModal();
+    showCourseDialog("activity-dialog");
     practice.busy = true;
     try {
       const data = await postJson("/api/learning/activity", {op: "create", kind});
@@ -717,24 +764,20 @@
 
   function showSummary(summary) {
     $("#summary-copy").textContent = summary || "Tu progreso quedó guardado.";
-    const dialog = $("#summary-dialog"); if (!dialog.open) dialog.showModal();
+    showCourseDialog("summary-dialog");
   }
 
   function closeSummary() {
-    const dialog = $("#summary-dialog"); if (dialog.open) dialog.close();
+    closeCourseDialog("summary-dialog");
   }
 
   function onDocumentClick(event) {
     const target = event.target;
+    if (!target || typeof target.closest !== "function") return;
     const openDialog = target.closest("[data-open-dialog]");
-    if (openDialog) {
-      const id = openDialog.dataset.openDialog;
-      if (id === "placement-dialog") openPlacement();
-      else if (id === "review-dialog") openReview();
-      else { const dialog = document.getElementById(id); if (dialog && !dialog.open) dialog.showModal(); }
-    }
+    if (openDialog) activateCourseTool(openDialog);
     const closeDialog = target.closest("[data-close-dialog]");
-    if (closeDialog) document.getElementById(closeDialog.dataset.closeDialog)?.close();
+    if (closeDialog) closeCourseDialog(closeDialog.dataset.closeDialog);
 
     const modeShortcut = target.closest("[data-mode-shortcut]");
     if (modeShortcut) { $("#roadmap-dialog").close(); switchMode(modeShortcut.dataset.modeShortcut); }
@@ -789,7 +832,7 @@
     }
 
     const practiceButton = target.closest("[data-activity]");
-    if (practiceButton) openPractice(practiceButton.dataset.activity);
+    if (practiceButton) activateCourseTool(practiceButton);
     const practiceChoice = target.closest("[data-practice-choice]");
     if (practiceChoice && practice.current) {
       const [question, option] = practiceChoice.dataset.practiceChoice.split(":").map(Number);
@@ -869,6 +912,9 @@
     $("#message-input").addEventListener("keydown", event => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); $("#message-form").requestSubmit(); } });
     $$("[data-message]").forEach(button => button.addEventListener("click", () => sendMessage(button.dataset.message)));
     $$("#mode-list button").forEach(button => button.addEventListener("click", () => switchMode(button.dataset.mode)));
+    $$(".learning-shortcuts [data-open-dialog], .learning-shortcuts [data-activity], #onboarding-card [data-open-dialog]").forEach(button => {
+      button.addEventListener("click", event => activateCourseTool(button, event));
+    });
     document.addEventListener("click", onDocumentClick);
     $("#next-step-button").addEventListener("click", () => runNextStep());
     $("#start-button").addEventListener("click", () => startClass());
