@@ -1655,7 +1655,9 @@ class JarvisLive:
             pass
 
     def _learning_snapshot(self) -> dict:
-        return self._learning.snapshot()
+        snapshot = self._learning.snapshot()
+        snapshot["providers"] = self._learning_service.provider_status()
+        return snapshot
 
     def _broadcast_learning(self, message: dict) -> None:
         if not self._dashboard or not self._loop:
@@ -1800,6 +1802,45 @@ class JarvisLive:
         asyncio.create_task(self._process_learning_turn(user_text, assistant_text))
         return self._learning_snapshot()
 
+    async def _learning_pronunciation(
+        self, pcm: bytes, expected_text: str, sample_rate: int
+    ) -> dict:
+        """Evaluate browser-captured PCM with the optional local engine."""
+        if not self._learning.active:
+            raise RuntimeError("Learning English is not active")
+        import tempfile
+        import wave
+
+        path = ""
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp:
+                path = temp.name
+            with wave.open(path, "wb") as wav:
+                wav.setnchannels(1)
+                wav.setsampwidth(2)
+                wav.setframerate(sample_rate)
+                wav.writeframes(pcm)
+            result = await asyncio.get_running_loop().run_in_executor(
+                None,
+                lambda: self._learning_service.analyze_pronunciation_file(
+                    path, expected_text
+                ),
+            )
+        finally:
+            if path:
+                try:
+                    Path(path).unlink(missing_ok=True)
+                except Exception:
+                    pass
+        if not result:
+            raise RuntimeError(
+                "OpenPronounce is not installed or its local service is unavailable"
+            )
+        self._broadcast_learning({
+            "type": "learning.pronunciation", "result": result
+        })
+        return result
+
     async def _learning_web_action(self, action: str, body: dict) -> dict:
         if action == "enter":
             return await self._enter_learning_english(trigger="web", open_browser=False)
@@ -1813,11 +1854,23 @@ class JarvisLive:
             self._learning.translation_enabled = bool(body.get("enabled", True))
         elif action == "mode":
             self._learning.set_mode(str(body.get("mode") or ""))
+        elif action == "scenario":
+            self._learning.select_scenario(str(body.get("scenario_id") or ""))
+        elif action == "unit":
+            self._learning.select_unit(str(body.get("unit_id") or ""))
+        elif action == "listening-activity":
+            self._learning.select_listening_activity(
+                str(body.get("activity_id") or "")
+            )
         elif action == "save-word":
             self._learning.store.save_word(
                 str(body.get("word") or ""),
                 str(body.get("meaning") or ""),
                 str(body.get("example") or ""),
+            )
+        elif action == "review-word":
+            self._learning.review_word(
+                str(body.get("word") or ""), str(body.get("rating") or "")
             )
         elif action == "settings":
             preferred = str(body.get("preferred_speed") or "normal")
@@ -3952,6 +4005,7 @@ class JarvisLive:
                 action=self._learning_web_action,
                 session=self._learning_live_session,
                 turn=self._learning_turn,
+                pronunciation=self._learning_pronunciation,
             )
             self._dashboard_task = asyncio.create_task(
                 self._dashboard.serve(), name="lumina-dashboard-lifecycle"

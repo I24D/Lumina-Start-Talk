@@ -153,6 +153,24 @@ open, Lumina's general assistant keeps its tools but pauses its microphone and
 voice. Each finished turn is analysed on `gemini-3.6-flash` into validated
 structured corrections, vocabulary and progress.
 
+The studio now adds an original Lumina curriculum with 18 units across CEFR
+A1–C2, nine role-play scenarios, course history, XP, streaks and four Listening
+Lab mechanics. Vocabulary is scheduled with the official Python FSRS package,
+so review dates come from a real spaced-repetition algorithm rather than from
+Gemini. The browser microphone and the tutor's Live session remain separate by
+design; the general assistant still pauses its own input for the whole class.
+
+Two local providers are optional and isolated behind Lumina-owned adapters:
+
+- `LUMINA_LANGUAGETOOL_URL` defaults to `http://127.0.0.1:8081/v2/check` and
+  adds objective grammar findings before Gemini explains them. Learner text is
+  never sent to LanguageTool's public service.
+- `LUMINA_OPENPRONOUNCE_URL` can point to a local OpenPronounce server, or the
+  `openpronounce` package can be installed in Lumina's environment. When it is
+  available, **Practicar de nuevo** records the next attempt from the studio's
+  existing browser microphone and shows its real score and phoneme differences.
+  Its large speech models are deliberately not included in Lumina or its setup.
+
 The studio opens on `http://127.0.0.1:8002`, a loopback-only twin of the
 dashboard: the dashboard's HTTPS certificate is self-signed, and the browser
 would stop the studio at a privacy warning.

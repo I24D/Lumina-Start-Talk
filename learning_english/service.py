@@ -12,7 +12,8 @@ from google import genai
 from google.genai import types
 
 from memory.config_manager import get_gemini_key
-from .types import TutorResponse
+from .providers import LanguageToolProvider, OpenPronounceProvider
+from .types import Correction, TutorResponse
 
 
 PROMPT_PATH = Path(__file__).parent / "prompts" / "english_tutor.txt"
@@ -91,11 +92,18 @@ class LearningEnglishService:
         api_key_loader: Callable[[], str | None] = get_gemini_key,
         generator: Callable[..., Any] | None = None,
         token_factory: Callable[[dict[str, Any]], str] | None = None,
+        grammar_provider: LanguageToolProvider | None = None,
+        pronunciation_provider: OpenPronounceProvider | None = None,
     ):
         self._api_key_loader = api_key_loader
         self._generator = generator
         self._token_factory = token_factory
+        self._grammar = grammar_provider or LanguageToolProvider()
+        self._pronunciation = pronunciation_provider or OpenPronounceProvider()
         self._system_prompt = PROMPT_PATH.read_text(encoding="utf-8")
+
+    def provider_status(self) -> list[dict[str, Any]]:
+        return [self._grammar.status(), self._pronunciation.status()]
 
     def build_live_system_prompt(
         self,
@@ -114,6 +122,13 @@ class LearningEnglishService:
             "current_mode": snapshot.get("currentMode", "conversation"),
             "recent_errors": recent_errors,
             "last_lesson": last_lesson,
+            "active_scenario": snapshot.get("activeScenario"),
+            "current_unit": snapshot.get("currentUnit"),
+            "listening_activity": snapshot.get("activeListeningActivity"),
+            "reviews_due": [
+                {"word": item.get("word"), "meaning": item.get("meaning")}
+                for item in snapshot.get("reviewQueue", [])[:6]
+            ],
         }
         return self._system_prompt + "\n\n[STUDENT CONTEXT]\n" + json.dumps(
             context, ensure_ascii=False
@@ -124,9 +139,12 @@ class LearningEnglishService:
         if profile.get("primary_language") and profile.get("goal") and profile.get("level_confirmed"):
             last = snapshot.get("last_lesson") or {}
             previous = str(last.get("summary") or "tu última práctica")
+            reviews = len(snapshot.get("reviewQueue", []))
             return (
                 "Da una bienvenida breve al estudiante. Menciona que la última vez "
-                f"trabajaron en {previous}. Pregunta si quiere continuar."
+                f"trabajaron en {previous}. "
+                + (f"Indica que tiene {reviews} palabras listas para repasar. " if reviews else "")
+                + "Pregunta si quiere continuar, repasar o elegir un escenario."
             )
         return (
             "Di exactamente al inicio: 'Modo Learning English activado. Desde ahora seré "
@@ -202,6 +220,8 @@ class LearningEnglishService:
         if not user_text and not assistant_text:
             return fallback
 
+        grammar_findings = self._grammar.check(user_text)
+
         request = {
             "task": "Analyze the completed tutor turn. Do not invent a different tutor reply.",
             "studentText": user_text,
@@ -209,6 +229,9 @@ class LearningEnglishService:
             "profile": snapshot.get("profile", {}),
             "currentMode": snapshot.get("currentMode", "conversation"),
             "currentProgress": self._current_progress(snapshot),
+            "scenario": snapshot.get("activeScenario"),
+            "curriculumUnit": snapshot.get("currentUnit"),
+            "objectiveGrammarFindings": grammar_findings,
             "rules": [
                 "Return corrections only after the student's turn is complete.",
                 "If only an STT transcript is available, never claim exact phoneme analysis.",
@@ -245,6 +268,18 @@ class LearningEnglishService:
             if isinstance(raw, str):
                 raw = json.loads(raw)
             parsed = TutorResponse.from_mapping(raw, fallback_assistant_text=assistant_text)
+            existing = {
+                (item.original.casefold(), item.corrected.casefold())
+                for item in parsed.corrections
+            }
+            for finding in grammar_findings:
+                correction = Correction.from_mapping(finding)
+                signature = (
+                    correction.original.casefold(), correction.corrected.casefold()
+                ) if correction else None
+                if correction and signature not in existing:
+                    parsed.corrections.append(correction)
+                    existing.add(signature)
             # The user must see the exact answer the Live tutor actually said,
             # never a second answer rephrased by the analysis request.
             if assistant_text:
@@ -255,7 +290,17 @@ class LearningEnglishService:
             # The UI can keep the live transcript even when structured analysis
             # is unavailable. No credential or provider response is logged.
             print(f"[Learning English] Structured analysis fallback ({type(exc).__name__})")
+            for finding in grammar_findings:
+                correction = Correction.from_mapping(finding)
+                if correction:
+                    fallback.corrections.append(correction)
             return fallback
+
+    def analyze_pronunciation_file(
+        self, audio_path: str, expected_text: str
+    ) -> dict[str, Any] | None:
+        """Run real phoneme analysis only when the optional local engine exists."""
+        return self._pronunciation.analyze_file(audio_path, expected_text)
 
     @staticmethod
     def _current_progress(snapshot: dict[str, Any]) -> int:

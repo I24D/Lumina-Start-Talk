@@ -27,6 +27,7 @@ win10toast; sys_platform == "win32"
 pywinauto; sys_platform == "win32"
 pywin32; sys_platform == "win32"
 qrcode[pil]
+fsrs>=6.2,<7
 # phone_notifications plugin: optional live-notification fallback. The plugin's
 # primary path reads the Windows notification store with stdlib sqlite3 only.
 winrt-Windows.UI.Notifications; sys_platform == "win32"

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
+from .catalog import build_catalog, find_listening_activity, find_scenario, find_unit
 from .store import LearningProgressStore
 from .types import LearningEnglishState, TutorResponse
 
@@ -70,6 +71,35 @@ class LearningEnglishController:
         )
         return self.snapshot()
 
+    def select_scenario(self, scenario_id: str) -> dict[str, Any]:
+        scenario = self.store.set_scenario(scenario_id)
+        self.current_mode = scenario["mode"]
+        self.state = LearningEnglishState.LESSON
+        self._emit("learningEnglish.scenarioStarted", {"scenario": scenario["id"]})
+        return self.snapshot()
+
+    def select_unit(self, unit_id: str) -> dict[str, Any]:
+        unit = self.store.set_unit(unit_id)
+        self.current_mode = unit["skill"]
+        self.state = LearningEnglishState.LESSON
+        self._emit("learningEnglish.unitSelected", {"unit": unit["id"]})
+        return self.snapshot()
+
+    def review_word(self, word: str, rating: str) -> dict[str, Any]:
+        result = self.store.review_word(word, rating)
+        self._emit("learningEnglish.reviewCompleted", result)
+        return self.snapshot()
+
+    def select_listening_activity(self, activity_id: str) -> dict[str, Any]:
+        activity = self.store.set_listening_activity(activity_id)
+        self.current_mode = "listening"
+        self.state = LearningEnglishState.LESSON
+        self._emit(
+            "learningEnglish.listeningActivitySelected",
+            {"activity": activity["id"]},
+        )
+        return self.snapshot()
+
     def set_paused(self, paused: bool) -> dict[str, Any]:
         if not self.active:
             return self.snapshot()
@@ -123,6 +153,12 @@ class LearningEnglishController:
 
     def snapshot(self) -> dict[str, Any]:
         progress = self.store.snapshot()
+        curriculum = progress.get("curriculum", {})
+        active_scenario = find_scenario(progress.get("active_scenario_id", ""))
+        current_unit = find_unit(curriculum.get("current_unit_id", ""))
+        listening_activity = find_listening_activity(
+            curriculum.get("listening_activity_id", "")
+        )
         return {
             "active": self.active,
             "state": self.state.value,
@@ -132,5 +168,10 @@ class LearningEnglishController:
             "currentMode": self.current_mode,
             "lastSummary": self.last_summary,
             "lastResponse": self.last_response.to_dict() if self.last_response else None,
+            "activeScenario": active_scenario,
+            "currentUnit": current_unit,
+            "activeListeningActivity": listening_activity,
+            "catalog": build_catalog(progress.get("profile", {}), curriculum),
+            "reviewQueue": self.store.due_reviews(),
             **progress,
         }

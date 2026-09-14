@@ -480,6 +480,7 @@ class DashboardServer:
         self._learning_action_callback    = None
         self._learning_session_callback   = None
         self._learning_turn_callback      = None
+        self._learning_pronunciation_callback = None
         self._startup_event               = asyncio.Event()
         self._server_ready                = False
         self._startup_error: str | None   = None
@@ -574,11 +575,14 @@ class DashboardServer:
     def set_connect_callback(self, fn) -> None:
         self._connect_callback = fn
 
-    def set_learning_callbacks(self, *, state=None, action=None, session=None, turn=None) -> None:
+    def set_learning_callbacks(
+        self, *, state=None, action=None, session=None, turn=None, pronunciation=None
+    ) -> None:
         self._learning_state_callback = state
         self._learning_action_callback = action
         self._learning_session_callback = session
         self._learning_turn_callback = turn
+        self._learning_pronunciation_callback = pronunciation
 
     # ── broadcast ────────────────────────────────────────────────────────
 
@@ -836,6 +840,31 @@ class DashboardServer:
                     {"error": f"Turn failed ({type(exc).__name__})"}, status_code=503
                 )
 
+        @app.post("/api/learning/pronunciation")
+        async def learning_pronunciation(req: Request):
+            if not _auth(req):
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
+            try:
+                body = await req.json()
+                expected = str(body.get("expected_text") or "").strip()[:500]
+                sample_rate = int(body.get("sample_rate") or 16000)
+                pcm = base64.b64decode(str(body.get("pcm_base64") or ""), validate=True)
+            except Exception:
+                return JSONResponse({"error": "Invalid pronunciation recording"}, status_code=400)
+            if not expected or not pcm or len(pcm) > 1_280_000 or sample_rate not in {16000, 24000, 48000}:
+                return JSONResponse({"error": "Invalid pronunciation recording"}, status_code=400)
+            try:
+                result = await _invoke(
+                    self._learning_pronunciation_callback, pcm, expected, sample_rate
+                )
+                return JSONResponse({"ok": True, "result": result})
+            except RuntimeError as exc:
+                return JSONResponse({"error": str(exc)[:160]}, status_code=409)
+            except Exception as exc:
+                return JSONResponse(
+                    {"error": f"Pronunciation failed ({type(exc).__name__})"}, status_code=503
+                )
+
         @app.post("/api/learning/action")
         async def learning_action(req: Request):
             if not _auth(req):
@@ -847,7 +876,8 @@ class DashboardServer:
             action_name = str(body.get("action") or "").strip().lower()
             allowed = {
                 "enter", "exit", "pause", "resume", "mute", "unmute",
-                "translation", "mode", "save-word", "settings",
+                "translation", "mode", "scenario", "unit", "save-word",
+                "review-word", "listening-activity", "settings",
             }
             if action_name not in allowed:
                 return JSONResponse({"error": "Unsupported action"}, status_code=400)

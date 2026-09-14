@@ -5,14 +5,17 @@ from __future__ import annotations
 import copy
 import threading
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
 from memory.memory_manager import load_memory, save_memory
+from .catalog import build_catalog, find_listening_activity, find_scenario, find_unit
+from .review import ReviewScheduler
 from .types import TutorResponse
 
 
 _LEVELS = {"A1", "A2", "B1", "B2", "C1", "C2"}
+_REVIEW_SCHEDULER = ReviewScheduler()
 
 
 def _now() -> str:
@@ -21,7 +24,7 @@ def _now() -> str:
 
 def _default_document() -> dict[str, Any]:
     return {
-        "version": 1,
+        "version": 2,
         "profile": {
             "primary_language": "",
             "level": "A1",
@@ -34,6 +37,7 @@ def _default_document() -> dict[str, Any]:
             "last_class_at": "",
         },
         "current_session_id": "",
+        "active_scenario_id": "",
         "sessions": [],
         "vocabulary": [],
         "frequent_errors": [],
@@ -45,6 +49,20 @@ def _default_document() -> dict[str, Any]:
             "listening": 0,
         },
         "weekly_activity": [],
+        "curriculum": {
+            "current_unit_id": "a1-foundations",
+            "listening_activity_id": "multiple-choice",
+            "completed_units": [],
+            "weekly_target": 3,
+        },
+        "metrics": {
+            "xp": 0,
+            "streak_days": 0,
+            "total_turns": 0,
+            "total_reviews": 0,
+            "successful_reviews": 0,
+            "last_activity_date": "",
+        },
         "last_lesson": None,
     }
 
@@ -58,8 +76,19 @@ def _normalise_document(raw: Any) -> dict[str, Any]:
         if key in raw and isinstance(raw[key], type(result[key])):
             result[key] = copy.deepcopy(raw[key])
     result["profile"] = {**default["profile"], **result.get("profile", {})}
+    result["curriculum"] = {
+        **default["curriculum"], **result.get("curriculum", {})
+    }
+    result["metrics"] = {**default["metrics"], **result.get("metrics", {})}
     level = str(result["profile"].get("level", "A1")).upper()
     result["profile"]["level"] = level if level in _LEVELS else "A1"
+    result["version"] = 2
+    for item in result.get("vocabulary", []):
+        if isinstance(item, dict) and not isinstance(item.get("srs"), dict):
+            item["srs"] = _REVIEW_SCHEDULER.new_card()
+            item["due_at"] = item["srs"].get("due", _now())
+            item["review_count"] = int(item.get("review_count", 0))
+            item["last_rating"] = str(item.get("last_rating", ""))
     return result
 
 
@@ -127,13 +156,15 @@ class LearningProgressStore:
                 "status": "active",
                 "trigger": str(trigger or "ui"),
                 "mode": "conversation",
+                "scenario_id": doc.get("active_scenario_id", ""),
+                "unit_id": doc.get("curriculum", {}).get("current_unit_id", ""),
                 "turns": [],
                 "correction_count": 0,
                 "vocabulary_count": 0,
                 "progress": 0,
                 "summary": "",
             })
-            doc["sessions"] = doc["sessions"][-12:]
+            doc["sessions"] = doc["sessions"][-30:]
             self._commit()
             return session_id
 
@@ -165,6 +196,65 @@ class LearningProgressStore:
                 session["mode"] = str(mode or "conversation")
                 self._commit()
 
+    def set_scenario(self, scenario_id: str) -> dict[str, Any]:
+        scenario = find_scenario(str(scenario_id or ""))
+        if not scenario:
+            raise ValueError("Unknown learning scenario")
+        with self._lock:
+            doc = self._load()
+            catalog = build_catalog(doc["profile"], doc["curriculum"])
+            available = next(
+                (item.get("available") for item in catalog["scenarios"] if item["id"] == scenario["id"]),
+                False,
+            )
+            if not available:
+                raise ValueError("This scenario is locked for the current CEFR level")
+            doc["active_scenario_id"] = scenario["id"]
+            session = self._current_session()
+            if session:
+                session["scenario_id"] = scenario["id"]
+                session["mode"] = scenario["mode"]
+            doc["profile"]["current_objective"] = scenario["objective"]
+            self._commit()
+        return scenario
+
+    def set_unit(self, unit_id: str) -> dict[str, Any]:
+        unit = find_unit(str(unit_id or ""))
+        if not unit:
+            raise ValueError("Unknown curriculum unit")
+        with self._lock:
+            doc = self._load()
+            catalog = build_catalog(doc["profile"], doc["curriculum"])
+            available = any(
+                candidate.get("available")
+                for level in catalog["levels"]
+                for candidate in level["units"]
+                if candidate["id"] == unit["id"]
+            )
+            if not available:
+                raise ValueError("This unit is locked for the current CEFR level")
+            doc["curriculum"]["current_unit_id"] = unit["id"]
+            doc["profile"]["current_objective"] = unit["objective"]
+            session = self._current_session()
+            if session:
+                session["unit_id"] = unit["id"]
+                session["mode"] = unit["skill"]
+            self._commit()
+        return unit
+
+    def set_listening_activity(self, activity_id: str) -> dict[str, Any]:
+        activity = find_listening_activity(str(activity_id or ""))
+        if not activity:
+            raise ValueError("Unknown listening activity")
+        with self._lock:
+            doc = self._load()
+            doc["curriculum"]["listening_activity_id"] = activity["id"]
+            session = self._current_session()
+            if session:
+                session["mode"] = "listening"
+            self._commit()
+        return activity
+
     def _current_session(self) -> dict[str, Any] | None:
         doc = self._load()
         session_id = doc.get("current_session_id")
@@ -193,6 +283,7 @@ class LearningProgressStore:
                     "category": c.category,
                     "pronunciation": c.pronunciation[:200],
                     "translation": c.translation[:300],
+                    "source": c.source[:60],
                 } for c in response.corrections[:4]],
             })
             session["turns"] = session["turns"][-30:]
@@ -202,6 +293,9 @@ class LearningProgressStore:
                 int(session.get("progress", 0)), response.lesson_progress
             )
             session["mode"] = response.exercise_type
+            self._touch_activity(doc)
+            doc["metrics"]["total_turns"] = int(doc["metrics"].get("total_turns", 0)) + 1
+            doc["metrics"]["xp"] = int(doc["metrics"].get("xp", 0)) + 5
 
             if response.profile_updates:
                 profile = doc["profile"]
@@ -239,6 +333,11 @@ class LearningProgressStore:
             if skill in doc["skill_progress"]:
                 old = int(doc["skill_progress"].get(skill, 0))
                 doc["skill_progress"][skill] = max(old, response.lesson_progress)
+            if response.lesson_progress >= 100:
+                current_unit = str(doc.get("curriculum", {}).get("current_unit_id") or "")
+                completed = doc["curriculum"].setdefault("completed_units", [])
+                if current_unit and current_unit not in completed:
+                    completed.append(current_unit)
             self._commit()
 
     @staticmethod
@@ -254,12 +353,18 @@ class LearningProgressStore:
                 "last_seen": _now(),
             })
             found["count"] = int(found.get("count", 0)) + 1
+            if not isinstance(found.get("srs"), dict):
+                found["srs"] = _REVIEW_SCHEDULER.new_card()
+                found["due_at"] = found["srs"].get("due", _now())
         else:
+            card = _REVIEW_SCHEDULER.new_card()
             doc["vocabulary"].append({
                 "word": word.strip()[:100],
                 "meaning": str(meaning)[:250],
                 "example": str(example)[:350],
                 "saved": False, "count": 1, "first_seen": _now(), "last_seen": _now(),
+                "srs": card, "due_at": card.get("due", _now()),
+                "review_count": 0, "last_rating": "",
             })
         doc["vocabulary"] = doc["vocabulary"][-80:]
 
@@ -271,6 +376,65 @@ class LearningProgressStore:
                 if item.get("word", "").casefold() == word.strip().casefold():
                     item["saved"] = True
             self._commit()
+
+    def due_reviews(self, limit: int = 20) -> list[dict[str, Any]]:
+        with self._lock:
+            words = [
+                copy.deepcopy(item)
+                for item in self._load().get("vocabulary", [])
+                if isinstance(item, dict) and _REVIEW_SCHEDULER.is_due(item.get("srs"))
+            ]
+        words.sort(key=lambda item: str(item.get("due_at") or ""))
+        return words[: max(1, min(50, int(limit)))]
+
+    def review_word(self, word: str, rating: str) -> dict[str, Any]:
+        key = str(word or "").strip().casefold()
+        if not key:
+            raise ValueError("A vocabulary word is required")
+        with self._lock:
+            doc = self._load()
+            item = next(
+                (entry for entry in doc["vocabulary"] if str(entry.get("word", "")).casefold() == key),
+                None,
+            )
+            if item is None:
+                raise ValueError("Vocabulary word not found")
+            result = _REVIEW_SCHEDULER.review(item.get("srs"), rating)
+            item["srs"] = result["card"]
+            item["due_at"] = result["dueAt"]
+            item["review_count"] = int(item.get("review_count", 0)) + 1
+            item["last_rating"] = str(rating).lower()
+            metrics = doc["metrics"]
+            metrics["total_reviews"] = int(metrics.get("total_reviews", 0)) + 1
+            if str(rating).lower() in {"good", "easy"}:
+                metrics["successful_reviews"] = int(metrics.get("successful_reviews", 0)) + 1
+                metrics["xp"] = int(metrics.get("xp", 0)) + 3
+            self._touch_activity(doc)
+            self._commit()
+            return {
+                "word": item["word"],
+                "rating": item["last_rating"],
+                "dueAt": item["due_at"],
+                "engine": result["engine"],
+            }
+
+    @staticmethod
+    def _touch_activity(doc: dict[str, Any]) -> None:
+        today = datetime.now(timezone.utc).date()
+        metrics = doc["metrics"]
+        previous_raw = str(metrics.get("last_activity_date") or "")
+        try:
+            previous = datetime.fromisoformat(previous_raw).date()
+        except ValueError:
+            previous = None
+        if previous == today:
+            return
+        metrics["streak_days"] = (
+            int(metrics.get("streak_days", 0)) + 1
+            if previous == today - timedelta(days=1)
+            else 1
+        )
+        metrics["last_activity_date"] = today.isoformat()
 
     def complete_session(self, summary: str) -> dict[str, Any]:
         with self._lock:
@@ -297,6 +461,8 @@ class LearningProgressStore:
                 else:
                     doc["weekly_activity"].append({"date": today, "lessons": 1})
                 doc["weekly_activity"] = doc["weekly_activity"][-7:]
+                doc["metrics"]["xp"] = int(doc["metrics"].get("xp", 0)) + 20
+                self._touch_activity(doc)
             doc["profile"]["last_class_at"] = _now()
             doc["current_session_id"] = ""
             self._commit()

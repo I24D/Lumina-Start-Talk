@@ -50,6 +50,7 @@ class Correction:
     category: str = "grammar"
     pronunciation: str = ""
     translation: str = ""
+    source: str = "Gemini"
 
     @classmethod
     def from_mapping(cls, raw: Any) -> "Correction | None":
@@ -69,6 +70,7 @@ class Correction:
             category=category,
             pronunciation=_clean(raw.get("pronunciation"), limit=300),
             translation=_clean(raw.get("translation"), limit=500),
+            source=_clean(raw.get("source"), limit=60) or "Gemini",
         )
 
 

@@ -3,18 +3,44 @@
 from __future__ import annotations
 
 import copy
+import base64
 import json
 import unittest
+from datetime import datetime, timezone
+from pathlib import Path
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
 from dashboard.server import DashboardServer
+from learning_english.catalog import build_catalog
 from learning_english.controller import LearningEnglishController
 from learning_english.intent import confirmation_answer, detect_learning_english_intent
+from learning_english.providers import LanguageToolProvider
+from learning_english.review import ReviewScheduler
 from learning_english.service import LearningEnglishService
 from learning_english.store import LearningProgressStore
 from learning_english.types import LearningEnglishState, TutorResponse
 from ui import MainWindow
+
+
+class _NoGrammarProvider:
+    def status(self):
+        return {"id": "grammar-test", "label": "Test", "state": "ready", "detail": ""}
+
+    def check(self, _text):
+        return []
+
+
+class _GrammarFindingProvider(_NoGrammarProvider):
+    def check(self, _text):
+        return [{
+            "original": "go",
+            "corrected": "went",
+            "explanation": "Past tense is required.",
+            "category": "grammar",
+            "source": "LanguageTool",
+        }]
 
 
 class LearningEnglishIntentTests(unittest.TestCase):
@@ -107,7 +133,7 @@ class TutorResponseTests(unittest.TestCase):
         self.assertEqual(result.speech_text, "Try again.")
 
     def test_service_uses_validated_structured_result(self):
-        service = LearningEnglishService(generator=lambda **_: {
+        service = LearningEnglishService(grammar_provider=_NoGrammarProvider(), generator=lambda **_: {
             "assistantText": "Good attempt.",
             "speechText": "Good attempt.",
             "uiLanguage": "es",
@@ -160,6 +186,85 @@ class TutorResponseTests(unittest.TestCase):
             configs[1]["live_connect_constraints"]["config"]["session_resumption"], {"handle": "h1"}
         )
 
+    def test_objective_grammar_findings_are_merged_with_gemini_feedback(self):
+        service = LearningEnglishService(
+            grammar_provider=_GrammarFindingProvider(),
+            generator=lambda **_: {
+                "assistantText": "Good attempt.",
+                "speechText": "Good attempt.",
+                "uiLanguage": "es",
+                "exerciseType": "grammar",
+                "corrections": [],
+                "newVocabulary": [],
+                "nextAction": "Try once more.",
+                "lessonProgress": 15,
+                "shouldWaitForUser": True,
+                "profileUpdates": {},
+            },
+        )
+        result = service.analyze_turn(
+            user_text="Yesterday I go home.",
+            assistant_text="Good attempt.",
+            snapshot={"currentMode": "grammar"},
+        )
+        self.assertEqual(len(result.corrections), 1)
+        self.assertEqual(result.corrections[0].corrected, "went")
+        self.assertEqual(result.corrections[0].source, "LanguageTool")
+
+
+class LearningCatalogAndReviewTests(unittest.TestCase):
+    def test_catalog_has_original_a1_to_c2_route_and_level_gates(self):
+        catalog = build_catalog(
+            {"level": "B1", "goal": "I need English for travel"},
+            {"current_unit_id": "b1-work", "completed_units": ["a1-foundations"]},
+        )
+        self.assertEqual([item["id"] for item in catalog["levels"]], ["A1", "A2", "B1", "B2", "C1", "C2"])
+        self.assertEqual(sum(len(item["units"]) for item in catalog["levels"]), 18)
+        self.assertEqual(catalog["recommendedScenarioId"], "hotel-checkin")
+        self.assertEqual(
+            [item["id"] for item in catalog["listeningActivities"]],
+            ["missing-word", "build-sentence", "multiple-choice", "spot-the-word"],
+        )
+        self.assertTrue(next(item for item in catalog["levels"] if item["id"] == "B1")["units"][1]["current"])
+        self.assertFalse(next(item for item in catalog["levels"] if item["id"] == "C2")["units"][0]["available"])
+
+    def test_fsrs_schedules_a_real_next_review(self):
+        scheduler = ReviewScheduler()
+        now = datetime.now(timezone.utc)
+        result = scheduler.review(scheduler.new_card(now), "good", now=now)
+        due = datetime.fromisoformat(result["dueAt"])
+        self.assertEqual(result["engine"], "fsrs-6")
+        self.assertGreater(due, now)
+        self.assertFalse(scheduler.is_due(result["card"], now=now))
+
+
+class LearningProviderTests(unittest.TestCase):
+    def test_languagetool_defaults_to_localhost_and_maps_objective_finding(self):
+        provider = LanguageToolProvider(timeout=0.01)
+
+        class Response:
+            @staticmethod
+            def raise_for_status():
+                return None
+
+            @staticmethod
+            def json():
+                return {"matches": [{
+                    "offset": 2,
+                    "length": 2,
+                    "message": "Use the past tense.",
+                    "replacements": [{"value": "went"}],
+                    "rule": {"issueType": "grammar"},
+                }]}
+
+        self.assertTrue(provider.endpoint.startswith("http://127.0.0.1:"))
+        with patch("learning_english.providers.requests.post", return_value=Response()):
+            findings = provider.check("I go yesterday")
+        self.assertEqual(findings[0]["original"], "go")
+        self.assertEqual(findings[0]["corrected"], "went")
+        self.assertEqual(findings[0]["source"], "LanguageTool")
+        self.assertEqual(provider.status()["state"], "ready")
+
 
 class LearningProgressTests(unittest.TestCase):
     def setUp(self):
@@ -209,6 +314,51 @@ class LearningProgressTests(unittest.TestCase):
         state = store.snapshot()
         self.assertTrue(state["current_session_id"])
         self.assertEqual(state["storageStatus"], "temporary")
+
+    def test_vocabulary_is_due_immediately_and_reviewed_with_fsrs(self):
+        self.store.save_word("journey", "viaje", "It was a long journey.")
+        self.assertEqual(self.store.due_reviews()[0]["word"], "journey")
+        reviewed = self.store.review_word("journey", "good")
+        state = self.store.snapshot()
+        self.assertEqual(reviewed["engine"], "fsrs-6")
+        self.assertEqual(state["metrics"]["total_reviews"], 1)
+        self.assertEqual(state["metrics"]["successful_reviews"], 1)
+        self.assertGreaterEqual(state["metrics"]["xp"], 3)
+        self.assertEqual(self.store.due_reviews(), [])
+
+    def test_old_vocabulary_is_migrated_without_losing_content(self):
+        legacy = {"learning_english": {
+            "version": 1,
+            "vocabulary": [{"word": "hello", "meaning": "hola", "example": "Hello!"}],
+        }}
+        migrated = LearningProgressStore(
+            loader=lambda: copy.deepcopy(legacy), saver=lambda _value: None
+        ).snapshot()
+        self.assertEqual(migrated["version"], 2)
+        self.assertEqual(migrated["vocabulary"][0]["word"], "hello")
+        self.assertIn("srs", migrated["vocabulary"][0])
+
+    def test_scenario_and_curriculum_selection_persist_in_the_session(self):
+        controller = LearningEnglishController(self.store)
+        controller.enter("test")
+        self.store.update_profile({"level": "B1"})
+        controller.select_scenario("job-interview")
+        snapshot = controller.select_unit("b1-work")
+        snapshot = controller.select_listening_activity("missing-word")
+        session = snapshot["sessions"][-1]
+        self.assertEqual(snapshot["activeScenario"]["id"], "job-interview")
+        self.assertEqual(snapshot["currentUnit"]["id"], "b1-work")
+        self.assertEqual(session["scenario_id"], "job-interview")
+        self.assertEqual(session["unit_id"], "b1-work")
+        self.assertEqual(snapshot["activeListeningActivity"]["id"], "missing-word")
+
+    def test_locked_cefr_content_cannot_be_selected_through_the_api_layer(self):
+        controller = LearningEnglishController(self.store)
+        controller.enter("test")
+        with self.assertRaises(ValueError):
+            controller.select_scenario("academic-discussion")
+        with self.assertRaises(ValueError):
+            controller.select_unit("c2-rhetoric")
 
 
 class LearningFlowIntegrationTests(unittest.TestCase):
@@ -268,12 +418,16 @@ class LearningWebApiTests(unittest.TestCase):
         self.state = {"active": True, "state": "lesson"}
         self.sessions = []
         self.turns = []
+        self.pronunciations = []
         self.actions = []
         self.server.set_learning_callbacks(
             state=lambda: self.state,
             action=lambda name, body: self.actions.append((name, body)) or self.state,
             session=lambda handle: self.sessions.append(handle) or {"token": "t", "model": "m", "opening": ""},
             turn=lambda user, assistant: self.turns.append((user, assistant)) or self.state,
+            pronunciation=lambda pcm, expected, rate: self.pronunciations.append(
+                (pcm, expected, rate)
+            ) or {"score": 92},
         )
         self.client = TestClient(self.server.app)
 
@@ -281,6 +435,9 @@ class LearningWebApiTests(unittest.TestCase):
         page = self.client.get("/learning-english")
         self.assertEqual(page.status_code, 200)
         self.assertIn("English Learning Studio", page.text)
+        self.assertIn("Ruta de aprendizaje A1–C2", page.text)
+        self.assertIn("Repaso inteligente", page.text)
+        self.assertIn("Elige un escenario real", page.text)
         self.assertNotIn("gemini_api_key", page.text)
         self.assertEqual(self.client.get("/api/learning/state").status_code, 401)
         state = self.client.get("/api/learning/state", headers=self.headers)
@@ -306,8 +463,48 @@ class LearningWebApiTests(unittest.TestCase):
         self.assertEqual(ended.status_code, 200)
         self.assertEqual(self.actions[0][0], "exit")
 
+        scenario = self.client.post(
+            "/api/learning/action", headers=self.headers,
+            json={"action": "scenario", "scenario_id": "coffee-shop"},
+        )
+        review = self.client.post(
+            "/api/learning/action", headers=self.headers,
+            json={"action": "review-word", "word": "hello", "rating": "good"},
+        )
+        listening = self.client.post(
+            "/api/learning/action", headers=self.headers,
+            json={"action": "listening-activity", "activity_id": "missing-word"},
+        )
+        self.assertEqual(scenario.status_code, 200)
+        self.assertEqual(review.status_code, 200)
+        self.assertEqual(listening.status_code, 200)
+        self.assertEqual(
+            [item[0] for item in self.actions[-3:]],
+            ["scenario", "review-word", "listening-activity"],
+        )
+
+    def test_pronunciation_audio_reaches_the_optional_engine_callback(self):
+        response = self.client.post(
+            "/api/learning/pronunciation",
+            headers=self.headers,
+            json={
+                "expected_text": "Hello",
+                "sample_rate": 16000,
+                "pcm_base64": base64.b64encode(b"\x00\x00" * 80).decode("ascii"),
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["result"]["score"], 92)
+        self.assertEqual(self.pronunciations[0][1:], ("Hello", 16000))
+
 
 class LearningDesktopLaunchTests(unittest.TestCase):
+    def test_learning_keeps_the_user_requested_separate_browser_microphone(self):
+        browser_source = Path("dashboard/static/learning-english.js").read_text(encoding="utf-8")
+        desktop_source = Path("main.py").read_text(encoding="utf-8")
+        self.assertIn("navigator.mediaDevices.getUserMedia", browser_source)
+        self.assertIn("and not self._learning.active", desktop_source)
+
     def test_learning_button_callback_does_not_reference_remote_overlay_state(self):
         calls = []
 
