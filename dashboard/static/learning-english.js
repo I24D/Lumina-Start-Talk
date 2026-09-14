@@ -21,6 +21,7 @@
   const MODE_NAMES = {conversation:"Conversación",pronunciation:"Pronunciación",grammar:"Gramática",vocabulary:"Vocabulario",listening:"Comprensión",reading:"Lectura",writing:"Escritura","quick-lesson":"Lección rápida",assessment:"Evaluación de nivel"};
   const AUDIENCE_NAMES = {kids:"Niños",teens:"Jóvenes",adults:"Adultos"};
   const pronunciationReady = () => (state?.providers || []).some(item => item.id === "openpronounce" && item.state === "ready");
+  const recordingEnabled = () => !!state?.recordings?.available && state?.privacy?.save_recordings !== false;
   const leaveRole = (hadScenario) => hadScenario ? "Termina el escenario y deja el rol. " : "";
 
   // ── The tutor's own Gemini Live session ──────────────────────────────────
@@ -31,12 +32,15 @@
   const LIVE_URL = "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContentConstrained";
   const MIC_RATE = 16000;
   const VOICE_RATE = 24000;
+  const MAX_TURN_BLOCKS = 600;  // 30 s of 50 ms microphone blocks
   const live = {
     ws: null, ready: false, closing: false, handle: "", retries: 0, retryTimer: null,
     micStream: null, micContext: null, micNode: null,
     voiceContext: null, voiceSources: new Set(), voiceClock: 0,
     heard: "", said: "", typed: "", pendingControls: [],
-    recordedPcm: [], pronunciationTarget: "", queuedPronunciationTarget: "",
+    // The student's current spoken turn: microphone blocks from the end of the
+    // tutor's last turn until the tutor starts answering.
+    turnPcm: [], tutorAnswering: false, pronunciationTarget: "", queuedPronunciationTarget: "",
     lastPronunciation: null,
   };
 
@@ -129,6 +133,7 @@
     $("#onboarding-card").classList.toggle("hidden", snapshot.state !== "onboarding");
     $("#mic-chip").classList.toggle("online", !!live.micStream && snapshot.active && !snapshot.inputMuted && !snapshot.paused);
     $("#mic-chip").classList.toggle("warn", snapshot.inputMuted || snapshot.paused);
+    $("#rec-chip").classList.toggle("hidden", !(snapshot.recordings?.available && snapshot.privacy?.save_recordings !== false));
     $("#mic-chip").childNodes[$("#mic-chip").childNodes.length - 1].textContent = snapshot.inputMuted ? " Micrófono silenciado" : " Micrófono";
     $$("#mode-list button").forEach(button => button.classList.toggle("active", button.dataset.mode === snapshot.currentMode));
     $("#mute-button").classList.toggle("active", !snapshot.inputMuted);
@@ -306,18 +311,24 @@
     const details = errors.slice(0, 4).map(item =>
       `<li><b>${esc(item.word || "sonido")}</b>: ${esc(item.expected || "—")} → ${esc(item.actual || "omitido")}</li>`
     ).join("");
-    $("#correction-list").insertAdjacentHTML("afterbegin", `<article class="correction-card pronunciation-result"><span class="category">OpenPronounce · análisis fonético local</span><div class="pronunciation-score"><strong>${Math.round(score)}</strong><span>/100</span></div><p class="explanation"><b>Frase objetivo:</b> ${esc(expected)}</p>${transcript ? `<p class="explanation"><b>Se reconoció:</b> ${esc(transcript)}</p>` : ""}${details ? `<ul class="phoneme-errors">${details}</ul>` : '<p class="explanation">No se detectaron diferencias fonéticas importantes.</p>'}</article>`);
+    $("#correction-list").insertAdjacentHTML("afterbegin", `<article class="correction-card pronunciation-result"><span class="category">OpenPronounce · análisis fonético local</span><div class="pronunciation-score"><strong>${Math.round(score)}</strong><span>/100</span></div>${state?.catalog?.audience === "kids" ? '<p class="explanation">Puntuación aproximada: con voces de niños es menos precisa.</p>' : ""}<p class="explanation"><b>Frase objetivo:</b> ${esc(expected)}</p>${transcript ? `<p class="explanation"><b>Se reconoció:</b> ${esc(transcript)}</p>` : ""}${details ? `<ul class="phoneme-errors">${details}</ul>` : '<p class="explanation">No se detectaron diferencias fonéticas importantes.</p>'}</article>`);
   }
 
-  async function analyzePronunciation(parts, expected) {
-    if (!parts.length || !expected || !pronunciationReady()) return;
+  // One spoken student turn: Lumina scores it when there is a phrase to compare
+  // it with, and keeps it in Supabase unless recordings are turned off.
+  async function sendVoiceTurn(parts, transcript, tutorText, expected) {
+    const scoring = !!expected && pronunciationReady();
+    // Under half a second is a click or a cough, not a turn.
+    if (parts.length < 10 || (!scoring && !recordingEnabled())) return;
     try {
-      const data = await postJson("/api/learning/pronunciation", {
-        expected_text: expected,
-        sample_rate: MIC_RATE,
+      const data = await postJson("/api/learning/voice", {
         pcm_base64: joinPcmBase64(parts),
+        sample_rate: MIC_RATE,
+        transcript,
+        tutor_text: tutorText,
+        expected_text: scoring ? expected : "",
       });
-      renderPronunciationResult(data.result || {}, expected);
+      if (data.pronunciation) renderPronunciationResult(data.pronunciation, expected);
     } catch (error) {
       toast(error.message, true);
     }
@@ -363,11 +374,9 @@
     live.micNode = new AudioWorkletNode(live.micContext, "mic-capture");
     live.micNode.port.onmessage = event => {
       if (state?.paused || state?.inputMuted) return;
-      // Keep only the current student's turn, and only when the optional
-      // pronunciation engine is installed and has a target to compare against.
-      if (live.pronunciationTarget && pronunciationReady()) {
-        live.recordedPcm.push(event.data.slice(0));
-        while (live.recordedPcm.length > 600) live.recordedPcm.shift();
+      if (!live.tutorAnswering) {
+        live.turnPcm.push(event.data.slice(0));
+        if (live.turnPcm.length > MAX_TURN_BLOCKS) live.turnPcm.shift();
       }
       liveSend({realtimeInput: {audio: {mimeType: `audio/pcm;rate=${MIC_RATE}`, data: toBase64(event.data)}}});
     };
@@ -459,7 +468,7 @@
       return;
     }
     const content = message.serverContent; if (!content) return;
-    if (content.interrupted) stopVoice();
+    if (content.interrupted) { stopVoice(); live.tutorAnswering = false; }
     if (content.inputTranscription?.text) {
       live.heard += content.inputTranscription.text;
       $("#student-text").textContent = live.heard.trim();
@@ -469,15 +478,16 @@
       $("#assistant-text").textContent = live.said.trim();
     }
     for (const part of content.modelTurn?.parts || []) {
-      if (part.inlineData?.data) playVoice(part.inlineData.data);
+      if (part.inlineData?.data) { live.tutorAnswering = true; playVoice(part.inlineData.data); }
     }
     if (content.turnComplete) finishTurn();
   }
 
   function finishTurn() {
+    const spoken = !live.typed && !!live.heard.trim();
     const user = (live.typed || live.heard).trim();
     const assistant = live.said.trim();
-    const pronunciationAudio = live.recordedPcm.splice(0);
+    const turnAudio = live.turnPcm; live.turnPcm = []; live.tutorAnswering = false;
     const pronunciationTarget = live.pronunciationTarget;
     live.pronunciationTarget = "";
     live.heard = ""; live.said = ""; live.typed = "";
@@ -486,9 +496,7 @@
       live.queuedPronunciationTarget = "";
     }
     if (!user && !assistant) return;
-    if (user && pronunciationTarget) {
-      analyzePronunciation(pronunciationAudio, pronunciationTarget);
-    }
+    if (spoken) sendVoiceTurn(turnAudio, user, assistant, pronunciationTarget);
     postJson("/api/learning/turn", {user, assistant})
       .then(data => { if (data.state) render(data.state); })
       .catch(error => toast(error.message, true));
@@ -513,7 +521,7 @@
     const ws = live.ws; live.ws = null; live.ready = false; live.handle = "";
     try { ws?.close(); } catch (_) {}
     live.heard = ""; live.said = ""; live.typed = "";
-    live.recordedPcm = []; live.pronunciationTarget = "";
+    live.turnPcm = []; live.tutorAnswering = false; live.pronunciationTarget = "";
     live.queuedPronunciationTarget = "";
     live.lastPronunciation = null;
     $("#gemini-chip").classList.remove("online");
@@ -828,7 +836,6 @@
     const reviewPractice = target.closest("[data-review-practice]");
     if (reviewPractice) {
       $("#review-dialog").close();
-      live.recordedPcm = [];
       live.lastPronunciation = null;
       live.queuedPronunciationTarget = reviewPractice.dataset.reviewPractice;
       sendTeacherControl(`Practica la palabra '${reviewPractice.dataset.reviewPractice}' en una situación breve. No des la respuesta antes de que el estudiante lo intente.`);
@@ -848,7 +855,6 @@
     if (correctionPractice && state?.lastResponse?.corrections) {
       const correction = state.lastResponse.corrections[Number(correctionPractice.dataset.practice)];
       if (correction) {
-        live.recordedPcm = [];
         live.lastPronunciation = null;
         live.queuedPronunciationTarget = correction.corrected;
         sendTeacherControl(`Pide al estudiante repetir exactamente: '${correction.corrected}'. Espera su voz antes de corregir.`);
@@ -873,6 +879,7 @@
       $("#speed-select").value = state?.profile?.preferred_speed || "normal";
       $("#translation-select").value = String(state?.translationEnabled !== false);
       $("#weekly-select").value = String(state?.curriculum?.weekly_target || 3);
+      $("#recordings-select").value = String(state?.privacy?.save_recordings !== false);
       $("#settings-dialog").showModal();
     });
     $("#save-settings").addEventListener("click", event => {
@@ -882,8 +889,14 @@
         translation_enabled: $("#translation-select").value === "true",
         audience: $("#audience-select").value,
         weekly_target: Number($("#weekly-select").value),
+        save_recordings: $("#recordings-select").value === "true",
       }).then(data => { if (data) toast("Preferencias guardadas"); });
       $("#settings-dialog").close();
+    });
+    $("#delete-recordings").addEventListener("click", async () => {
+      if (!window.confirm("¿Borrar todas las grabaciones de voz guardadas en Supabase? No se pueden recuperar.")) return;
+      const data = await action("delete-recordings");
+      if (data) toast("Grabaciones borradas");
     });
     $("#summary-close").addEventListener("click", () => { $("#summary-dialog").close(); try { window.close(); } catch (_) {} });
     $("#input-mode-button").addEventListener("click", () => $("#message-input").focus());

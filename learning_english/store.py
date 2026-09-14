@@ -78,6 +78,8 @@ def _default_document() -> dict[str, Any]:
         },
         "placement": None,
         "activity_log": [],
+        # Spoken student turns go to Lumina's private Supabase storage.
+        "privacy": {"save_recordings": True},
         "last_lesson": None,
     }
 
@@ -108,6 +110,7 @@ def _normalise_document(raw: Any) -> dict[str, Any]:
         if not isinstance(curriculum.get(key), list):
             curriculum[key] = []
     result["metrics"] = {**default["metrics"], **result.get("metrics", {})}
+    result["privacy"] = {**default["privacy"], **result["privacy"]}
     level = str(result["profile"].get("level", "A1")).upper()
     result["profile"]["level"] = level if level in _LEVELS else "A1"
     if result["profile"].get("audience") not in AUDIENCES:
@@ -322,6 +325,11 @@ class LearningProgressStore:
             raise ValueError("Weekly target must be between 1 and 7 classes")
         with self._lock:
             self._load()["curriculum"]["weekly_target"] = value
+            self._commit()
+
+    def set_save_recordings(self, enabled: bool) -> None:
+        with self._lock:
+            self._load()["privacy"]["save_recordings"] = bool(enabled)
             self._commit()
 
     def apply_placement(self, level: str, *, correct: int, answered: int) -> None:

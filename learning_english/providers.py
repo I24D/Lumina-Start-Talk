@@ -1,14 +1,18 @@
-"""Optional local engines for objective grammar and pronunciation feedback."""
+"""Local engines for objective grammar and pronunciation feedback.
+
+Both run on this PC (see engines.py) and start with a class. Learner text and
+voice never go to LanguageTool's or OpenPronounce's public services.
+"""
 
 from __future__ import annotations
 
-import importlib.util
 import os
-import time
 from pathlib import Path
 from typing import Any
 
 import requests
+
+from .engines import LanguageToolServer, PronunciationWorker
 
 
 def _json_safe(value: Any) -> Any:
@@ -29,28 +33,64 @@ def _json_safe(value: Any) -> Any:
     return str(value)
 
 
-class LanguageToolProvider:
-    """Use a self-hosted LanguageTool server; never sends learner text publicly."""
+def _engine_status(engine: Any, *, ready_detail: str) -> tuple[str, str]:
+    if engine.ready.is_set():
+        return "ready", ready_detail
+    if engine.starting:
+        return "starting", "Arrancando en este equipo…"
+    if engine.installed:
+        return "installed", "Instalado; se activa al empezar la clase"
+    return "not-installed", "Instálalo con: python -m learning_english.engines install"
 
-    def __init__(self, endpoint: str | None = None, *, timeout: float = 1.2):
-        self.endpoint = (endpoint or os.getenv("LUMINA_LANGUAGETOOL_URL") or "http://127.0.0.1:8081/v2/check").rstrip("/")
+
+class LanguageToolProvider:
+    """LanguageTool for the class, or the server at LUMINA_LANGUAGETOOL_URL."""
+
+    def __init__(
+        self,
+        endpoint: str | None = None,
+        *,
+        server: LanguageToolServer | None = None,
+        timeout: float = 4.0,
+    ):
+        self._external = (endpoint or os.getenv("LUMINA_LANGUAGETOOL_URL") or "").rstrip("/")
+        self.server = None if self._external else (server or LanguageToolServer())
         self.timeout = timeout
-        self._retry_after = 0.0
         self._last_error = ""
-        self._available = False
+
+    @property
+    def endpoint(self) -> str:
+        return self._external or self.server.endpoint
+
+    @property
+    def ready(self) -> bool:
+        return bool(self._external) or self.server.ready.is_set()
+
+    def start(self) -> None:
+        if self.server is not None:
+            self.server.start()
+
+    def stop(self) -> None:
+        if self.server is not None:
+            self.server.stop()
 
     def status(self) -> dict[str, Any]:
+        if self._external:
+            state = "optional" if self._last_error else "ready"
+            detail = f"Servidor externo ({self._external})"
+        else:
+            state, detail = _engine_status(self.server, ready_detail="Revisión gramatical local activa")
         return {
             "id": "languagetool",
             "label": "LanguageTool",
-            "state": "ready" if self._available else "optional",
-            "detail": "Verificación gramatical local activa" if self._available else "Servidor local opcional en 127.0.0.1:8081",
+            "state": state,
+            "detail": detail,
             "lastError": self._last_error,
         }
 
     def check(self, text: str, language: str = "en-US") -> list[dict[str, str]]:
         text = str(text or "").strip()
-        if not text or time.monotonic() < self._retry_after:
+        if not text or not self.ready:
             return []
         try:
             response = requests.post(
@@ -60,12 +100,9 @@ class LanguageToolProvider:
             )
             response.raise_for_status()
             payload = response.json()
-            self._available = True
             self._last_error = ""
         except Exception as exc:
-            self._available = False
             self._last_error = type(exc).__name__
-            self._retry_after = time.monotonic() + 60
             return []
 
         corrections: list[dict[str, str]] = []
@@ -93,46 +130,69 @@ class LanguageToolProvider:
 
 
 class OpenPronounceProvider:
-    """Status and analysis adapter for the optional OpenPronounce runtime."""
+    """OpenPronounce for the class, or the server at LUMINA_OPENPRONOUNCE_URL."""
 
-    def __init__(self, endpoint: str | None = None, *, timeout: float = 120.0):
-        self.endpoint = (endpoint or os.getenv("LUMINA_OPENPRONOUNCE_URL") or "").rstrip("/")
+    def __init__(
+        self,
+        endpoint: str | None = None,
+        *,
+        worker: PronunciationWorker | None = None,
+        timeout: float = 120.0,
+    ):
+        self._external = (endpoint or os.getenv("LUMINA_OPENPRONOUNCE_URL") or "").rstrip("/")
+        self.worker = None if self._external else (worker or PronunciationWorker())
         self.timeout = timeout
-        self._installed = importlib.util.find_spec("openpronounce") is not None
         self._last_error = ""
 
+    @property
+    def ready(self) -> bool:
+        return bool(self._external) or self.worker.ready.is_set()
+
+    def start(self) -> None:
+        if self.worker is not None:
+            self.worker.start()
+
+    def stop(self) -> None:
+        if self.worker is not None:
+            self.worker.stop()
+
     def status(self) -> dict[str, Any]:
-        ready = bool(self.endpoint or self._installed)
+        if self._external:
+            state, detail = "ready", f"Servidor externo ({self._external})"
+        else:
+            state, detail = _engine_status(self.worker, ready_detail="Evaluación fonética local activa")
         return {
             "id": "openpronounce",
             "label": "OpenPronounce",
-            "state": "ready" if ready else "not-installed",
-            "detail": "Evaluación fonética local disponible" if ready else "Paquete opcional; los modelos no se incluyen en Lumina",
+            "state": state,
+            "detail": detail,
             "lastError": self._last_error,
         }
 
     def analyze_file(self, audio_path: str | Path, expected_text: str) -> dict[str, Any] | None:
         path = Path(audio_path)
         expected = str(expected_text or "").strip()
-        if not path.is_file() or not expected:
+        if not path.is_file() or not expected or not self.ready:
             return None
         try:
-            if self.endpoint:
+            if self._external:
                 with path.open("rb") as audio:
                     response = requests.post(
-                        f"{self.endpoint}/pronunciation",
+                        f"{self._external}/pronunciation",
                         files={"file": (path.name, audio, "audio/wav")},
                         data={"expected_text": expected, "lang": "en"},
                         timeout=self.timeout,
                     )
                 response.raise_for_status()
-                return _json_safe(response.json())
-            if self._installed:
-                from openpronounce import compare_audio_with_text, load_audio
-
-                return _json_safe(
-                    compare_audio_with_text(load_audio(str(path)), expected, lang="en")
-                )
+                result = response.json()
+                result.pop("prosody", None)
+            else:
+                result = self.worker.analyze(path, expected, timeout=self.timeout)
+                if result is None:
+                    self._last_error = self.worker.last_error
+                    return None
+            self._last_error = ""
+            return _json_safe(result)
         except Exception as exc:
             self._last_error = type(exc).__name__
-        return None
+            return None

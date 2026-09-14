@@ -33,6 +33,7 @@
       <div class="connection-cluster">
         <span class="status-chip" id="gemini-chip"><i></i>Gemini</span>
         <span class="status-chip" id="mic-chip"><i></i>Micrófono</span>
+        <span class="status-chip hidden" id="rec-chip" title="Tus respuestas habladas se guardan en el Supabase privado de Lumina"><i></i>Grabando</span>
         <button class="icon-button" id="settings-button" type="button" title="Configuración" aria-label="Configuración">⚙</button>
         <button class="danger-button" id="end-button" type="button">Terminar clase</button>
       </div>
@@ -184,7 +185,9 @@
       <label>Velocidad preferida<select id="speed-select"><option value="slow">Lenta</option><option value="normal" selected>Normal</option><option value="natural">Natural</option></select></label>
       <label>Mostrar traducciones<select id="translation-select"><option value="true">Cuando sean necesarias</option><option value="false">Solo inglés</option></select></label>
       <label>Meta semanal<select id="weekly-select"><option value="1">1 clase</option><option value="2">2 clases</option><option value="3" selected>3 clases</option><option value="4">4 clases</option><option value="5">5 clases</option><option value="7">Todos los días</option></select></label>
-      <p>La evaluación fonética avanzada está desacoplada. Con la transcripción actual, Lumina evalúa inteligibilidad sin fingir puntuaciones por fonema.</p>
+      <label>Grabaciones de voz<select id="recordings-select"><option value="true">Guardar mis respuestas habladas en Supabase</option><option value="false">No guardar grabaciones</option></select></label>
+      <button type="button" class="ghost-button danger-inline" id="delete-recordings">Borrar todas mis grabaciones</button>
+      <p>LanguageTool y OpenPronounce corren en este equipo y se activan al empezar la clase. Las grabaciones van al Supabase privado de Lumina; si quien aprende es un niño, guárdalas solo con permiso de su madre, padre o tutor.</p>
       <div class="provider-list" id="provider-list"></div>
       <button class="dialog-save" id="save-settings" value="default">Guardar</button>
     </form>

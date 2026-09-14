@@ -243,7 +243,12 @@ class LearningCatalogAndReviewTests(unittest.TestCase):
 
 class LearningProviderTests(unittest.TestCase):
     def test_languagetool_defaults_to_localhost_and_maps_objective_finding(self):
-        provider = LanguageToolProvider(timeout=0.01)
+        # A class's local server that has finished warming up.
+        server = type("ReadyServer", (), {
+            "endpoint": "http://127.0.0.1:8081/v2/check",
+            "ready": type("Ready", (), {"is_set": staticmethod(lambda: True)})(),
+        })()
+        provider = LanguageToolProvider(server=server, timeout=0.01)
 
         class Response:
             @staticmethod
@@ -424,16 +429,16 @@ class LearningWebApiTests(unittest.TestCase):
         self.state = {"active": True, "state": "lesson"}
         self.sessions = []
         self.turns = []
-        self.pronunciations = []
+        self.voices = []
         self.actions = []
         self.server.set_learning_callbacks(
             state=lambda: self.state,
             action=lambda name, body: self.actions.append((name, body)) or self.state,
             session=lambda handle: self.sessions.append(handle) or {"token": "t", "model": "m", "opening": ""},
             turn=lambda user, assistant: self.turns.append((user, assistant)) or self.state,
-            pronunciation=lambda pcm, expected, rate: self.pronunciations.append(
-                (pcm, expected, rate)
-            ) or {"score": 92},
+            voice=lambda pcm, rate, details: self.voices.append(
+                (pcm, rate, details)
+            ) or {"pronunciation": {"score": 92}, "saved": True},
         )
         self.client = TestClient(self.server.app)
 
@@ -490,19 +495,21 @@ class LearningWebApiTests(unittest.TestCase):
             ["scenario", "review-word", "listening-activity"],
         )
 
-    def test_pronunciation_audio_reaches_the_optional_engine_callback(self):
+    def test_a_spoken_turn_reaches_the_voice_callback(self):
         response = self.client.post(
-            "/api/learning/pronunciation",
+            "/api/learning/voice",
             headers=self.headers,
             json={
                 "expected_text": "Hello",
+                "transcript": "Hello",
                 "sample_rate": 16000,
                 "pcm_base64": base64.b64encode(b"\x00\x00" * 80).decode("ascii"),
             },
         )
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json()["result"]["score"], 92)
-        self.assertEqual(self.pronunciations[0][1:], ("Hello", 16000))
+        self.assertEqual(response.json()["pronunciation"]["score"], 92)
+        self.assertEqual(self.voices[0][1], 16000)
+        self.assertEqual(self.voices[0][2]["expected_text"], "Hello")
 
 
 class LearningDesktopLaunchTests(unittest.TestCase):

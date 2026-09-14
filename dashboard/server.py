@@ -480,7 +480,7 @@ class DashboardServer:
         self._learning_action_callback    = None
         self._learning_session_callback   = None
         self._learning_turn_callback      = None
-        self._learning_pronunciation_callback = None
+        self._learning_voice_callback       = None
         self._learning_placement_callback = None
         self._learning_activity_callback  = None
         self._startup_event              = asyncio.Event()
@@ -578,14 +578,14 @@ class DashboardServer:
         self._connect_callback = fn
 
     def set_learning_callbacks(
-        self, *, state=None, action=None, session=None, turn=None, pronunciation=None,
+        self, *, state=None, action=None, session=None, turn=None, voice=None,
         placement=None, activity=None,
     ) -> None:
         self._learning_state_callback = state
         self._learning_action_callback = action
         self._learning_session_callback = session
         self._learning_turn_callback = turn
-        self._learning_pronunciation_callback = pronunciation
+        self._learning_voice_callback = voice
         self._learning_placement_callback = placement
         self._learning_activity_callback = activity
 
@@ -845,29 +845,31 @@ class DashboardServer:
                     {"error": f"Turn failed ({type(exc).__name__})"}, status_code=503
                 )
 
-        @app.post("/api/learning/pronunciation")
-        async def learning_pronunciation(req: Request):
+        @app.post("/api/learning/voice")
+        async def learning_voice(req: Request):
             if not _auth(req):
                 return JSONResponse({"error": "Unauthorized"}, status_code=401)
             try:
                 body = await req.json()
-                expected = str(body.get("expected_text") or "").strip()[:500]
                 sample_rate = int(body.get("sample_rate") or 16000)
                 pcm = base64.b64decode(str(body.get("pcm_base64") or ""), validate=True)
+                details = {
+                    key: str(body.get(key) or "").strip()[:4000]
+                    for key in ("transcript", "tutor_text", "expected_text")
+                }
             except Exception:
-                return JSONResponse({"error": "Invalid pronunciation recording"}, status_code=400)
-            if not expected or not pcm or len(pcm) > 1_280_000 or sample_rate not in {16000, 24000, 48000}:
-                return JSONResponse({"error": "Invalid pronunciation recording"}, status_code=400)
+                return JSONResponse({"error": "Invalid voice turn"}, status_code=400)
+            # 16-bit mono PCM, at most 40 s at 16 kHz.
+            if not pcm or len(pcm) % 2 or len(pcm) > 1_280_000 or sample_rate not in {16000, 24000, 48000}:
+                return JSONResponse({"error": "Invalid voice turn"}, status_code=400)
             try:
-                result = await _invoke(
-                    self._learning_pronunciation_callback, pcm, expected, sample_rate
-                )
-                return JSONResponse({"ok": True, "result": result})
+                result = await _invoke(self._learning_voice_callback, pcm, sample_rate, details)
+                return JSONResponse({"ok": True, **result})
             except RuntimeError as exc:
                 return JSONResponse({"error": str(exc)[:160]}, status_code=409)
             except Exception as exc:
                 return JSONResponse(
-                    {"error": f"Pronunciation failed ({type(exc).__name__})"}, status_code=503
+                    {"error": f"Voice turn failed ({type(exc).__name__})"}, status_code=503
                 )
 
         @app.post("/api/learning/placement")
@@ -927,7 +929,7 @@ class DashboardServer:
             allowed = {
                 "enter", "exit", "pause", "resume", "mute", "unmute",
                 "translation", "mode", "scenario", "scenario-end", "unit", "save-word",
-                "review-word", "listening-activity", "audience", "settings",
+                "review-word", "listening-activity", "audience", "delete-recordings", "settings",
             }
             if action_name not in allowed:
                 return JSONResponse({"error": "Unsupported action"}, status_code=400)

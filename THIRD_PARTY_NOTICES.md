@@ -1,21 +1,35 @@
 # Learning English third-party notes
 
 Lumina's Learning English implementation is original code. The following
-projects are dependencies, optional integrations, or product references.
+projects are dependencies, local engines, a hosted model, or product references.
 
 ## Runtime dependency
 
 - Py-FSRS (`fsrs`) — MIT License. Used to schedule vocabulary reviews.
   <https://github.com/open-spaced-repetition/py-fsrs>
 
-## Optional local integrations
+## Local engines, installed on demand
 
-- OpenPronounce — MIT License. Lumina contains an adapter but does not bundle
-  the package, speech models, ffmpeg, espeak-ng or model weights.
-  <https://github.com/Halleck45/OpenPronounce>
-- LanguageTool — LGPL-2.1-or-later. Lumina can call a separately operated local
-  LanguageTool HTTP server; LanguageTool itself is not bundled.
+`python -m learning_english.engines install` downloads these into
+`%LOCALAPPDATA%\LuminaStartTalk\engines`. None of them is part of this
+repository, and each runs unmodified in its own process.
+
+- LanguageTool — LGPL-2.1-or-later. Run as a loopback-only HTTP server.
   <https://github.com/languagetool-org/languagetool>
+- Eclipse Temurin JRE 21 — GPL-2.0 with the Classpath Exception. The Java runtime
+  LanguageTool runs on. <https://adoptium.net/>
+- OpenPronounce — MIT License. Run in its own Python environment.
+  <https://github.com/Halleck45/OpenPronounce>
+- eSpeak NG — GPL-3.0. Unpacked for OpenPronounce's phonemizer.
+  <https://github.com/espeak-ng/espeak-ng>
+- `facebook/wav2vec2-large-960h` and `facebook/wav2vec2-lv-60-espeak-cv-ft` —
+  Apache-2.0. Speech models OpenPronounce downloads from Hugging Face.
+
+## Hosted model
+
+- Gemma 4 (`gemma4:31b`), served by Ollama Cloud. Lumina sends it the text of a
+  student's turn for analysis; its use follows the model's own license and
+  Ollama's terms. <https://ollama.com/library/gemma4>
 
 ## Product references only
 

@@ -1,10 +1,13 @@
 """Gemini services for the English tutor: the browser's live session token,
-the structured analysis of each finished turn, and generated practice."""
+the structured analysis of each finished turn, generated practice, and the
+local engines that back them."""
 
 from __future__ import annotations
 
 import json
+import tempfile
 import time
+import wave
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -15,6 +18,7 @@ from google.genai import types
 from memory.config_manager import get_gemini_key
 from .activities import build_request as build_activity_request
 from .activities import schema_for, validate as validate_activity
+from .ollama_cloud import OllamaCloud, OllamaCloudError
 from .providers import LanguageToolProvider, OpenPronounceProvider
 from .types import Correction, TutorResponse
 
@@ -30,7 +34,12 @@ MODEL = "gemini-3.6-flash"
 # Free-tier text quotas are per model and per day: 3.6 Flash allowed 20 requests
 # a day on 2026-09-14, and every analysed turn spends one. When a model's quota
 # is spent, the next lighter model takes over instead of the corrections stopping.
-TEXT_MODELS = (MODEL, "gemini-3.5-flash-lite", "gemini-2.5-flash-lite")
+GEMINI_TEXT_MODELS = (MODEL, "gemini-3.5-flash-lite", "gemini-2.5-flash-lite")
+# Gemma 4 on Ollama Cloud answered an analysis in 2-3 s with every key and
+# Gemini-grade corrections, so it leads the per-turn analysis and saves Gemini's
+# quota. Writing a whole activity stalled past 180 s, so there it comes last.
+ANALYSIS_CHAIN = (("ollama", ""), *(("gemini", model) for model in GEMINI_TEXT_MODELS))
+ACTIVITY_CHAIN = (*(("gemini", model) for model in GEMINI_TEXT_MODELS), ("ollama", ""))
 
 _RESPONSE_SCHEMA = {
     "type": "object",
@@ -102,7 +111,14 @@ def _quota_spent(exc: Exception) -> bool:
 
 
 def _busy(exc: Exception) -> bool:
-    return getattr(exc, "code", None) in (500, 503) or "UNAVAILABLE" in str(exc)
+    return getattr(exc, "code", None) in (500, 502, 503) or "UNAVAILABLE" in str(exc)
+
+
+def _complete_analysis(raw: Any) -> dict[str, Any]:
+    """A helper model that renames or drops keys must not pass as an analysis."""
+    if not isinstance(raw, dict) or any(key not in raw for key in _RESPONSE_SCHEMA["required"]):
+        raise ValueError("the analysis is missing required keys")
+    return raw
 
 
 class LearningEnglishService:
@@ -113,6 +129,7 @@ class LearningEnglishService:
         generator: Callable[..., Any] | None = None,
         token_factory: Callable[[dict[str, Any]], str] | None = None,
         client_factory: Callable[[str], Any] | None = None,
+        ollama: OllamaCloud | None = None,
         grammar_provider: LanguageToolProvider | None = None,
         pronunciation_provider: OpenPronounceProvider | None = None,
     ):
@@ -120,6 +137,7 @@ class LearningEnglishService:
         self._generator = generator
         self._token_factory = token_factory
         self._client_factory = client_factory or (lambda key: genai.Client(api_key=key))
+        self._ollama = ollama if ollama is not None else OllamaCloud.from_env()
         self._grammar = grammar_provider or LanguageToolProvider()
         self._pronunciation = pronunciation_provider or OpenPronounceProvider()
         self._system_prompt = PROMPT_PATH.read_text(encoding="utf-8")
@@ -128,6 +146,25 @@ class LearningEnglishService:
 
     def provider_status(self) -> list[dict[str, Any]]:
         return [self._grammar.status(), self._pronunciation.status()]
+
+    def start_engines(self, on_change: Callable[[], None] | None = None) -> None:
+        """Start the local engines in the background for a class."""
+        for provider in (self._grammar, self._pronunciation):
+            engine = getattr(provider, "server", None) or getattr(provider, "worker", None)
+            if engine is not None:
+                engine.on_ready = on_change
+            start = getattr(provider, "start", None)
+            if start:
+                start()
+
+    def stop_engines(self) -> None:
+        for provider in (self._grammar, self._pronunciation):
+            stop = getattr(provider, "stop", None)
+            if stop:
+                stop()
+
+    def pronunciation_ready(self) -> bool:
+        return bool(getattr(self._pronunciation, "ready", False))
 
     def build_live_system_prompt(
         self,
@@ -232,47 +269,67 @@ class LearningEnglishService:
         request: dict[str, Any],
         schema: dict[str, Any],
         *,
+        chain: tuple[tuple[str, str], ...],
         system_instruction: str,
         temperature: float,
         max_output_tokens: int,
-    ) -> str:
-        """JSON text from the first text model that still has quota."""
-        key = self._api_key_loader()
-        if not key:
-            raise RuntimeError("Gemini API key is not configured")
-        client = self._client_factory(key)
+        timeout: float,
+        validate: Callable[[Any], Any],
+    ) -> Any:
+        """The first usable, validated JSON result along a chain of text models."""
         failure: Exception | None = None
-        for model in TEXT_MODELS:
-            if self._spent_until.get(model, 0.0) > time.monotonic():
+        for provider, model in chain:
+            name = f"{provider}:{model or self._ollama.model}"
+            if self._spent_until.get(name, 0.0) > time.monotonic():
                 continue
             try:
-                response = client.models.generate_content(
-                    model=model,
-                    contents=json.dumps(request, ensure_ascii=False),
-                    config=types.GenerateContentConfig(
-                        system_instruction=system_instruction,
-                        response_mime_type="application/json",
-                        response_json_schema=schema,
-                        temperature=temperature,
-                        max_output_tokens=max_output_tokens,
-                    ),
-                )
+                if provider == "ollama":
+                    if not self._ollama.configured:
+                        continue
+                    text = self._ollama.chat_json(
+                        system=system_instruction, request=request, schema=schema,
+                        temperature=temperature, timeout=timeout,
+                    )
+                else:
+                    key = self._api_key_loader()
+                    if not key:
+                        continue
+                    text = self._client_factory(key).models.generate_content(
+                        model=model,
+                        contents=json.dumps(request, ensure_ascii=False),
+                        config=types.GenerateContentConfig(
+                            system_instruction=system_instruction,
+                            response_mime_type="application/json",
+                            response_json_schema=schema,
+                            temperature=temperature,
+                            max_output_tokens=max_output_tokens,
+                        ),
+                    ).text
+                return validate(json.loads(text) if isinstance(text, str) else text)
+            except ValueError as exc:
+                # Unusable JSON or content: the next model may do better.
+                print(f"[Learning English] {name} gave unusable output ({exc}); trying the next model")
+                failure = exc
             except Exception as exc:
                 if _quota_spent(exc):
                     # A daily limit stays spent for hours; a per-minute one clears fast.
                     wait = 3600 if "PerDay" in str(exc) else 60
-                    self._spent_until[model] = time.monotonic() + wait
-                    print(f"[Learning English] {model} is out of quota; trying the next model")
+                    self._spent_until[name] = time.monotonic() + wait
+                    print(f"[Learning English] {name} is out of quota; trying the next model")
                 elif _busy(exc):
                     # Overloaded for this request only (measured: a 503 from
                     # 3.5 Flash-Lite that the next request did not repeat).
-                    print(f"[Learning English] {model} is busy; trying the next model")
+                    print(f"[Learning English] {name} is busy; trying the next model")
+                elif isinstance(exc, OllamaCloudError):
+                    # A helper with a rejected key must not stop the class.
+                    self._spent_until[name] = time.monotonic() + 600
+                    print(f"[Learning English] {name} failed ({exc}); trying the next model")
                 else:
                     raise
                 failure = exc
-                continue
-            return response.text
-        raise failure or RuntimeError("RESOURCE_EXHAUSTED: every Gemini text model is out of quota")
+        if failure is not None:
+            raise failure
+        raise RuntimeError("RESOURCE_EXHAUSTED: no text model is available for Learning English")
 
     def analyze_turn(
         self,
@@ -315,6 +372,10 @@ class LearningEnglishService:
                 "Set profileUpdates.audience only when the student said the class is "
                 "for a child, a teenager or an adult.",
                 "lessonProgress must never be lower than currentProgress.",
+                # Gemma 4 once returned "await_user_response" here; the studio
+                # shows this field to the student as it is.
+                "nextAction is one short sentence for the student, in their primary "
+                "language, saying what to do next; never a code or identifier.",
             ],
         }
         try:
@@ -324,6 +385,7 @@ class LearningEnglishService:
                 raw = self._generate_json(
                     request,
                     _RESPONSE_SCHEMA,
+                    chain=ANALYSIS_CHAIN,
                     system_instruction=(
                         "You are the structured evaluator for Lumina Learning. "
                         "Return only the requested JSON. The live tutor already spoke; "
@@ -331,6 +393,8 @@ class LearningEnglishService:
                     ),
                     temperature=0.1,
                     max_output_tokens=1800,
+                    timeout=25,
+                    validate=_complete_analysis,
                 )
             if isinstance(raw, str):
                 raw = json.loads(raw)
@@ -366,34 +430,48 @@ class LearningEnglishService:
     def generate_activity(self, kind: str, snapshot: dict[str, Any]) -> dict[str, Any]:
         """A checkpoint or guided reading for the current unit, validated.
 
-        Raises ValueError when the content cannot be used. The returned activity
-        still carries its answer key, which only Lumina's server keeps."""
+        Raises ValueError when no model wrote usable content. The returned
+        activity still carries its answer key, which only Lumina's server keeps."""
         request = build_activity_request(kind, snapshot)
         schema = schema_for(kind)
+        unit_id = str((snapshot.get("currentUnit") or {}).get("id") or "")
         if self._generator:
             raw = self._generator(request=request, schema=schema)
-        else:
-            raw = self._generate_json(
-                request,
-                schema,
-                system_instruction=(
-                    "You write practice material for Lumina Learning, an English "
-                    "course for children, teenagers and adults. Return only the "
-                    "requested JSON."
-                ),
-                temperature=0.7,
-                max_output_tokens=6000,
-            )
-        if isinstance(raw, str):
-            raw = json.loads(raw)
-        unit = snapshot.get("currentUnit") or {}
-        return validate_activity(kind, raw, unit_id=str(unit.get("id") or ""))
+            return validate_activity(kind, json.loads(raw) if isinstance(raw, str) else raw, unit_id=unit_id)
+        return self._generate_json(
+            request,
+            schema,
+            chain=ACTIVITY_CHAIN,
+            system_instruction=(
+                "You write practice material for Lumina Learning, an English "
+                "course for children, teenagers and adults. Return only the "
+                "requested JSON."
+            ),
+            temperature=0.7,
+            max_output_tokens=6000,
+            timeout=75,
+            validate=lambda raw: validate_activity(kind, raw, unit_id=unit_id),
+        )
 
-    def analyze_pronunciation_file(
-        self, audio_path: str, expected_text: str
+    def analyze_pronunciation(
+        self, pcm: bytes, sample_rate: int, expected_text: str
     ) -> dict[str, Any] | None:
-        """Run real phoneme analysis only when the optional local engine exists."""
-        return self._pronunciation.analyze_file(audio_path, expected_text)
+        """Score a spoken attempt with OpenPronounce; None when it is not running."""
+        if not self.pronunciation_ready():
+            return None
+        path = ""
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp:
+                path = temp.name
+            with wave.open(path, "wb") as wav:
+                wav.setnchannels(1)
+                wav.setsampwidth(2)
+                wav.setframerate(sample_rate)
+                wav.writeframes(pcm)
+            return self._pronunciation.analyze_file(path, expected_text)
+        finally:
+            if path:
+                Path(path).unlink(missing_ok=True)
 
     @staticmethod
     def _current_progress(snapshot: dict[str, Any]) -> int:

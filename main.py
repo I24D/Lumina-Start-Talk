@@ -171,6 +171,7 @@ from core                      import undo as undo_stack
 from core                      import confirm as confirm_gate
 from core                      import audio_devices
 from learning_english import LearningEnglishController, LearningEnglishService
+from learning_english.recordings import VoiceRecordings
 from learning_english.intent import confirmation_answer, detect_learning_english_intent
 
 def get_base_dir():
@@ -1290,6 +1291,7 @@ class JarvisLive:
         self._learning_analysis_lock: asyncio.Lock | None = None
         self._learning = LearningEnglishController(event_sink=self._emit_learning_event)
         self._learning_service = LearningEnglishService(api_key_loader=_get_api_key)
+        self._learning_recordings = VoiceRecordings(BASE_DIR)
         self._turn_done_event: asyncio.Event | None = None
         self._dashboard     = None
         self._briefing_sent    = False          # morning briefing fires once per process
@@ -1657,6 +1659,7 @@ class JarvisLive:
     def _learning_snapshot(self) -> dict:
         snapshot = self._learning.snapshot()
         snapshot["providers"] = self._learning_service.provider_status()
+        snapshot["recordings"] = {"available": self._learning_recordings.available}
         return snapshot
 
     def _broadcast_learning(self, message: dict) -> None:
@@ -1675,6 +1678,10 @@ class JarvisLive:
                 )
         except Exception:
             pass
+
+    def _broadcast_learning_snapshot(self) -> None:
+        """Safe from any thread: the engines call it when they become ready."""
+        self._broadcast_learning({"type": "learning.snapshot", "state": self._learning_snapshot()})
 
     def _on_learning_english_clicked(self) -> None:
         """Qt-thread entrypoint. Scheduling keeps the desktop UI responsive."""
@@ -1742,6 +1749,9 @@ class JarvisLive:
         if self._live_vision_source:
             self.stop_live_vision()
         self._learning.enter(trigger)
+        # LanguageTool and OpenPronounce warm up in their own processes while the
+        # tutor connects; the studio hears when each one is ready.
+        self._learning_service.start_engines(on_change=self._broadcast_learning_snapshot)
         self._learning_confirmation_pending = False
         self._learning_confirmation_prompt_pending = False
         self.ui.write_log(
@@ -1763,6 +1773,7 @@ class JarvisLive:
                 completed = self._learning.complete()
         else:
             completed = self._learning.complete()
+        await asyncio.get_running_loop().run_in_executor(None, self._learning_service.stop_engines)
         self._broadcast_learning({
             "type": "learning.snapshot", "state": self._learning_snapshot()
         })
@@ -1802,41 +1813,35 @@ class JarvisLive:
         asyncio.create_task(self._process_learning_turn(user_text, assistant_text))
         return self._learning_snapshot()
 
-    async def _learning_pronunciation(
-        self, pcm: bytes, expected_text: str, sample_rate: int
-    ) -> dict:
-        """Evaluate browser-captured PCM with the optional local engine."""
+    async def _learning_voice(self, pcm: bytes, sample_rate: int, details: dict) -> dict:
+        """One spoken student turn: scored when there is a phrase to compare it
+        with and OpenPronounce runs, and saved to Supabase unless turned off."""
         if not self._learning.active:
             raise RuntimeError("Learning English is not active")
-        import tempfile
-        import wave
-
-        path = ""
-        try:
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp:
-                path = temp.name
-            with wave.open(path, "wb") as wav:
-                wav.setnchannels(1)
-                wav.setsampwidth(2)
-                wav.setframerate(sample_rate)
-                wav.writeframes(pcm)
+        expected = str(details.get("expected_text") or "")
+        result = None
+        if expected:
             result = await asyncio.get_running_loop().run_in_executor(
                 None,
-                lambda: self._learning_service.analyze_pronunciation_file(
-                    path, expected_text
-                ),
+                lambda: self._learning_service.analyze_pronunciation(pcm, sample_rate, expected),
             )
-        finally:
-            if path:
-                try:
-                    Path(path).unlink(missing_ok=True)
-                except Exception:
-                    pass
-        if not result:
-            raise RuntimeError(
-                "OpenPronounce is not installed or its local service is unavailable"
-            )
-        return result
+        snapshot = self._learning_snapshot()
+        saved = False
+        if (snapshot.get("privacy") or {}).get("save_recordings", True):
+            saved = self._learning_recordings.save(pcm, sample_rate, {
+                "session_id": snapshot.get("current_session_id", ""),
+                "audience": (snapshot.get("catalog") or {}).get("audience", ""),
+                "level": (snapshot.get("profile") or {}).get("level", ""),
+                "mode": snapshot.get("currentMode", ""),
+                "unit_id": (snapshot.get("currentUnit") or {}).get("id", ""),
+                "scenario_id": (snapshot.get("activeScenario") or {}).get("id", ""),
+                "transcript": details.get("transcript", ""),
+                "tutor_text": details.get("tutor_text", ""),
+                "expected_text": expected,
+                "pronunciation_score": (result or {}).get("score"),
+                "pronunciation": result,
+            })
+        return {"pronunciation": result, "saved": saved}
 
     async def _learning_placement(self, answers: list) -> dict:
         """One step of the studio's written placement test."""
@@ -1918,6 +1923,11 @@ class JarvisLive:
             )
         elif action == "audience":
             self._learning.set_audience(str(body.get("audience") or ""))
+        elif action == "delete-recordings":
+            removed = await asyncio.get_running_loop().run_in_executor(
+                None, self._learning_recordings.delete_all
+            )
+            self.ui.write_log(f"SYS: Learning English deleted {removed} saved voice turns.")
         elif action == "settings":
             preferred = str(body.get("preferred_speed") or "normal")
             if preferred not in {"slow", "normal", "natural"}:
@@ -1926,6 +1936,8 @@ class JarvisLive:
                 self._learning.set_audience(str(body.get("audience") or ""))
             if "weekly_target" in body:
                 self._learning.store.set_weekly_target(body.get("weekly_target"))
+            if "save_recordings" in body:
+                self._learning.store.set_save_recordings(bool(body.get("save_recordings")))
             self._learning.translation_enabled = bool(body.get("translation_enabled", True))
             self._learning.store.update_profile({"preferred_speed": preferred})
         snapshot = self._learning_snapshot()
@@ -4055,7 +4067,7 @@ class JarvisLive:
                 action=self._learning_web_action,
                 session=self._learning_live_session,
                 turn=self._learning_turn,
-                pronunciation=self._learning_pronunciation,
+                voice=self._learning_voice,
                 placement=self._learning_placement,
                 activity=self._learning_activity,
             )

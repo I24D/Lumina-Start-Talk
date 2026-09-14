@@ -192,16 +192,42 @@ tutor spoke are not analysed at all. The browser microphone and the tutor's Live
 session remain separate by design; the general assistant still pauses its own
 input for the whole class.
 
-Two local providers are optional and isolated behind Lumina-owned adapters:
+**Local engines.** LanguageTool and OpenPronounce run on this PC, never on their
+public services, each in its own process so neither shares memory with Lumina's
+voice. They live outside the repository, in
+`%LOCALAPPDATA%\LuminaStartTalk\engines`, and are installed once with:
 
-- `LUMINA_LANGUAGETOOL_URL` defaults to `http://127.0.0.1:8081/v2/check` and
-  adds objective grammar findings before Gemini explains them. Learner text is
-  never sent to LanguageTool's public service.
-- `LUMINA_OPENPRONOUNCE_URL` can point to a local OpenPronounce server, or the
-  `openpronounce` package can be installed in Lumina's environment. When it is
-  available, **Practicar de nuevo** records the next attempt from the studio's
-  existing browser microphone and shows its real score and phoneme differences.
-  Its large speech models are deliberately not included in Lumina or its setup.
+```powershell
+.venv\Scripts\python.exe -m learning_english.engines install
+```
+
+- **LanguageTool** runs on a portable, checksum-verified Java 21 as a server that
+  only listens on loopback. It starts with each class, warms up before the first
+  turn (its first check took over 10 s) and stops when the class ends. Its
+  objective findings join the corrections. `LUMINA_LANGUAGETOOL_URL` points at a
+  server run elsewhere instead.
+- **OpenPronounce** runs in its own Python environment with eSpeak NG and two
+  Wav2Vec2 speech models (a 2.4 GB download; about 4.8 GB on disk on Windows
+  without Developer Mode, whose cache cannot use symlinks). When the tutor asks for a phrase to be
+  repeated, the spoken attempt gets a real 0–100 score and the sounds that were
+  off. The models were trained on adult voices, so children's scores are shown as
+  approximate. `LUMINA_OPENPRONOUNCE_URL` points at a server run elsewhere.
+
+**Gemma 4 helps Gemini.** With `OLLAMA_CLOUD_ENABLED`, `OLLAMA_CLOUD_BASE_URL` and
+`OLLAMA_CLOUD_API_KEY` in `.env`, `gemma4:31b` on Ollama Cloud analyses each
+student turn first (2 to 4 s, measured), and Gemini's models take over whenever it
+fails or leaves out part of the analysis. For generated activities the order is
+reversed, because Gemma stalled for minutes writing a whole checkpoint.
+
+**Voice turns in Supabase.** Each spoken student turn is saved to Lumina's
+Supabase: the audio (Opus through ffmpeg, otherwise WAV) in the private
+`learning-voice` bucket, and a row in `public.learning_voice_recordings` with the
+transcript, the tutor's reply, the class context and any pronunciation score.
+Only the service role can reach either (schema in `memory/supabase_schema.sql`).
+The studio shows **Grabando** while this is on, and its settings turn it off or
+delete every recording. With children, keep recordings only with a parent's or
+guardian's permission. Course progress keeps syncing through the memory document
+in `lumina_state_documents`.
 
 The studio opens on `http://127.0.0.1:8002`, a loopback-only twin of the
 dashboard: the dashboard's HTTPS certificate is self-signed, and the browser

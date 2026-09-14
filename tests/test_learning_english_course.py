@@ -14,6 +14,7 @@ from learning_english import activities, placement
 from learning_english import service as service_module
 from learning_english.catalog import CEFR_LEVELS, build_catalog, next_step, next_unit_id
 from learning_english.controller import LearningEnglishController
+from learning_english.ollama_cloud import OllamaCloud
 from learning_english.service import LearningEnglishService
 from learning_english.store import LearningProgressStore
 from learning_english.types import TutorResponse
@@ -407,7 +408,7 @@ def _service_with(models):
     client = type("Client", (), {"models": models})()
     return LearningEnglishService(
         api_key_loader=lambda: "key", client_factory=lambda _key: client,
-        grammar_provider=_NoGrammar(),
+        ollama=OllamaCloud(), grammar_provider=_NoGrammar(),
     )
 
 
@@ -418,7 +419,7 @@ class ModelQuotaTests(unittest.TestCase):
         snapshot = {"profile": {"level": "A1"}, "currentUnit": {"id": "a1-foundations"}}
         service.generate_activity("reading", snapshot)
         service.generate_activity("reading", snapshot)
-        lighter = service_module.TEXT_MODELS[1]
+        lighter = service_module.GEMINI_TEXT_MODELS[1]
         self.assertEqual(models.calls, [service_module.MODEL, lighter, lighter])
 
     def test_a_busy_model_hands_over_without_being_skipped_later(self):
@@ -437,22 +438,22 @@ class ModelQuotaTests(unittest.TestCase):
         service.generate_activity("reading", {"profile": {}})
         self.assertEqual(
             models.calls,
-            [service_module.MODEL, service_module.TEXT_MODELS[1], service_module.MODEL],
+            [service_module.MODEL, service_module.GEMINI_TEXT_MODELS[1], service_module.MODEL],
         )
 
     def test_errors_other_than_quota_are_not_hidden(self):
         class Broken:
             def generate_content(self, **_kwargs):
-                raise ValueError("bad request")
+                raise TypeError("bad request")
 
-        with self.assertRaises(ValueError):
+        with self.assertRaises(TypeError):
             _service_with(Broken()).generate_activity("checkpoint", {"profile": {}})
 
     def test_when_every_model_is_spent_the_quota_error_surfaces(self):
-        models = _Models(spent=set(service_module.TEXT_MODELS))
+        models = _Models(spent=set(service_module.GEMINI_TEXT_MODELS))
         with self.assertRaises(_QuotaSpent):
             _service_with(models).generate_activity("reading", {"profile": {}})
-        self.assertEqual(models.calls, list(service_module.TEXT_MODELS))
+        self.assertEqual(models.calls, list(service_module.GEMINI_TEXT_MODELS))
 
     def test_turns_where_only_the_tutor_spoke_spend_no_quota(self):
         models = _Models()

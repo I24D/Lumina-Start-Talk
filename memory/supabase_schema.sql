@@ -82,3 +82,60 @@ revoke all on function public.lumina_search_interactions(text, text, int)
     from public, anon, authenticated;
 grant execute on function public.lumina_search_interactions(text, text, int)
     to service_role;
+
+-- ── Learning English voice turns ─────────────────────────────────────────────
+-- learning_english/recordings.py keeps every spoken student turn: the audio in
+-- the private learning-voice bucket (Opus, or WAV without ffmpeg) and one row
+-- here with the transcript, the tutor's reply, the class context and the
+-- OpenPronounce score when there was one. Students can be children, so both
+-- stay reachable by the service role only, and the studio can delete them all.
+
+create table if not exists public.learning_voice_recordings (
+    id uuid primary key default gen_random_uuid(),
+    workspace_id text not null default 'lumina-start-talk',
+    session_id text not null default '',
+    recorded_at timestamptz not null default now(),
+    audience text not null default '',
+    level text not null default '',
+    mode text not null default '',
+    unit_id text not null default '',
+    scenario_id text not null default '',
+    transcript text not null default '',
+    tutor_text text not null default '',
+    expected_text text not null default '',
+    duration_ms integer not null default 0 check (duration_ms >= 0),
+    storage_bucket text not null default 'learning-voice',
+    storage_path text not null unique,
+    content_type text not null,
+    size_bytes integer not null default 0 check (size_bytes >= 0),
+    pronunciation_score numeric(5, 2),
+    pronunciation jsonb
+);
+
+create index if not exists learning_voice_recordings_session_idx
+    on public.learning_voice_recordings (workspace_id, session_id, recorded_at desc);
+
+comment on table public.learning_voice_recordings is
+    'Learning English student voice turns; the audio lives in the private learning-voice bucket.';
+
+alter table public.learning_voice_recordings enable row level security;
+
+revoke all privileges on table public.learning_voice_recordings
+    from public, anon, authenticated, service_role;
+grant select, insert, update, delete
+    on table public.learning_voice_recordings to service_role;
+
+drop policy if exists service_role_only on public.learning_voice_recordings;
+create policy service_role_only
+    on public.learning_voice_recordings
+    for all
+    to service_role
+    using (true)
+    with check (true);
+
+insert into storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
+values ('learning-voice', 'learning-voice', false, 5242880, array['audio/ogg', 'audio/wav'])
+on conflict (id) do update
+    set public = false,
+        file_size_limit = excluded.file_size_limit,
+        allowed_mime_types = excluded.allowed_mime_types;
