@@ -11,12 +11,20 @@ Install deps:  pip install fastapi "uvicorn[standard]" cryptography
 import asyncio
 import base64
 import hashlib
+import inspect
 import re
 import secrets
 import socket
 import string
+import sys
 import time
 from pathlib import Path
+
+# uvicorn colours its log by asking sys.stdout.isatty(). Under pythonw — how
+# "Abrir LUMINA.bat" and the Run key start Lumina — sys.stdout is None, that call
+# raises inside uvicorn.Config, and the dashboard never binds its port. Answering
+# the question here keeps colours on a console and lets pythonw serve.
+_LOG_COLORS = bool(sys.stdout and sys.stdout.isatty())
 
 _DEPS_OK = False
 try:
@@ -38,6 +46,9 @@ except Exception:
 BASE_DIR    = Path(__file__).resolve().parent.parent
 STATIC_DIR  = Path(__file__).parent / "static"
 PORT        = 8000
+# Plain-HTTP twin of the dashboard, bound to 127.0.0.1 only, for the Learning
+# English studio opened on this PC. See _serve_loopback.
+LOCAL_PORT  = PORT + 2
 MAX_UPLOAD_MB = 500
 
 
@@ -465,12 +476,22 @@ class DashboardServer:
         self._command_queue               = asyncio.Queue()
         self._wake_callback               = None
         self._connect_callback            = None
+        self._learning_state_callback     = None
+        self._learning_action_callback    = None
+        self._learning_session_callback   = None
+        self._learning_turn_callback      = None
+        self._startup_event               = asyncio.Event()
+        self._server_ready                = False
+        self._startup_error: str | None   = None
+        self._main_server                 = None
+        self._loopback_server             = None
         self._pending_keys: dict[str, float] = {}
         self._device_sessions: dict[str, dict] = {}  # device_token → {session_key}
         self._phone_audio_queue: asyncio.Queue    = asyncio.Queue(maxsize=200)
         self._uploads_dir                 = UPLOADS_DIR
         self._login_html                  = _read("login.html")
         self._app_html                    = _read("app.html")
+        self._learning_html               = _read("learning-english.html")
         self.app                          = self._build_app()
 
     # ── one-time key management ───────────────────────────────────────────
@@ -497,6 +518,40 @@ class DashboardServer:
             return f"{self._ip}:{PORT + 1}"
         return f"{self._ip}:{PORT}"
 
+    def get_learning_url(self, expiry_secs: int = 600, *, local: bool = True) -> str:
+        """Create an authenticated browser entry directly into the studio.
+
+        Learning English opens on this PC, so loopback is the reliable default:
+        it does not depend on the active Wi-Fi address or a LAN firewall rule.
+        Remote-dashboard URLs continue to use ``get_url()`` and the LAN IP.
+        """
+        key = self.new_key(expiry_secs)
+        loopback = self._loopback_server
+        if local and loopback is not None and loopback.started:
+            base = f"http://127.0.0.1:{LOCAL_PORT}"
+        else:
+            proto = "https" if self._ssl_enabled() else "http"
+            base = f"{proto}://127.0.0.1:{PORT}" if local else self.get_url()
+        return f"{base}/auto-login?key={key}&next=/learning-english"
+
+    @property
+    def startup_error(self) -> str | None:
+        return self._startup_error
+
+    async def wait_until_ready(self, timeout: float = 10.0) -> bool:
+        """Wait until uvicorn is accepting connections or startup has failed."""
+        if self._server_ready:
+            return True
+        try:
+            await asyncio.wait_for(self._startup_event.wait(), timeout=timeout)
+        except TimeoutError:
+            self._startup_error = (
+                self._startup_error
+                or f"The local web server did not start within {timeout:.0f} seconds."
+            )
+            return False
+        return self._server_ready
+
     def _aes_key(self, session_key: str) -> bytes:
         if session_key not in self._aes_cache:
             self._aes_cache[session_key] = _derive_key(session_key)
@@ -518,6 +573,12 @@ class DashboardServer:
 
     def set_connect_callback(self, fn) -> None:
         self._connect_callback = fn
+
+    def set_learning_callbacks(self, *, state=None, action=None, session=None, turn=None) -> None:
+        self._learning_state_callback = state
+        self._learning_action_callback = action
+        self._learning_session_callback = session
+        self._learning_turn_callback = turn
 
     # ── broadcast ────────────────────────────────────────────────────────
 
@@ -542,6 +603,12 @@ class DashboardServer:
             tok = req.headers.get("authorization", "").removeprefix("Bearer ").strip()
             return bool(tok) and tok in self._tokens
 
+        async def _invoke(callback, *args):
+            if callback is None:
+                raise RuntimeError("Learning English is not available yet")
+            result = callback(*args)
+            return await result if inspect.isawaitable(result) else result
+
         # serve CryptoJS from local cache, fallback to CDN redirect
         @app.get("/static/crypto.js")
         async def serve_crypto():
@@ -550,6 +617,19 @@ class DashboardServer:
                                     media_type="application/javascript")
             from fastapi.responses import RedirectResponse
             return RedirectResponse(_CRYPTOJS_CDN)
+
+        @app.get("/static/learning-english.css")
+        async def learning_css():
+            return FileResponse(
+                str(STATIC_DIR / "learning-english.css"), media_type="text/css"
+            )
+
+        @app.get("/static/learning-english.js")
+        async def learning_js():
+            return FileResponse(
+                str(STATIC_DIR / "learning-english.js"),
+                media_type="application/javascript",
+            )
 
         @app.get("/login", response_class=HTMLResponse)
         async def login_page():
@@ -564,6 +644,12 @@ class DashboardServer:
                     .replace("__IP__", self._ip)
                     .replace("__PORT__", str(PORT)))
             return HTMLResponse(html)
+
+        @app.get("/learning-english", response_class=HTMLResponse)
+        async def learning_english_page():
+            # The document contains no credentials. API and WebSocket requests
+            # still require the same bearer token as the remote dashboard.
+            return HTMLResponse(self._learning_html)
 
         @app.post("/login")
         async def login(req: Request):
@@ -587,7 +673,7 @@ class DashboardServer:
                                 status_code=401)
 
         @app.get("/auto-login")
-        async def auto_login(key: str = ""):
+        async def auto_login(key: str = "", next: str = "/"):
             """QR code target — validates one-time key, creates session, redirects phone."""
             now = time.time()
             if not key or key not in self._pending_keys or self._pending_keys[key] <= now:
@@ -616,6 +702,7 @@ class DashboardServer:
                 {"type": "sys", "text": "Remote connection established via QR code."}
             ))
 
+            safe_next = "/learning-english" if next == "/learning-english" else "/"
             return HTMLResponse(f"""<!DOCTYPE html>
 <html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width">
 <style>
@@ -628,7 +715,7 @@ class DashboardServer:
   sessionStorage.setItem('jarvis_token','{tok}');
   sessionStorage.setItem('jarvis_key','{key}');
   localStorage.setItem('jarvis_device_token','{dev_tok}');
-  setTimeout(function(){{location.replace('/')}},400);
+  setTimeout(function(){{location.replace('{safe_next}')}},400);
 </script>
 <p>Connecting to LUMINA…</p>
 </body></html>""")
@@ -690,6 +777,91 @@ class DashboardServer:
             if self._wake_callback:
                 self._wake_callback()
             return JSONResponse({"ok": True})
+
+        # ── Learning English studio ─────────────────────────────────────────
+
+        @app.get("/api/learning/state")
+        async def learning_state(req: Request):
+            if not _auth(req):
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
+            try:
+                state = await _invoke(self._learning_state_callback)
+                return JSONResponse(state or {})
+            except Exception as exc:
+                return JSONResponse(
+                    {"error": f"Learning English unavailable ({type(exc).__name__})"},
+                    status_code=503,
+                )
+
+        @app.post("/api/learning/live-session")
+        async def learning_live_session(req: Request):
+            """A single-use token for the tutor's own Gemini Live session in the
+            browser. The API key never leaves this process."""
+            if not _auth(req):
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
+            try:
+                body = await req.json()
+            except Exception:
+                body = {}
+            handle = str(body.get("handle") or "").strip()[:2048]
+            try:
+                session = await _invoke(self._learning_session_callback, handle)
+                return JSONResponse(session)
+            except RuntimeError as exc:
+                return JSONResponse({"error": str(exc)[:160]}, status_code=409)
+            except Exception as exc:
+                return JSONResponse(
+                    {"error": f"Tutor session unavailable ({type(exc).__name__})"}, status_code=503
+                )
+
+        @app.post("/api/learning/turn")
+        async def learning_turn(req: Request):
+            if not _auth(req):
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
+            try:
+                body = await req.json()
+            except Exception:
+                return JSONResponse({"error": "Invalid request"}, status_code=400)
+            user = str(body.get("user") or "").strip()[:4000]
+            assistant = str(body.get("assistant") or "").strip()[:8000]
+            if not user and not assistant:
+                return JSONResponse({"error": "Turn is empty"}, status_code=400)
+            try:
+                result = await _invoke(self._learning_turn_callback, user, assistant)
+                return JSONResponse({"ok": True, "state": result})
+            except RuntimeError as exc:
+                return JSONResponse({"error": str(exc)[:160]}, status_code=409)
+            except Exception as exc:
+                return JSONResponse(
+                    {"error": f"Turn failed ({type(exc).__name__})"}, status_code=503
+                )
+
+        @app.post("/api/learning/action")
+        async def learning_action(req: Request):
+            if not _auth(req):
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
+            try:
+                body = await req.json()
+            except Exception:
+                return JSONResponse({"error": "Invalid request"}, status_code=400)
+            action_name = str(body.get("action") or "").strip().lower()
+            allowed = {
+                "enter", "exit", "pause", "resume", "mute", "unmute",
+                "translation", "mode", "save-word", "settings",
+            }
+            if action_name not in allowed:
+                return JSONResponse({"error": "Unsupported action"}, status_code=400)
+            try:
+                result = await _invoke(self._learning_action_callback, action_name, body)
+                return JSONResponse({"ok": True, "state": result})
+            except ValueError as exc:
+                return JSONResponse({"error": str(exc)}, status_code=400)
+            except RuntimeError as exc:
+                return JSONResponse({"error": str(exc)[:160]}, status_code=409)
+            except Exception as exc:
+                return JSONResponse(
+                    {"error": f"Action failed ({type(exc).__name__})"}, status_code=503
+                )
 
         # ── Phone mic real-time audio → Gemini Live ──────────────────────────
 
@@ -848,13 +1020,44 @@ class DashboardServer:
         asyncio.get_event_loop().run_in_executor(None, _ensure_network_access, PORT + 1)
         cfg = uvicorn.Config(
             self.app, host="0.0.0.0", port=PORT + 1, log_level="warning",
+            use_colors=_LOG_COLORS,
             ssl_keyfile=str(ssl_key), ssl_certfile=str(ssl_cert),
         )
         print(f"[Dashboard] Manual entry:  {self._ip}:{PORT + 1}  (type in browser, accept cert once)")
-        await uvicorn.Server(cfg).serve()
+        try:
+            await uvicorn.Server(cfg).serve()
+        except SystemExit as exc:
+            # uvicorn raises SystemExit when a bind fails. In a background task
+            # that exception can otherwise take down the entire Lumina process.
+            print(f"[Dashboard] Manual-entry server failed on port {PORT + 1}: {exc}")
+
+    async def _serve_loopback(self) -> None:
+        """Plain HTTP on 127.0.0.1 for the Learning English studio opened on this PC.
+
+        The certificate is self-signed, so the browser on this PC stopped the
+        studio at "Your connection isn't private" (NET::ERR_CERT_AUTHORITY_INVALID).
+        Loopback never leaves the machine, browsers treat http://127.0.0.1 as a
+        secure context, and every API and WebSocket call still needs the same
+        bearer token. Phones keep using the HTTPS ports."""
+        cfg = uvicorn.Config(
+            self.app, host="127.0.0.1", port=LOCAL_PORT, log_level="warning",
+            use_colors=_LOG_COLORS,
+        )
+        server = uvicorn.Server(cfg)
+        self._loopback_server = server
+        try:
+            await server.serve()
+        except SystemExit as exc:
+            # As with the alias: a failed bind must not take Lumina down.
+            print(f"[Dashboard] Loopback studio server failed on port {LOCAL_PORT}: {exc}")
 
     async def serve(self) -> None:
+        self._server_ready = False
+        self._startup_error = None
+        self._startup_event.clear()
         if not _DEPS_OK:
+            self._startup_error = "fastapi/uvicorn is not installed."
+            self._startup_event.set()
             print("[Dashboard] fastapi/uvicorn not installed — dashboard disabled.")
             print("[Dashboard] Run:  pip install fastapi 'uvicorn[standard]' cryptography")
             return
@@ -870,15 +1073,74 @@ class DashboardServer:
         ssl_key  = BASE_DIR / "config" / "certs" / "jarvis.key"
         ssl_cert = BASE_DIR / "config" / "certs" / "jarvis.crt"
 
+        loopback_task = None
         if use_ssl:
             asyncio.create_task(self._serve_alias())
+            loopback_task = asyncio.create_task(self._serve_loopback())
 
-        cfg = uvicorn.Config(
-            self.app, host="0.0.0.0", port=PORT, log_level="warning",
-            **({"ssl_keyfile": str(ssl_key), "ssl_certfile": str(ssl_cert)} if use_ssl else {}),
-        )
+        try:
+            cfg = uvicorn.Config(
+                self.app, host="0.0.0.0", port=PORT, log_level="warning",
+                use_colors=_LOG_COLORS,
+                **({"ssl_keyfile": str(ssl_key), "ssl_certfile": str(ssl_cert)} if use_ssl else {}),
+            )
+        except Exception as exc:
+            # Reported at once: raised here, nothing would ever set the startup
+            # event, and every caller would wait out its timeout for a vague error.
+            self._startup_error = f"The local web server could not be configured: {exc}"
+            self._startup_event.set()
+            print(f"[Dashboard] Server failed: {exc}")
+            return
 
         proto = "https" if use_ssl else "http"
         print(f"[Dashboard] {proto}://{self._ip}:{PORT}")
         print("[Dashboard] Press 'Remote Control' in JARVIS UI to get the QR code.")
-        await uvicorn.Server(cfg).serve()
+        server = uvicorn.Server(cfg)
+        self._main_server = server
+
+        async def run_server():
+            try:
+                await server.serve()
+            except SystemExit as exc:
+                raise RuntimeError(
+                    f"Could not bind the local dashboard to port {PORT} (exit {exc.code})."
+                ) from exc
+
+        server_task = asyncio.create_task(run_server(), name="lumina-dashboard-server")
+        try:
+            while not server.started:
+                if server_task.done():
+                    await server_task
+                    self._startup_error = "The local web server stopped during startup."
+                    self._startup_event.set()
+                    return
+                await asyncio.sleep(0.05)
+
+            # The studio link points at the loopback twin, so give it the same
+            # chance to bind before announcing ready. It stays optional: if it
+            # cannot bind, get_learning_url falls back to the HTTPS port.
+            if loopback_task is not None:
+                for _ in range(100):
+                    loopback = self._loopback_server
+                    if loopback_task.done() or (loopback is not None and loopback.started):
+                        break
+                    await asyncio.sleep(0.05)
+
+            self._server_ready = True
+            self._startup_event.set()
+            await server_task
+        except asyncio.CancelledError:
+            server.should_exit = True
+            if self._loopback_server is not None:
+                self._loopback_server.should_exit = True
+            server_task.cancel()
+            await asyncio.gather(server_task, return_exceptions=True)
+            raise
+        except Exception as exc:
+            self._startup_error = str(exc)
+            self._startup_event.set()
+            print(f"[Dashboard] Server failed: {exc}")
+        finally:
+            self._server_ready = False
+            if not self._startup_event.is_set():
+                self._startup_event.set()

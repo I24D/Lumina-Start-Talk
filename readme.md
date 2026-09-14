@@ -68,6 +68,7 @@ It's not just an assistant — it's an extension of your digital life.
 ### Core Features
 | Feature | Description |
 |---|---|
+| 🎓 Learning English | Dedicated browser studio with Gemini Live voice lessons, CEFR profile, structured corrections, vocabulary and persistent progress |
 | 🎙️ Voice Picker | Choose from 5 native Gemini voices and switch live from the UI — no restart |
 | 🎨 Live Theming | Recolour the entire HUD from a hue wheel or hex — applied instantly across every panel |
 | 〰️ Reactive HUD | Waveform and reactor core pulse to real audio — your mic while listening, LUMINA while speaking |
@@ -136,6 +137,36 @@ The **🧩 Plugin System**, **💓 Affective Dialog**, **🤫 Proactive Audio**,
 These improvements form one reliable base across supported operating systems.
 
 No new dependencies. No bundled asset files. No hardcoded language, and nothing that assumes one operating system.
+
+### 🎓 Learning English — a separate teaching workspace
+
+Open **⚙ Controls → 🎓 Learning English** to launch **English Learning Studio**
+in the browser, or say “Lumina, quiero aprender inglés”, “Enséñame inglés”,
+“Teach me English” or “Let's practice English”.
+
+The class runs its own Gemini Live session inside the studio page, on
+`gemini-3.1-flash-live-preview`: the browser's microphone with echo
+cancellation, the tutor's own voice, and no tools. Lumina's server only mints a
+single-use ephemeral token — model, teacher prompt, voice and transcription are
+locked inside it, and the API key never reaches the browser. While a class is
+open, Lumina's general assistant keeps its tools but pauses its microphone and
+voice. Each finished turn is analysed on `gemini-3.6-flash` into validated
+structured corrections, vocabulary and progress.
+
+The studio opens on `http://127.0.0.1:8002`, a loopback-only twin of the
+dashboard: the dashboard's HTTPS certificate is self-signed, and the browser
+would stop the studio at a privacy warning.
+
+The first class asks conversationally for the student's primary language,
+approximate CEFR level and goal. Later classes restore the saved profile,
+frequent corrections, vocabulary, skill progress and last lesson. Use the web
+studio to switch among conversation, pronunciation, grammar, vocabulary,
+listening, quick lesson and level assessment.
+
+A spoken request never ends a class: the tutor answers that it cannot close the
+class by voice and points to **Volver a Lumina**. Press **Volver a Lumina** or
+**Terminar clase** in the studio (or type the order in Lumina's command input).
+The class summary is saved and Lumina's microphone comes back.
 
 ### 👁️ Live Vision — screen and camera
 

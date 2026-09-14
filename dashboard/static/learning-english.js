@@ -1,0 +1,465 @@
+(() => {
+  "use strict";
+  const tokenKey = "jarvis_token";
+  let token = sessionStorage.getItem(tokenKey) || "";
+  let state = null;
+  let socket = null;
+  let reconnectTimer = null;
+  let toastTimer = null;
+
+  const $ = (selector) => document.querySelector(selector);
+  const $$ = (selector) => [...document.querySelectorAll(selector)];
+  const esc = (value) => String(value ?? "").replace(/[&<>'"]/g, ch => ({"&":"&amp;","<":"&lt;",">":"&gt;","'":"&#39;",'"':"&quot;"})[ch]);
+
+  // ── The tutor's own Gemini Live session ──────────────────────────────────
+  // The class runs here: this page's microphone, its own voice and its own
+  // Gemini session, independent of Lumina's general assistant, whose
+  // microphone Lumina pauses while a class is open. Lumina's server only mints
+  // the single-use token and keeps the progress.
+  const LIVE_URL = "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContentConstrained";
+  const MIC_RATE = 16000;
+  const VOICE_RATE = 24000;
+  const live = {
+    ws: null, ready: false, closing: false, handle: "", retries: 0, retryTimer: null,
+    micStream: null, micContext: null, micNode: null,
+    voiceContext: null, voiceSources: new Set(), voiceClock: 0,
+    heard: "", said: "", typed: "",
+  };
+
+  // 50 ms blocks of 16 kHz PCM16, the format the live model transcribes.
+  const MIC_WORKLET = `
+    class MicCapture extends AudioWorkletProcessor {
+      constructor() { super(); this.block = new Int16Array(800); this.filled = 0; }
+      process(inputs) {
+        const channel = inputs[0] && inputs[0][0];
+        if (channel) {
+          for (let i = 0; i < channel.length; i++) {
+            const sample = Math.max(-1, Math.min(1, channel[i]));
+            this.block[this.filled++] = sample < 0 ? sample * 0x8000 : sample * 0x7fff;
+            if (this.filled === this.block.length) {
+              this.port.postMessage(this.block.buffer.slice(0));
+              this.filled = 0;
+            }
+          }
+        }
+        return true;
+      }
+    }
+    registerProcessor("mic-capture", MicCapture);`;
+
+  async function recoverAuth() {
+    if (token) return true;
+    const deviceToken = localStorage.getItem("jarvis_device_token");
+    if (deviceToken) {
+      try {
+        const response = await fetch("/api/device-login", {
+          method: "POST", headers: {"Content-Type":"application/json"},
+          body: JSON.stringify({device_token: deviceToken}),
+        });
+        const data = await response.json();
+        if (response.ok && data.token) {
+          token = data.token;
+          sessionStorage.setItem(tokenKey, token);
+          sessionStorage.setItem("jarvis_key", data.key || "");
+          return true;
+        }
+      } catch (_) {}
+    }
+    location.replace("/login?next=/learning-english");
+    return false;
+  }
+
+  async function api(path, options = {}) {
+    options.headers = Object.assign({}, options.headers, {Authorization: `Bearer ${token}`});
+    const response = await fetch(path, options);
+    let data = {};
+    try { data = await response.json(); } catch (_) {}
+    if (response.status === 401) {
+      sessionStorage.removeItem(tokenKey); token = ""; await recoverAuth();
+      throw new Error("La sesión web expiró.");
+    }
+    if (!response.ok) throw new Error(data.error || "No se pudo completar la acción.");
+    return data;
+  }
+
+  function toast(message, error = false) {
+    const node = $("#toast"); node.textContent = message; node.style.borderColor = error ? "rgba(255,110,123,.5)" : "";
+    node.classList.add("show"); clearTimeout(toastTimer); toastTimer = setTimeout(() => node.classList.remove("show"), 2600);
+  }
+
+  function skillName(key) {
+    return ({conversation:"Conversación",pronunciation:"Pronunciación",grammar:"Gramática",vocabulary:"Vocabulario",listening:"Comprensión"})[key] || key;
+  }
+
+  function render(snapshot) {
+    if (!snapshot) return;
+    state = snapshot;
+    const profile = snapshot.profile || {};
+    const currentSession = (snapshot.sessions || []).find(item => item.id === snapshot.current_session_id) || {};
+    const progress = Number(currentSession.progress || snapshot.last_lesson?.progress || 0);
+    const level = profile.level || "A1";
+    $("#header-level").textContent = level; $("#level-ring").textContent = level;
+    $("#header-goal").textContent = profile.goal || "Configurando perfil";
+    $("#profile-goal").textContent = profile.goal || "Inglés práctico";
+    $("#header-progress").textContent = `${progress}%`;
+    $("#lesson-label").textContent = profile.current_objective || "Primera lección";
+    $("#lesson-objective").textContent = profile.current_objective || "Construyamos tu plan de aprendizaje";
+    $("#onboarding-card").classList.toggle("hidden", snapshot.state !== "onboarding");
+    $("#mic-chip").classList.toggle("online", !!live.micStream && snapshot.active && !snapshot.inputMuted && !snapshot.paused);
+    $("#mic-chip").classList.toggle("warn", snapshot.inputMuted || snapshot.paused);
+    $("#mic-chip").childNodes[$("#mic-chip").childNodes.length - 1].textContent = snapshot.inputMuted ? " Micrófono silenciado" : " Micrófono";
+    $$("#mode-list button").forEach(button => button.classList.toggle("active", button.dataset.mode === snapshot.currentMode));
+    $("#mute-button").classList.toggle("active", !snapshot.inputMuted);
+    $("#mute-button").setAttribute("aria-pressed", String(!snapshot.inputMuted));
+    $("#mute-button").lastChild.textContent = snapshot.inputMuted ? " Activar micrófono" : " Micrófono";
+    $("#pause-button").textContent = snapshot.paused ? "▶ Continuar clase" : "Ⅱ Pausar clase";
+    $("#translation-button").classList.toggle("active", snapshot.translationEnabled);
+    $("#translation-button").setAttribute("aria-pressed", String(!!snapshot.translationEnabled));
+    $("#words-count").textContent = `${(snapshot.vocabulary || []).length} palabras`;
+    $("#vocabulary-total").textContent = (snapshot.vocabulary || []).length;
+    $("#error-count").textContent = (snapshot.frequent_errors || []).length;
+    renderSkills(snapshot.skill_progress || {});
+    renderErrors(snapshot.frequent_errors || []);
+    renderVocabulary(snapshot.vocabulary || []);
+    renderWeek(snapshot.weekly_activity || []);
+    if (snapshot.lastResponse) renderTutorResponse(snapshot.lastResponse);
+    if (snapshot.storageStatus === "temporary") {
+      $("#dock-detail").textContent = snapshot.storageError || "Progreso temporal; se reintentará el guardado";
+    } else {
+      $("#dock-detail").textContent = "Tu progreso se guarda automáticamente";
+    }
+    // The summary opens once, when a class ends (sessionCompleted). Reopening it
+    // from every later snapshot left a stale modal blocking the next class.
+    if (snapshot.active) closeSummary();
+    // A class ended from Lumina closes this page's session too; a class opened
+    // again while the page stayed open starts a fresh one.
+    if (snapshot.active && live.closing) { live.closing = false; startClass(); }
+    if (!snapshot.active && !live.closing && (live.ws || live.micStream)) shutdownLive();
+  }
+
+  function renderSkills(skills) {
+    $("#skill-bars").innerHTML = Object.entries({conversation:0,pronunciation:0,grammar:0,vocabulary:0,listening:0}).map(([key]) => {
+      const value = Math.max(0, Math.min(100, Number(skills[key] || 0)));
+      return `<div class="skill-row"><header><span>${esc(skillName(key))}</span><b>${value}%</b></header><div class="skill-track"><i style="width:${value}%"></i></div></div>`;
+    }).join("");
+  }
+
+  function renderErrors(errors) {
+    const recent = errors.slice(0, 4);
+    $("#error-list").innerHTML = recent.length ? recent.map(item => `<div class="mini-error"><strong>${esc(item.corrected)}</strong>${esc(item.category)} · ${Number(item.count || 1)} veces</div>`).join("") : '<p class="empty-copy">Las oportunidades de práctica aparecerán aquí.</p>';
+  }
+
+  function renderWeek(entries) {
+    const map = new Map(entries.map(item => [item.date, Number(item.lessons || 0)]));
+    const days = [];
+    for (let i = 6; i >= 0; i--) { const d = new Date(); d.setDate(d.getDate() - i); days.push(d); }
+    const total = days.reduce((sum,d) => sum + (map.get(d.toISOString().slice(0,10)) || 0), 0);
+    $("#week-total").textContent = `${total} ${total === 1 ? "clase" : "clases"}`;
+    $("#week-chart").innerHTML = days.map(d => { const n = map.get(d.toISOString().slice(0,10)) || 0; return `<div class="week-column" title="${n} clases"><i style="height:${Math.max(4,n*15)}px"></i><small>${d.toLocaleDateString("es",{weekday:"narrow"})}</small></div>`; }).join("");
+  }
+
+  function renderVocabulary(words) {
+    const list = words.slice(-6).reverse();
+    $("#vocabulary-list").innerHTML = list.length ? list.map(item => `<article class="word-card"><header><strong>${esc(item.word)}</strong><button type="button" data-save-word="${esc(item.word)}" data-meaning="${esc(item.meaning)}" data-example="${esc(item.example)}">${item.saved ? "✓ Guardada" : "+ Guardar"}</button></header><p>${esc(item.meaning)}</p><em>${esc(item.example)}</em></article>`).join("") : '<p class="empty-copy">Todavía no hay palabras nuevas.</p>';
+  }
+
+  function renderTutorResponse(response) {
+    if (response.assistantText) $("#assistant-text").textContent = response.assistantText;
+    $("#next-action").textContent = response.nextAction || "Responde cuando estés listo.";
+    const corrections = response.corrections || [];
+    $("#correction-list").innerHTML = corrections.length ? corrections.map((item,index) => `<article class="correction-card"><span class="category">${esc(item.category)}</span><div class="compare"><div><small>Lo que dijiste</small><p class="original">${esc(item.original)}</p></div><div><small>Forma recomendada</small><p class="corrected">${esc(item.corrected)}</p></div></div><p class="explanation">${esc(item.explanation)}</p>${item.pronunciation ? `<p class="explanation"><b>Pronunciación aproximada:</b> ${esc(item.pronunciation)}</p>` : ""}${state?.translationEnabled && item.translation ? `<p class="explanation"><b>Traducción:</b> ${esc(item.translation)}</p>` : ""}<div class="correction-actions"><button type="button" data-practice="${index}">↻ Practicar de nuevo</button></div></article>`).join("") : '<div class="empty-state"><span>✓</span><h3>Buen turno</h3><p>No hay una corrección esencial en esta respuesta. Continuemos.</p></div>';
+  }
+
+  function setTutorStatus(kind, label) {
+    const node = $("#tutor-state"); node.innerHTML = `<i></i>${esc(label)}`;
+    $("#dock-state").textContent = label;
+    $("#tutor-orb").classList.toggle("speaking", kind === "speaking");
+    $(".sound-wave").classList.toggle("active", kind === "speaking" || kind === "listening");
+    $("#stream-label").textContent = kind.toUpperCase();
+  }
+
+  // ── Live session plumbing ────────────────────────────────────────────────
+
+  function toBase64(buffer) {
+    const bytes = new Uint8Array(buffer); let binary = "";
+    for (let i = 0; i < bytes.length; i += 0x8000) binary += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+    return btoa(binary);
+  }
+
+  function fromBase64(data) {
+    const binary = atob(data); const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return bytes;
+  }
+
+  function liveSend(message) {
+    if (live.ws && live.ws.readyState === WebSocket.OPEN && live.ready) live.ws.send(JSON.stringify(message));
+  }
+
+  function sendTeacherControl(instruction) {
+    if (!live.ready) { toast("La maestra todavía se está conectando", true); return; }
+    liveSend({clientContent: {turns: [{role: "user", parts: [{text: `[TEACHER_CONTROL]\n${instruction}`}]}], turnComplete: true}});
+  }
+
+  async function ensureVoice() {
+    if (!live.voiceContext) live.voiceContext = new AudioContext({sampleRate: VOICE_RATE});
+    if (live.voiceContext.state === "suspended") { try { await live.voiceContext.resume(); } catch (_) {} }
+    return live.voiceContext.state === "running";
+  }
+
+  async function startMicrophone() {
+    if (live.micStream) return;
+    live.micStream = await navigator.mediaDevices.getUserMedia({audio: {
+      channelCount: 1, echoCancellation: true, noiseSuppression: true,
+      // Automatic gain can move the device's input level, and Lumina reads the
+      // same microphone again once the class ends.
+      autoGainControl: false,
+    }});
+    live.micContext = new AudioContext({sampleRate: MIC_RATE});
+    const url = URL.createObjectURL(new Blob([MIC_WORKLET], {type: "application/javascript"}));
+    try { await live.micContext.audioWorklet.addModule(url); } finally { URL.revokeObjectURL(url); }
+    const source = live.micContext.createMediaStreamSource(live.micStream);
+    live.micNode = new AudioWorkletNode(live.micContext, "mic-capture");
+    live.micNode.port.onmessage = event => {
+      if (state?.paused || state?.inputMuted) return;
+      liveSend({realtimeInput: {audio: {mimeType: `audio/pcm;rate=${MIC_RATE}`, data: toBase64(event.data)}}});
+    };
+    // Pulled through a silent output so the worklet keeps running; nothing is heard.
+    const silent = live.micContext.createGain(); silent.gain.value = 0;
+    source.connect(live.micNode).connect(silent).connect(live.micContext.destination);
+    if (live.micContext.state === "suspended") await live.micContext.resume();
+    $("#mic-chip").classList.add("online");
+  }
+
+  function stopMicrophone() {
+    if (live.micStream) live.micStream.getTracks().forEach(track => track.stop());
+    if (live.micContext) live.micContext.close().catch(() => {});
+    live.micStream = null; live.micContext = null; live.micNode = null;
+    $("#mic-chip").classList.remove("online");
+  }
+
+  function playVoice(base64) {
+    const ctx = live.voiceContext; if (!ctx) return;
+    const bytes = fromBase64(base64);
+    const samples = new Int16Array(bytes.buffer, 0, Math.floor(bytes.byteLength / 2));
+    const buffer = ctx.createBuffer(1, samples.length, VOICE_RATE);
+    const channel = buffer.getChannelData(0);
+    for (let i = 0; i < samples.length; i++) channel[i] = samples[i] / 0x8000;
+    const source = ctx.createBufferSource(); source.buffer = buffer; source.connect(ctx.destination);
+    live.voiceClock = Math.max(live.voiceClock, ctx.currentTime);
+    source.start(live.voiceClock); live.voiceClock += buffer.duration;
+    live.voiceSources.add(source);
+    setTutorStatus("speaking", "Hablando");
+    source.onended = () => {
+      live.voiceSources.delete(source);
+      if (!live.voiceSources.size && live.ready) setTutorStatus("listening", "Escuchando");
+    };
+  }
+
+  function stopVoice() {
+    live.voiceSources.forEach(source => { try { source.stop(); } catch (_) {} });
+    live.voiceSources.clear();
+    live.voiceClock = 0;
+  }
+
+  async function connectLive() {
+    clearTimeout(live.retryTimer);
+    if (live.closing || (live.ws && live.ws.readyState <= WebSocket.OPEN)) return;
+    setTutorStatus("connecting", "Conectando con la maestra");
+    let session;
+    try {
+      session = await api("/api/learning/live-session", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({handle: live.handle})});
+    } catch (error) { toast(error.message, true); scheduleLiveRetry(); return; }
+    if (live.closing) return;
+    const ws = new WebSocket(`${LIVE_URL}?access_token=${encodeURIComponent(session.token)}`);
+    live.ws = ws; live.ready = false;
+    ws.onopen = () => ws.send(JSON.stringify({setup: {model: session.model}}));
+    ws.onmessage = async event => {
+      const text = typeof event.data === "string" ? event.data : await event.data.text();
+      let message; try { message = JSON.parse(text); } catch (_) { return; }
+      if (live.ws === ws) handleLiveMessage(message, session);
+    };
+    ws.onclose = event => {
+      if (live.ws !== ws) return;
+      live.ws = null; live.ready = false;
+      $("#gemini-chip").classList.remove("online");
+      if (!live.closing) { setTutorStatus("reconnecting", "Reconectando con la maestra"); scheduleLiveRetry(event.reason); }
+    };
+  }
+
+  function scheduleLiveRetry(reason) {
+    if (live.closing || !state?.active) return;
+    live.retries += 1;
+    if (reason) console.warn("Tutor session closed:", reason);
+    live.retryTimer = setTimeout(connectLive, Math.min(1000 * 2 ** Math.min(live.retries, 4), 15000));
+  }
+
+  function handleLiveMessage(message, session) {
+    if (message.setupComplete) {
+      live.ready = true; live.retries = 0;
+      $("#gemini-chip").classList.add("online");
+      setTutorStatus("listening", "Escuchando");
+      if (session.opening) sendTeacherControl(session.opening);
+      return;
+    }
+    const update = message.sessionResumptionUpdate;
+    if (update?.resumable && update.newHandle) live.handle = update.newHandle;
+    if (message.goAway) {
+      // The service is rotating the session: reconnect now, resuming it.
+      live.retries = 0;
+      try { live.ws?.close(); } catch (_) {}
+      return;
+    }
+    const content = message.serverContent; if (!content) return;
+    if (content.interrupted) stopVoice();
+    if (content.inputTranscription?.text) {
+      live.heard += content.inputTranscription.text;
+      $("#student-text").textContent = live.heard.trim();
+    }
+    if (content.outputTranscription?.text) {
+      live.said += content.outputTranscription.text;
+      $("#assistant-text").textContent = live.said.trim();
+    }
+    for (const part of content.modelTurn?.parts || []) {
+      if (part.inlineData?.data) playVoice(part.inlineData.data);
+    }
+    if (content.turnComplete) finishTurn();
+  }
+
+  function finishTurn() {
+    const user = (live.typed || live.heard).trim();
+    const assistant = live.said.trim();
+    live.heard = ""; live.said = ""; live.typed = "";
+    if (!user && !assistant) return;
+    api("/api/learning/turn", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({user, assistant})})
+      .then(data => { if (data.state) render(data.state); })
+      .catch(error => toast(error.message, true));
+  }
+
+  async function startClass() {
+    $("#start-button").classList.add("hidden");
+    if (!(await ensureVoice())) {
+      // The browser only lets a page play sound after the user touches it.
+      $("#start-button").classList.remove("hidden");
+      setTutorStatus("waiting", "Pulsa Empezar clase");
+      return;
+    }
+    try { await startMicrophone(); }
+    catch (_) { toast("Permite el micrófono en el navegador para hablar con la maestra.", true); $("#mic-chip").classList.add("warn"); }
+    connectLive();
+  }
+
+  function shutdownLive() {
+    live.closing = true; clearTimeout(live.retryTimer);
+    stopVoice(); stopMicrophone();
+    const ws = live.ws; live.ws = null; live.ready = false; live.handle = "";
+    try { ws?.close(); } catch (_) {}
+    live.heard = ""; live.said = ""; live.typed = "";
+    $("#gemini-chip").classList.remove("online");
+  }
+
+  async function endClass() {
+    shutdownLive();
+    const data = await action("exit");
+    if (!data) { live.closing = false; startClass(); }  // exit failed: stay in the class
+  }
+
+  async function sendMessage(text) {
+    text = String(text || "").trim(); if (!text) return;
+    if (!live.ready) { toast("La maestra todavía se está conectando", true); return; }
+    stopVoice();
+    live.typed = text; live.heard = "";
+    $("#student-text").textContent = text; setTutorStatus("thinking", "Lumina está pensando");
+    liveSend({clientContent: {turns: [{role: "user", parts: [{text}]}], turnComplete: true}});
+    $("#message-input").value = "";
+  }
+
+  async function action(name, payload = {}) {
+    try {
+      const data = await api("/api/learning/action", {method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:name,...payload})});
+      if (data.state) render(data.state);
+      return data;
+    } catch (error) { toast(error.message, true); return null; }
+  }
+
+  // Lumina's own socket: progress, corrections and the end of a class.
+  function connectSocket() {
+    if (!token) return;
+    const protocol = location.protocol === "https:" ? "wss:" : "ws:";
+    socket = new WebSocket(`${protocol}//${location.host}/ws?token=${encodeURIComponent(token)}`);
+    socket.onclose = () => { clearTimeout(reconnectTimer); reconnectTimer = setTimeout(connectSocket, 1800); };
+    socket.onmessage = event => {
+      let message; try { message = JSON.parse(event.data); } catch (_) { return; }
+      if (message.type === "learning.turn") { renderTutorResponse(message.response || {}); loadState(); }
+      if (message.type === "learning.snapshot") render(message.state);
+      if (message.type === "learning.error") toast(message.message || "Ocurrió un error", true);
+      if (message.type === "learningEnglish.sessionCompleted") showSummary(message.summary || "Clase completada.");
+      if (message.type === "learningEnglish.modeEntered") closeSummary();
+      if (message.type === "learningEnglish.modeExited") setTutorStatus("inactive", "Clase finalizada");
+    };
+  }
+
+  async function loadState() {
+    try {
+      const data = await api("/api/learning/state"); render(data);
+      if (!data.active) { const entered = await action("enter"); if (entered?.state) render(entered.state); }
+    } catch (error) { toast(error.message, true); setTutorStatus("error", "Lumina no disponible"); }
+  }
+
+  function showSummary(summary) {
+    $("#summary-copy").textContent = summary || "Tu progreso quedó guardado.";
+    const dialog = $("#summary-dialog"); if (!dialog.open) dialog.showModal();
+  }
+
+  function closeSummary() {
+    const dialog = $("#summary-dialog"); if (dialog.open) dialog.close();
+  }
+
+  function bind() {
+    $("#message-form").addEventListener("submit", event => { event.preventDefault(); sendMessage($("#message-input").value); });
+    $("#message-input").addEventListener("keydown", event => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); $("#message-form").requestSubmit(); } });
+    $$("[data-message]").forEach(button => button.addEventListener("click", () => sendMessage(button.dataset.message)));
+    $$("#mode-list button").forEach(button => button.addEventListener("click", async () => {
+      const data = await action("mode", {mode:button.dataset.mode});
+      if (!data) return;
+      sendTeacherControl(`Cambia ahora al modo de aprendizaje '${button.dataset.mode}'. Presenta un solo ejercicio breve.`);
+      toast(`${button.textContent.trim()} activado`);
+    }));
+    document.addEventListener("click", event => {
+      const actionButton = event.target.closest("[data-action]");
+      if (actionButton) {
+        const name = actionButton.dataset.action;
+        if (name === "pause") action(state?.paused ? "resume" : "pause");
+        else if (name === "mute") action(state?.inputMuted ? "unmute" : "mute");
+        else if (name === "translation") action("translation", {enabled:!state?.translationEnabled});
+        else if (name === "repeat") sendTeacherControl("Repite tu última pregunta o ejemplo, sin añadir otro ejercicio.");
+        else if (name === "slower") sendTeacherControl("Repite tu última frase más despacio y con pausas naturales.");
+        else if (name === "stop") stopVoice();
+      }
+      const practice = event.target.closest("[data-practice]");
+      if (practice && state?.lastResponse?.corrections) {
+        const correction = state.lastResponse.corrections[Number(practice.dataset.practice)];
+        if (correction) sendMessage(`Quiero practicar de nuevo esta corrección: ${correction.corrected}`);
+      }
+      const save = event.target.closest("[data-save-word]");
+      if (save) action("save-word", {word:save.dataset.saveWord,meaning:save.dataset.meaning,example:save.dataset.example}).then(() => toast("Palabra guardada"));
+    });
+    $("#start-button").addEventListener("click", () => startClass());
+    $("#end-button").addEventListener("click", () => endClass());
+    $("#back-button").addEventListener("click", () => endClass());
+    $("#settings-button").addEventListener("click", () => $("#settings-dialog").showModal());
+    $("#save-settings").addEventListener("click", event => { event.preventDefault(); action("settings", {preferred_speed:$("#speed-select").value,translation_enabled:$("#translation-select").value === "true"}); $("#settings-dialog").close(); toast("Preferencias guardadas"); });
+    $("#summary-close").addEventListener("click", () => { $("#summary-dialog").close(); try { window.close(); } catch (_) {} });
+    $("#input-mode-button").addEventListener("click", () => $("#message-input").focus());
+    window.addEventListener("keydown", event => { if (event.key === "Escape" && !$("#settings-dialog").open && !$("#summary-dialog").open) stopVoice(); });
+    window.addEventListener("pagehide", () => shutdownLive());
+  }
+
+  (async function init() {
+    bind();
+    if (!(await recoverAuth())) return;
+    connectSocket();
+    await loadState();
+    if (state?.active) startClass();
+  })();
+})();

@@ -3378,6 +3378,7 @@ class MainWindow(QMainWindow):
 
         self.on_text_command   = None
         self.on_remote_clicked = None   # callable: () -> (url, key) | None
+        self.on_learning_english = None # callable: () -> None — opens web studio
         self.on_interrupt      = None   # callable: () -> None — stop JARVIS mid-speech
         self.on_voice_change   = None   # callable: () -> None — rebuild session with new voice
         self.on_audio_device_change = None  # callable: () -> None — reopen audio streams
@@ -4458,6 +4459,26 @@ class MainWindow(QMainWindow):
         remote_btn.clicked.connect(self._open_remote)
         lay.addWidget(remote_btn)
 
+        learning_btn = QPushButton("🎓  LEARNING ENGLISH")
+        learning_btn.setFixedHeight(30)
+        learning_btn.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
+        learning_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        learning_btn.setToolTip("Open English Learning Studio in your browser")
+        learning_btn.setAccessibleName("Open Learning English")
+        learning_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: rgba(20, 120, 82, 0.18); color: #62F0B2;
+                border: 1px solid rgba(67, 240, 170, 0.42); border-radius: 3px;
+                text-align: left; padding: 0 8px;
+            }}
+            QPushButton:hover {{
+                background: rgba(20, 160, 102, 0.28);
+                border-color: #43F0AA; color: #DFFFF2;
+            }}
+        """)
+        learning_btn.clicked.connect(self._open_learning_english)
+        lay.addWidget(learning_btn)
+
         fs_btn = QPushButton("⛶  FULLSCREEN  [F11]")
         fs_btn.setFixedHeight(26)
         fs_btn.setFont(QFont("Courier New", 7))
@@ -4810,6 +4831,22 @@ class MainWindow(QMainWindow):
         ov.show()
         self._remote_overlay = ov
         self._log.append_log(f"SYS: Remote key generated — manual: {manual or url}")
+
+    def _open_learning_english(self):
+        if not self.on_learning_english:
+            self._log.append_log("SYS: Learning English is still starting.")
+            return
+        self._drawer_btn.setChecked(False)
+        self._toggle_drawer(False)
+        try:
+            self.on_learning_english()
+        except Exception as exc:
+            # An exception raised by a Qt slot can terminate the whole process.
+            # Keep Lumina alive and make the launch failure visible instead.
+            print(f"[Learning English] Could not start: {exc}")
+            self._log.append_log(
+                "ERR: Learning English could not start. Check the console for details."
+            )
 
     # ── Auto-start ──────────────────────────────────────────────────────────────
 
@@ -5615,6 +5652,14 @@ class JarvisUI:
     @on_remote_clicked.setter
     def on_remote_clicked(self, cb):
         self._win.on_remote_clicked = cb
+
+    @property
+    def on_learning_english(self):
+        return self._win.on_learning_english
+
+    @on_learning_english.setter
+    def on_learning_english(self, cb):
+        self._win.on_learning_english = cb
 
     @property
     def on_interrupt(self):

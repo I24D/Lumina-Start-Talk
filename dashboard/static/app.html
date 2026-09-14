@@ -50,6 +50,7 @@
     .enc-badge.on  { display: block; background: rgba(34,197,94,0.1); border: 1px solid rgba(34,197,94,0.25); color: var(--green); }
     .enc-badge.off { display: block; background: rgba(255,100,100,0.08); border: 1px solid rgba(255,100,100,0.2); color: #f87171; }
     .url { font-size: 10px; font-family: monospace; color: var(--muted); padding: 4px 9px; background: var(--surface); border: 1px solid var(--border); border-radius: 6px; }
+    .learning-link { color:#6ee7b7; text-decoration:none; font-size:10px; font-weight:700; letter-spacing:1px; padding:7px 10px; border:1px solid rgba(110,231,183,.24); border-radius:8px; background:rgba(110,231,183,.06); }
 
     /* ── FEED ── */
     main { flex: 1; overflow-y: auto; padding: 14px 16px 8px; display: flex; flex-direction: column; gap: 10px; }
@@ -140,6 +141,7 @@
     <div class="pill" id="pill"><span class="dot"></span><span id="st">Connecting</span></div>
     <div class="enc-badge" id="enc">AES-256</div>
     <div class="spacer"></div>
+    <a class="learning-link" href="/learning-english">🎓 LEARNING ENGLISH</a>
     <div class="url">__IP__:__PORT__</div>
   </header>
   <main id="feed"></main>

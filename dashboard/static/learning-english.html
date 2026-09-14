@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#071410">
+  <title>Learning English · Lumina</title>
+  <link rel="stylesheet" href="/static/learning-english.css">
+</head>
+<body>
+  <div class="ambient ambient-one"></div>
+  <div class="ambient ambient-two"></div>
+  <div id="toast" role="status" aria-live="polite"></div>
+
+  <div class="app-shell">
+    <header class="learning-header">
+      <button class="ghost-button" id="back-button" type="button" aria-label="Volver a Lumina">
+        <span aria-hidden="true">←</span><span>Volver a Lumina</span>
+      </button>
+      <div class="brand-block">
+        <div class="brand-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24"><path d="m2 10 10-5 10 5-10 5L2 10Z"/><path d="M6 12.5V17c3.5 2.5 8.5 2.5 12 0v-4.5"/><path d="M22 10v6"/></svg>
+        </div>
+        <div><span class="eyebrow">English Learning Studio</span><h1>Learning English</h1></div>
+      </div>
+      <div class="header-facts" aria-label="Estado de la clase">
+        <span class="fact"><small>Nivel</small><strong id="header-level">A1</strong></span>
+        <span class="fact fact-objective"><small>Objetivo</small><strong id="header-goal">Configurando perfil</strong></span>
+        <span class="fact progress-fact"><small>Lección</small><strong id="header-progress">0%</strong></span>
+      </div>
+      <div class="connection-cluster">
+        <span class="status-chip" id="gemini-chip"><i></i>Gemini</span>
+        <span class="status-chip" id="mic-chip"><i></i>Micrófono</span>
+        <button class="icon-button" id="settings-button" type="button" title="Configuración" aria-label="Configuración">⚙</button>
+        <button class="danger-button" id="end-button" type="button">Terminar clase</button>
+      </div>
+    </header>
+
+    <main class="studio-grid">
+      <aside class="panel course-panel" aria-label="Curso y progreso">
+        <section class="profile-card">
+          <div class="level-ring"><span id="level-ring">A1</span></div>
+          <div><span class="section-kicker">Tu recorrido</span><h2 id="profile-goal">Inglés práctico</h2><p id="lesson-label">Preparando la primera lección</p></div>
+        </section>
+
+        <section>
+          <div class="section-heading"><h3>Modos de aprendizaje</h3><span>7 modos</span></div>
+          <nav class="mode-list" id="mode-list" aria-label="Modos de aprendizaje">
+            <button data-mode="conversation" class="active"><span>◌</span><b>Conversación</b></button>
+            <button data-mode="pronunciation"><span>◎</span><b>Pronunciación</b></button>
+            <button data-mode="grammar"><span>⌁</span><b>Gramática</b></button>
+            <button data-mode="vocabulary"><span>◇</span><b>Vocabulario</b></button>
+            <button data-mode="listening"><span>◉</span><b>Comprensión auditiva</b></button>
+            <button data-mode="quick-lesson"><span>ϟ</span><b>Lección rápida</b></button>
+            <button data-mode="assessment"><span>✓</span><b>Evaluación de nivel</b></button>
+          </nav>
+        </section>
+
+        <section>
+          <div class="section-heading"><h3>Progreso por habilidad</h3><span id="words-count">0 palabras</span></div>
+          <div class="skill-bars" id="skill-bars"></div>
+        </section>
+
+        <section class="compact-section">
+          <div class="section-heading"><h3>Necesita práctica</h3><span id="error-count">0</span></div>
+          <div id="error-list" class="mini-list"><p class="empty-copy">Las oportunidades de práctica aparecerán aquí.</p></div>
+        </section>
+
+        <section class="compact-section">
+          <div class="section-heading"><h3>Actividad semanal</h3><span id="week-total">0 clases</span></div>
+          <div class="week-chart" id="week-chart" aria-label="Actividad semanal"></div>
+        </section>
+      </aside>
+
+      <section class="panel tutor-panel" aria-label="Maestra y ejercicio">
+        <div class="tutor-stage">
+          <div class="orb-wrap" aria-hidden="true">
+            <div class="orb-orbit orbit-one"></div><div class="orb-orbit orbit-two"></div>
+            <div class="tutor-orb" id="tutor-orb"><span></span></div>
+          </div>
+          <span class="tutor-state" id="tutor-state"><i></i>Conectando</span>
+          <h2 id="lesson-objective">Construyamos tu plan de aprendizaje</h2>
+          <p class="lesson-subtitle" id="next-action">Lumina hará una pregunta a la vez y guardará tu progreso.</p>
+          <button class="dialog-save hidden" id="start-button" type="button">Empezar clase</button>
+        </div>
+
+        <div class="conversation-card">
+          <div class="turn-label"><span>Maestra Lumina</span><small id="stream-label">EN ESPERA</small></div>
+          <p class="assistant-text" id="assistant-text">Estoy preparando tu estudio personalizado…</p>
+          <div class="turn-actions">
+            <button type="button" data-action="repeat">↻ Repetir</button>
+            <button type="button" data-action="slower">◷ Más despacio</button>
+          </div>
+        </div>
+
+        <div class="student-card">
+          <div class="turn-label"><span>Tu respuesta</span><small>TU VOZ</small></div>
+          <p id="student-text">Habla con la maestra o escribe tu respuesta abajo.</p>
+        </div>
+
+        <div class="onboarding-card" id="onboarding-card">
+          <span class="section-kicker">Primeros pasos</span>
+          <h3>Una configuración breve, conversando</h3>
+          <p>Responde por voz. También puedes usar una opción rápida; Lumina preguntará solamente lo que falte.</p>
+          <div class="quick-options">
+            <button data-message="Mi idioma principal es español.">Mi idioma es español</button>
+            <button data-message="Quiero comenzar desde cero, nivel A1.">Comenzar desde cero</button>
+            <button data-message="Quiero hacer una evaluación rápida de nivel.">Evaluar mi nivel</button>
+            <button data-message="Mi objetivo principal es conversar con confianza.">Conversación</button>
+            <button data-message="Mi objetivo es usar inglés en el trabajo.">Trabajo</button>
+            <button data-message="Mi objetivo es viajar y comunicarme.">Viajes</button>
+          </div>
+        </div>
+
+        <form class="text-composer" id="message-form">
+          <label class="sr-only" for="message-input">Responder por texto</label>
+          <textarea id="message-input" rows="1" maxlength="4000" placeholder="Escribe tu respuesta…"></textarea>
+          <button class="send-button" type="submit" aria-label="Enviar respuesta">➤</button>
+        </form>
+        <p class="mic-note">La maestra te escucha por el micrófono de este navegador. El micrófono de Lumina queda en pausa hasta que pulses Volver a Lumina.</p>
+      </section>
+
+      <aside class="panel correction-panel" aria-label="Correcciones en vivo">
+        <div class="section-heading correction-heading"><div><span class="section-kicker">Después de tu turno</span><h2>Correcciones en vivo</h2></div><span class="live-badge">LIVE</span></div>
+        <div id="correction-list" class="correction-list">
+          <div class="empty-state">
+            <span>✓</span><h3>Este es un espacio seguro</h3>
+            <p>Las correcciones aparecerán cuando termines de hablar, nunca mientras estás formando una idea.</p>
+          </div>
+        </div>
+
+        <section class="vocabulary-section">
+          <div class="section-heading"><h3>Vocabulario nuevo</h3><span id="vocabulary-total">0</span></div>
+          <div id="vocabulary-list" class="vocabulary-list"><p class="empty-copy">Todavía no hay palabras nuevas.</p></div>
+        </section>
+      </aside>
+    </main>
+
+    <footer class="voice-dock" aria-label="Controles de voz">
+      <div class="voice-status"><span class="sound-wave"><i></i><i></i><i></i><i></i><i></i></span><div><strong id="dock-state">Esperando a Gemini</strong><small id="dock-detail">Tu progreso se guarda automáticamente</small></div></div>
+      <div class="dock-controls">
+        <button type="button" id="mute-button" data-action="mute" aria-pressed="false"><span>◉</span> Micrófono</button>
+        <button type="button" class="stop-control" data-action="stop"><span>■</span> Detener</button>
+        <button type="button" data-action="repeat"><span>↻</span> Repetir</button>
+        <button type="button" data-action="slower"><span>◷</span> Más despacio</button>
+        <button type="button" id="translation-button" data-action="translation" aria-pressed="true"><span>A/文</span> Traducción</button>
+        <button type="button" id="input-mode-button"><span>⌨</span> Voz + texto</button>
+      </div>
+      <button class="pause-button" id="pause-button" data-action="pause" type="button">Ⅱ Pausar clase</button>
+    </footer>
+  </div>
+
+  <dialog id="settings-dialog">
+    <form method="dialog">
+      <div class="dialog-heading"><div><span class="section-kicker">Learning English</span><h2>Preferencias de la clase</h2></div><button value="cancel" aria-label="Cerrar">×</button></div>
+      <label>Velocidad preferida<select id="speed-select"><option value="slow">Lenta</option><option value="normal" selected>Normal</option><option value="natural">Natural</option></select></label>
+      <label>Mostrar traducciones<select id="translation-select"><option value="true">Cuando sean necesarias</option><option value="false">Solo inglés</option></select></label>
+      <p>La evaluación fonética avanzada está desacoplada. Con la transcripción actual, Lumina evalúa inteligibilidad sin fingir puntuaciones por fonema.</p>
+      <button class="dialog-save" id="save-settings" value="default">Guardar</button>
+    </form>
+  </dialog>
+
+  <dialog id="summary-dialog">
+    <div class="summary-mark">✓</div><span class="section-kicker">Sesión guardada</span><h2>Clase completada</h2><p id="summary-copy"></p>
+    <button class="dialog-save" id="summary-close" type="button">Volver a Lumina</button>
+  </dialog>
+
+  <script src="/static/learning-english.js" defer></script>
+</body>
+</html>

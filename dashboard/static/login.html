@@ -153,6 +153,8 @@
   </div>
 
   <script>
+    const _next = new URLSearchParams(location.search).get('next') === '/learning-english'
+      ? '/learning-english' : '/';
     // Try auto-reconnect with stored device token (set on first QR login)
     (async function() {
       const devTok = localStorage.getItem('jarvis_device_token');
@@ -168,7 +170,7 @@
         if (d.ok && d.token) {
           sessionStorage.setItem('jarvis_key', d.key);
           sessionStorage.setItem('jarvis_token', d.token);
-          location.replace('/');
+          location.replace(_next);
           return;
         }
       } catch (_) {}
@@ -204,7 +206,7 @@
       if (data.ok && data.token) {
         sessionStorage.setItem('jarvis_key', key);
         sessionStorage.setItem('jarvis_token', data.token);
-        location.href = '/';
+        location.href = _next;
       } else {
         inp.value = '';
         inp.focus();

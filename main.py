@@ -116,6 +116,7 @@ import time
 import json
 import sys
 import traceback
+import webbrowser
 from collections import deque
 from datetime import datetime
 from pathlib import Path
@@ -169,6 +170,8 @@ from core.plugin_loader        import discover_plugins
 from core                      import undo as undo_stack
 from core                      import confirm as confirm_gate
 from core                      import audio_devices
+from learning_english import LearningEnglishController, LearningEnglishService
+from learning_english.intent import confirmation_answer, detect_learning_english_intent
 
 def get_base_dir():
     if getattr(sys, "frozen", False):
@@ -1239,6 +1242,7 @@ class JarvisLive:
         self._interrupted          = False   # True while draining audio after user interrupt
         self.ui.on_text_command   = self._on_text_command
         self.ui.on_remote_clicked = self._make_remote_key
+        self.ui.on_learning_english = self._on_learning_english_clicked
         self.ui.on_interrupt      = self.interrupt
         self.ui.on_voice_change   = self._on_voice_change     # voice picker → rebuild session
         self.ui.on_audio_device_change = self._on_audio_device_change
@@ -1248,6 +1252,11 @@ class JarvisLive:
         self.ui.on_camera_frame     = self._on_live_camera_frame
         self.ui.on_camera_error     = self._on_live_camera_error
         self._reconnect_event: asyncio.Event | None = None
+        # Keep strong references to long-lived dashboard tasks. The event loop
+        # only keeps weak task references, so an unreferenced server task can
+        # disappear before uvicorn reaches its listening state.
+        self._dashboard_task: asyncio.Task | None = None
+        self._dashboard_commands_task: asyncio.Task | None = None
         self._reconnect_keep = True   # False → next rebuild drops the resumption handle
         # Transcripts arrive in fragments, so the wake phrase is seen on several
         # consecutive updates. This keeps one spoken phrase to one wake.
@@ -1272,6 +1281,15 @@ class JarvisLive:
         # conversation that never ends never produces a summary, and the
         # "yesterday we talked about…" line silently disappears.
         self._resume_handle: str | None = None
+        # Learning English runs its own Gemini Live session in the browser.
+        # This session stays the general assistant throughout, tools included;
+        # only its microphone and voice pause while a class is open.
+        self._learning_confirmation_pending = False
+        self._learning_confirmation_prompt_pending = False
+        self._learning_seen_turns: deque[tuple[int, float]] = deque(maxlen=50)
+        self._learning_analysis_lock: asyncio.Lock | None = None
+        self._learning = LearningEnglishController(event_sink=self._emit_learning_event)
+        self._learning_service = LearningEnglishService(api_key_loader=_get_api_key)
         self._turn_done_event: asyncio.Event | None = None
         self._dashboard     = None
         self._briefing_sent    = False          # morning briefing fires once per process
@@ -1624,12 +1642,266 @@ class JarvisLive:
         manual = self._dashboard.get_manual_url()
         return url, key, f"{url}/auto-login?key={key}", manual
 
+    def _emit_learning_event(self, name: str, payload: dict | None = None) -> None:
+        dashboard = self._dashboard
+        loop = self._loop
+        if not dashboard or not loop:
+            return
+        message = {"type": name, **(payload or {})}
+        try:
+            if loop.is_running():
+                asyncio.run_coroutine_threadsafe(dashboard.broadcast(message), loop)
+        except Exception:
+            pass
+
+    def _learning_snapshot(self) -> dict:
+        return self._learning.snapshot()
+
+    def _broadcast_learning(self, message: dict) -> None:
+        if not self._dashboard or not self._loop:
+            return
+        try:
+            try:
+                running = asyncio.get_running_loop()
+            except RuntimeError:
+                running = None
+            if running is self._loop:
+                self._loop.create_task(self._dashboard.broadcast(message))
+            else:
+                asyncio.run_coroutine_threadsafe(
+                    self._dashboard.broadcast(message), self._loop
+                )
+        except Exception:
+            pass
+
+    def _on_learning_english_clicked(self) -> None:
+        """Qt-thread entrypoint. Scheduling keeps the desktop UI responsive."""
+        if not self._loop or not self._loop.is_running():
+            self.ui.write_log("SYS: Learning English is waiting for Lumina to connect.")
+            return
+        asyncio.run_coroutine_threadsafe(
+            self._enter_learning_english(trigger="click", open_browser=True),
+            self._loop,
+        )
+
+    async def _learning_studio_ready(self) -> bool:
+        """Start the local web server when needed and wait for it. False means
+        the studio cannot open; the log and the studio have already been told."""
+        if not self._dashboard:
+            self.ui.write_log("ERR: English Learning Studio needs the local dashboard.")
+            self._broadcast_learning({
+                "type": "learning.error",
+                "message": "El servidor web de Lumina no está disponible.",
+            })
+            return False
+        if self._dashboard_task is None or self._dashboard_task.done():
+            self._dashboard_task = asyncio.create_task(
+                self._dashboard.serve(), name="lumina-dashboard-lifecycle"
+            )
+        if not await self._dashboard.wait_until_ready(timeout=10.0):
+            detail = self._dashboard.startup_error or "unknown startup error"
+            self.ui.write_log(f"ERR: English Learning Studio could not start: {detail}")
+            self._broadcast_learning({
+                "type": "learning.error",
+                "message": "El servidor web local de Lumina no pudo iniciar.",
+            })
+            return False
+        return True
+
+    async def _open_learning_browser(self) -> None:
+        if not await self._learning_studio_ready():
+            return
+        url = self._dashboard.get_learning_url(local=True)
+        opened = await asyncio.to_thread(webbrowser.open, url, new=2)
+        if not opened:
+            self.ui.write_log(f"SYS: Open Learning English manually: {url}")
+
+    async def _enter_learning_english(
+        self, *, trigger: str = "ui", open_browser: bool = True
+    ) -> dict:
+        if self._learning.active:
+            if open_browser:
+                await self._open_learning_browser()
+            return self._learning_snapshot()
+
+        # The studio is checked before anything changes: without it there is no
+        # class to hand the microphone to.
+        if open_browser and not await self._learning_studio_ready():
+            self.speak(
+                "[SYSTEM_ALERT] Tell the user briefly that Learning English could not "
+                "open, so you are still their general assistant."
+            )
+            return self._learning_snapshot()
+
+        # The class has its own Gemini session in the browser. This one keeps
+        # running, tools and all; it only stops hearing and speaking until the
+        # user presses "Volver a Lumina".
+        self.interrupt()
+        if self._live_vision_source:
+            self.stop_live_vision()
+        self._learning.enter(trigger)
+        self._learning_confirmation_pending = False
+        self._learning_confirmation_prompt_pending = False
+        self.ui.write_log(
+            "SYS: Learning English is open in your browser — Lumina's microphone "
+            "is paused until you press Volver a Lumina."
+        )
+        self._broadcast_learning({
+            "type": "learning.snapshot", "state": self._learning_snapshot()
+        })
+        if open_browser:
+            await self._open_learning_browser()
+        return self._learning_snapshot()
+
+    async def _exit_learning_english(self, *, trigger: str = "ui") -> dict:
+        if not self._learning.active:
+            return self._learning_snapshot()
+        if self._learning_analysis_lock is not None:
+            async with self._learning_analysis_lock:
+                completed = self._learning.complete()
+        else:
+            completed = self._learning.complete()
+        self._broadcast_learning({
+            "type": "learning.snapshot", "state": self._learning_snapshot()
+        })
+        self.ui.write_log(f"SYS: Learning English ended ({trigger}) — Lumina's microphone is back.")
+        self.speak(
+            "[SYSTEM_ALERT] Learning English terminó y el progreso quedó guardado. "
+            f"Di una despedida de una frase. Resumen: {completed.get('lastSummary', '')}"
+        )
+        return self._learning_snapshot()
+
+    async def _learning_live_session(self, handle: str = "") -> dict:
+        """The browser tutor's single-use Gemini Live token."""
+        if not self._learning.active:
+            raise RuntimeError("Learning English is not active")
+        snapshot = self._learning_snapshot()
+        session = await asyncio.get_running_loop().run_in_executor(
+            None,
+            lambda: self._learning_service.create_live_session(
+                snapshot,
+                assistant_name=self._asst_name,
+                user_name=self._user_name,
+                voice_name=get_voice(),
+                resume_handle=handle or None,
+            ),
+        )
+        if not handle:
+            self._learning.session_ready()
+            self._broadcast_learning({
+                "type": "learning.snapshot", "state": self._learning_snapshot()
+            })
+        return session
+
+    async def _learning_turn(self, user_text: str, assistant_text: str) -> dict:
+        """A finished turn from the browser tutor, analysed for the studio."""
+        if not self._learning.active:
+            raise RuntimeError("Learning English is not active")
+        asyncio.create_task(self._process_learning_turn(user_text, assistant_text))
+        return self._learning_snapshot()
+
+    async def _learning_web_action(self, action: str, body: dict) -> dict:
+        if action == "enter":
+            return await self._enter_learning_english(trigger="web", open_browser=False)
+        if action == "exit":
+            return await self._exit_learning_english(trigger="web")
+        if action in {"pause", "resume"}:
+            self._learning.set_paused(action == "pause")
+        elif action in {"mute", "unmute"}:
+            self._learning.input_muted = action == "mute"
+        elif action == "translation":
+            self._learning.translation_enabled = bool(body.get("enabled", True))
+        elif action == "mode":
+            self._learning.set_mode(str(body.get("mode") or ""))
+        elif action == "save-word":
+            self._learning.store.save_word(
+                str(body.get("word") or ""),
+                str(body.get("meaning") or ""),
+                str(body.get("example") or ""),
+            )
+        elif action == "settings":
+            preferred = str(body.get("preferred_speed") or "normal")
+            if preferred not in {"slow", "normal", "natural"}:
+                raise ValueError("Invalid preferred speed")
+            self._learning.translation_enabled = bool(body.get("translation_enabled", True))
+            self._learning.store.update_profile({"preferred_speed": preferred})
+        snapshot = self._learning_snapshot()
+        self._broadcast_learning({"type": "learning.snapshot", "state": snapshot})
+        return snapshot
+
+    async def _process_learning_turn(self, user_text: str, assistant_text: str) -> None:
+        if not user_text and not assistant_text:
+            return
+        turn_key = hash((user_text, assistant_text))
+        now = time.monotonic()
+        if any(key == turn_key and now - seen_at < 5 for key, seen_at in self._learning_seen_turns):
+            return
+        self._learning_seen_turns.append((turn_key, now))
+        if self._learning_analysis_lock is None:
+            self._learning_analysis_lock = asyncio.Lock()
+        async with self._learning_analysis_lock:
+            snapshot = self._learning_snapshot()
+            response = await asyncio.get_running_loop().run_in_executor(
+                None,
+                lambda: self._learning_service.analyze_turn(
+                    user_text=user_text,
+                    assistant_text=assistant_text,
+                    snapshot=snapshot,
+                ),
+            )
+            # A user can leave while structured analysis is in flight. Preserve the
+            # finished turn, but never resurrect an inactive browser session.
+            if self._learning.active:
+                state = self._learning.apply_turn(user_text, response)
+                self._broadcast_learning({
+                    "type": "learning.turn", "response": response.to_dict()
+                })
+                self._broadcast_learning({"type": "learning.snapshot", "state": state})
+                if state.get("storageStatus") == "temporary":
+                    self._broadcast_learning({
+                        "type": "learning.error",
+                        "message": state.get("storageError") or "El progreso se guardará temporalmente.",
+                    })
+
     def _on_text_command(self, text: str):
         # Before the session check, deliberately: typing the wake phrase is the
         # last resort when the session is gone, and the old early return made
         # that exact case do nothing at all.
         if _is_wake_phrase(text, self._asst_name):
             self.wake(text)
+            return
+
+        intent = detect_learning_english_intent(text, active=self._learning.active)
+        if self._learning_confirmation_pending:
+            answer = confirmation_answer(text)
+            if answer is not None:
+                self._learning_confirmation_pending = False
+                if answer:
+                    if self._loop:
+                        asyncio.run_coroutine_threadsafe(
+                            self._enter_learning_english(trigger="confirmation", open_browser=True),
+                            self._loop,
+                        )
+                else:
+                    self.speak("[SYSTEM_ALERT] Confirma brevemente que Learning English no se activará.")
+                return
+        if intent.action == "enter" and intent.confidence >= 0.9:
+            if self._loop:
+                asyncio.run_coroutine_threadsafe(
+                    self._enter_learning_english(trigger="text", open_browser=True), self._loop
+                )
+            return
+        if intent.action == "exit" and intent.confidence >= 0.9:
+            if self._loop:
+                asyncio.run_coroutine_threadsafe(
+                    self._exit_learning_english(trigger="text"), self._loop
+                )
+            return
+        if intent.action == "enter" and intent.confidence >= 0.6:
+            self._learning_confirmation_pending = True
+            self.speak(
+                "[SYSTEM_ALERT] Pregunta solamente: '¿Quieres que active Learning English y abra el estudio?'"
+            )
             return
 
         if not self._loop or not self.session:
@@ -1780,7 +2052,6 @@ class JarvisLive:
             # utterances captured and sent, zero transcriptions returned.
             # The service's defaults handle turn-taking perfectly well.
             system_instruction="\n".join(parts),
-            tools=[{"function_declarations": TOOL_DECLARATIONS + self._plugin_registry.get_tool_declarations()}],
             # Hand back the handle captured from the last session_resumption
             # update. `handle=None` is exactly the old behaviour (ask for
             # handles, start fresh), so the first connect of a run is unchanged.
@@ -1795,6 +2066,12 @@ class JarvisLive:
                 )
             ),
         )
+
+        cfg["tools"] = [{
+            "function_declarations": (
+                TOOL_DECLARATIONS + self._plugin_registry.get_tool_declarations()
+            )
+        }]
 
         # Sliding-window compression: the session never dies of a full context
         # window, so one conversation can run for hours. Added here rather than
@@ -2305,8 +2582,11 @@ class JarvisLive:
             # back through it. On headphones it cannot, so it stays open and
             # the user can talk over her at any point — which is the whole
             # difference between a voice assistant and a monologue.
+            # While a Learning English class is open the browser tutor has the
+            # student's voice; this session must not answer it too.
             if ((not jarvis_speaking or self._full_duplex)
-                    and not self.ui.muted and not self._phone_active):
+                    and not self.ui.muted and not self._phone_active
+                    and not self._learning.active):
                 data = indata.tobytes()
                 level = _pcm_level(indata)
                 # Loudest block the model was actually given since the last
@@ -2420,7 +2700,7 @@ class JarvisLive:
                 while True:
                     await asyncio.sleep(0.5)
 
-                    if self.ui.muted:
+                    if self.ui.muted or self._learning.active:
                         # Muting stops nothing at the device, but there is no
                         # sense reopening hardware the user has switched off.
                         self._last_mic_block = time.monotonic()
@@ -2668,6 +2948,7 @@ class JarvisLive:
         print("[JARVIS] 👂 Recv started")
         out_buf = _TranscriptAccumulator()
         in_buf = _TranscriptAccumulator()
+        mode_switch_requested = False
 
         _streams = 0
         try:
@@ -2726,6 +3007,11 @@ class JarvisLive:
                     if response.data:
                         if self._interrupted:
                             pass  # discard: interrupted
+                        elif self._learning.active:
+                            # The class is speaking in the browser. What this
+                            # session says meanwhile still reaches the HUD log
+                            # as text; it just does not talk over the teacher.
+                            pass
                         else:
                             if self._turn_done_event and self._turn_done_event.is_set():
                                 self._turn_done_event.clear()
@@ -2838,6 +3124,42 @@ class JarvisLive:
                                 except Exception:
                                     pass
 
+                                # The intent detector consumes Gemini's existing
+                                # transcription, so Learning English never opens
+                                # a competing STT engine or microphone.
+                                if not mode_switch_requested:
+                                    heard = in_buf.text
+                                    if self._learning_confirmation_pending:
+                                        answer = confirmation_answer(heard)
+                                        if answer is not None:
+                                            self._learning_confirmation_pending = False
+                                            mode_switch_requested = bool(answer)
+                                            if answer:
+                                                asyncio.create_task(
+                                                    self._enter_learning_english(
+                                                        trigger="voice-confirmation",
+                                                        open_browser=True,
+                                                    )
+                                                )
+                                    else:
+                                        learning_intent = detect_learning_english_intent(heard)
+                                        if (
+                                            learning_intent.action == "enter"
+                                            and learning_intent.confidence >= 0.9
+                                        ):
+                                            mode_switch_requested = True
+                                            asyncio.create_task(
+                                                self._enter_learning_english(
+                                                    trigger="voice", open_browser=True
+                                                )
+                                            )
+                                        elif (
+                                            learning_intent.action == "enter"
+                                            and learning_intent.confidence >= 0.6
+                                        ):
+                                            self._learning_confirmation_pending = True
+                                            self._learning_confirmation_prompt_pending = True
+
                                 # Checked here rather than at turn_complete: if
                                 # the model has gone quiet there may never be a
                                 # turn to complete, and waiting for one is the
@@ -2909,6 +3231,16 @@ class JarvisLive:
                             # Supabase never delays the next thing she says.
                             if full_in or full_out:
                                 log_turn(BASE_DIR, full_in, full_out)
+
+                            if self._learning_confirmation_prompt_pending and self.session:
+                                self._learning_confirmation_prompt_pending = False
+                                await self.session.send_client_content(
+                                    turns={"parts": [{"text": (
+                                        "[SYSTEM_ALERT] Pregunta solamente si el usuario quiere "
+                                        "activar Learning English y abrir el estudio."
+                                    )}]},
+                                    turn_complete=True,
+                                )
 
                             # Vision injection: model finished tool-response turn → now send the image
                             if self._pending_vision and self.session:
@@ -3545,7 +3877,7 @@ class JarvisLive:
             self._phone_active = True   # phone is streaming — silence PC mic
             with self._speaking_lock:
                 speaking = self._is_speaking
-            if not speaking and not self.ui.muted:
+            if not speaking and not self.ui.muted and not self._learning.active:
                 try:
                     self.out_queue.put_nowait(chunk)
                 except asyncio.QueueFull:
@@ -3615,9 +3947,27 @@ class JarvisLive:
             from dashboard.server import DashboardServer
             self._dashboard = DashboardServer()
             self._dashboard.set_connect_callback(self._on_phone_connected)
-            asyncio.create_task(self._dashboard.serve())
+            self._dashboard.set_learning_callbacks(
+                state=self._learning_snapshot,
+                action=self._learning_web_action,
+                session=self._learning_live_session,
+                turn=self._learning_turn,
+            )
+            self._dashboard_task = asyncio.create_task(
+                self._dashboard.serve(), name="lumina-dashboard-lifecycle"
+            )
+            # Do not announce Lumina as ready while the browser server is still
+            # only an intention. Usually this takes under a second; failures are
+            # retained and shown instead of opening a dead browser tab.
+            if not await self._dashboard.wait_until_ready(timeout=10.0):
+                detail = self._dashboard.startup_error or "unknown startup error"
+                print(f"[Dashboard] Startup incomplete: {detail}")
+                self.ui.write_log(f"ERR: Local web server could not start: {detail}")
             # Runs for the whole lifetime, not just inside an active session
-            asyncio.create_task(self._process_dashboard_commands())
+            self._dashboard_commands_task = asyncio.create_task(
+                self._process_dashboard_commands(),
+                name="lumina-dashboard-commands",
+            )
         except Exception as e:
             print(f"[Dashboard] Disabled: {e}")
             self._dashboard = None
