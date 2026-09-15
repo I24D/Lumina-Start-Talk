@@ -420,7 +420,7 @@ class ToolsBesideTheConversationTests(unittest.TestCase):
         async def exercise():
             release = asyncio.Event()
             live = main.JarvisLive.__new__(main.JarvisLive)
-            live._rx_at, live._rx_kinds, live._tool_tasks = 0.0, {}, set()
+            live._rx_at, live._rx_kinds, live._tool_tasks, live._tool_calls_open = 0.0, {}, set(), 0
 
             class Session:
                 async def receive(self):

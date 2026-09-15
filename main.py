@@ -1334,6 +1334,9 @@ class JarvisLive:
         # deafness watchdog for why.
         self._deaf_rebuilds = 0
         self._tool_running = 0
+        # Tool calls the model has issued and not yet had answered. Gemini 3.1
+        # cancels an open call if any text reaches it meanwhile; see plugin_say.
+        self._tool_calls_open = 0
         # Tool calls run beside the conversation, not inside the receive loop.
         self._tool_tasks: set[asyncio.Task] = set()
         # Transcriptions this session has produced since it connected. The
@@ -1399,6 +1402,13 @@ class JarvisLive:
 
         async def _say():
             try:
+                # Gemini 3.1 cancels an open tool call the moment any text
+                # reaches it: the result is thrown away and the model calls
+                # tools again (measured 2026-09-15). What a plugin has to say
+                # waits until the open calls have been answered.
+                if not isinstance(self.session, OpenAIRealtimeSession):
+                    while self._tool_calls_open:
+                        await asyncio.sleep(0.1)
                 await self._send_text_turn(instruction)
             except Exception as e:
                 print(f"[PluginSay] {e}")
@@ -2347,16 +2357,20 @@ class JarvisLive:
         search, a file or another assistant took, nothing from the model was
         read: no transcript and no voice. It now keeps reading while this runs.
         """
-        responses = [await self._execute_tool(fc) for fc in calls]
-        if self.session is not session:
-            print(f"[JARVIS] 📤 {len(responses)} tool result(s) dropped — "
-                  "their session has closed", flush=True)
-            return
+        self._tool_calls_open += 1
         try:
-            await session.send_tool_response(function_responses=responses)
-        except Exception as exc:
-            print(f"[JARVIS] ⛔ tool result not sent: {type(exc).__name__}: {exc}",
-                  flush=True)
+            responses = [await self._execute_tool(fc) for fc in calls]
+            if self.session is not session:
+                print(f"[JARVIS] 📤 {len(responses)} tool result(s) dropped — "
+                      "their session has closed", flush=True)
+                return
+            try:
+                await session.send_tool_response(function_responses=responses)
+            except Exception as exc:
+                print(f"[JARVIS] ⛔ tool result not sent: {type(exc).__name__}: {exc}",
+                      flush=True)
+        finally:
+            self._tool_calls_open -= 1
 
     async def _dispatch_tool(self, fc) -> types.FunctionResponse:
         name = fc.name

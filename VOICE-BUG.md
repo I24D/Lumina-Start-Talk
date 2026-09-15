@@ -299,8 +299,6 @@ say what to look at next. Do not change a second variable before that answer.
 
 ## Known and unfixed, separate from the above
 
-- **Copilot's bridge still blocks the turn** while it waits, unlike ChatGPT's
-  and OpenClaw's, which return immediately and speak the answer on arrival.
 - **On speakers the microphone closes while she speaks**, so a 30-second
   reply is 30 seconds of not hearing him, and voice barge-in cannot work —
   `START_OF_ACTIVITY_INTERRUPTS` is configured but never receives audio to

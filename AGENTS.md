@@ -70,6 +70,17 @@ dialog or proactive audio. On 2026-09-05 a regional slowdown of 3.1 was reported
 from EU traffic (first audio 16–26 s); replies that suddenly take that long are
 the service, not this code.
 
+**No text while a tool call is open.** On 3.1, any text that reaches the
+session while a function call is still open cancels the call: the result sent
+afterwards is thrown away and the model calls tools again. Measured on
+2026-09-15 against the API, with Lumina's prompt and the Copilot declaration: a
+"tell the user you have asked Copilot" sent mid-call brought
+`tool_call_cancellation` within 60 ms and the answer was never read; without it
+the answer was read 0.6 s after the tool result. So on Gemini `plugin_say` waits
+for `_tool_calls_open` to reach zero, and a bridge that waits on another
+assistant returns at once and delivers the answer as `[DELAYED_ANSWER]`, as
+Copilot's, ChatGPT's and OpenClaw's all do.
+
 ### 1b. Do not set `realtime_input_config`. The upstream project does not
 
 This one cost a day. `_build_config` must not pass a `RealtimeInputConfig`, and

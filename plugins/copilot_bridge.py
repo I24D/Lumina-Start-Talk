@@ -57,13 +57,14 @@ PLUGIN = {
     "name": "copilot_bridge",
     "description": (
         "Talks to the Microsoft Copilot desktop app: opens its chat, types a question into it, "
-        "waits for Copilot's answer and reads that answer back out loud. Use this for ANY request "
+        "and reads Copilot's answer out loud when it arrives. Use this for ANY request "
         "that involves asking Copilot something or writing in Copilot's chat — do NOT use "
         "computer_control or open_app for that, they cannot see the chat box or read the reply. "
         "You are the messenger, not the judge: you do not know what Copilot can and cannot do, so "
         "never refuse a request or claim Copilot lacks a capability. Put the question to it and "
         "let its own answer say so. "
-        "action='ask' (default) sends a question and returns Copilot's answer: 'pregúntale a "
+        "action='ask' (default) sends a question and returns at once; Copilot's answer then "
+        "reaches you by itself as a [DELAYED_ANSWER] message: 'pregúntale a "
         "Copilot qué capacidades tiene', 'escribe en el chat de Copilot que...', 'dile a Copilot "
         "que...', 'consúltale a Copilot', 'ask Copilot what it can do', 'write in Copilot's chat'. "
         "Put the question itself in 'text'. "
@@ -112,11 +113,22 @@ _APP_IDS = (
 _SAID = "Copilot said:"
 _OBJID_CLIENT = 0xFFFFFFFC
 
-# A reply is finished once it has stopped growing for this long. Copilot streams
-# token by token with no completion signal, so silence is the only signal there.
+# Copilot adds a reply's toolbar (Copy Response, the feedback buttons) when the
+# reply is finished, so a reply with its toolbar whose text has held still this
+# long is done. The toolbar is found by control type, not by button names, so it
+# holds in any interface language.
+_FINISHED_STEADY_SECONDS = 0.25
+# Without a toolbar (a different Copilot build), a reply that has stopped growing
+# for this long is taken as finished, as it always was.
 _SETTLE_SECONDS = 2.5
-_POLL_SECONDS = 1.2
+# A poll reads only the conversation, about 20 ms, so it can run this often.
+# Walking the whole window takes half a second (measured 2026-09-15); with the
+# old 1.2 s pause and 2.5 s settle, an answer reached Lumina 3.5-5 s after
+# Copilot had finished writing it.
+_POLL_SECONDS = 0.3
 _DEFAULT_TIMEOUT = 90
+# Nobody waits on the tool call any more, so this only bounds a stuck Copilot.
+_BACKGROUND_TIMEOUT = 300
 
 class _Detailed(str):
     """A Copilot answer, as opposed to one of the plugin's own status lines.
@@ -313,30 +325,75 @@ def _is_placeholder(text: str) -> bool:
     return len(text) < 40 and text.rstrip().endswith(("…", "..."))
 
 
+def _conversation(turn):
+    """The element that holds every turn of the chat, found from one reply.
+
+    Each reply sits in a wrapper of its own, so the conversation is the first
+    ancestor with more than one child. Reading its children takes about 20 ms;
+    walking the whole window takes half a second (measured 2026-09-15)."""
+    node = turn
+    for _ in range(6):
+        node = node.parent()
+        if node is None:
+            return None
+        if len(node.children()) > 1:
+            return node
+    return None
+
+
+def _latest_reply(conversation):
+    """The newest 'Copilot said' group in the conversation, or None."""
+    for wrapper in reversed(conversation.children()):
+        for element in (wrapper, *wrapper.children()):
+            info = element.element_info
+            if info.control_type == "Group" and (info.name or "").startswith(_SAID):
+                return element
+    return None
+
+
+def _is_finished(turn) -> bool:
+    """Whether Copilot has added the reply's toolbar, which it does once it is done."""
+    return any(child.element_info.control_type == "ToolBar" for child in turn.children())
+
+
 def _await_reply(window, baseline: str, timeout: int) -> str:
-    """Block until the newest reply differs from `baseline` and stops growing.
+    """Block until the newest reply differs from `baseline` and is finished.
 
     Counting turns does not work: Copilot virtualises the transcript, exposing
     only the turns near the viewport, so the number of 'Copilot said:' groups
     stays flat while older ones fall out of the tree. Watching the text of the
-    last turn change is the signal that survives that."""
+    last turn change is the signal that survives that.
+
+    After the first full walk only the conversation is read; every tenth poll
+    walks the whole window again, in case Copilot has rebuilt it."""
     deadline = time.time() + timeout
-    last, settled_at = "", None
+    conversation, polls = None, 0
+    last, changed_at = "", time.time()
     while time.time() < deadline:
         time.sleep(_POLL_SECONDS)
-        turns = _reply_turns(window)
-        if not turns:
-            continue
-        text = _turn_text(turns[-1])
+        polls += 1
+        turn = None
+        if conversation is not None and polls % 10:
+            try:
+                turn = _latest_reply(conversation)
+            except Exception:
+                conversation = None
+        if turn is None:
+            turns = _reply_turns(window)
+            if not turns:
+                continue
+            turn = turns[-1]
+            conversation = _conversation(turn)
+        text = _turn_text(turn)
         if not text or text == baseline or _is_placeholder(text):
             continue
-        if text == last:
-            if settled_at is None:
-                settled_at = time.time()
-            elif time.time() - settled_at >= _SETTLE_SECONDS:
-                return text
-        else:
-            last, settled_at = text, None
+        now = time.time()
+        if text != last:
+            last, changed_at = text, now
+            continue
+        steady = now - changed_at
+        if steady >= _SETTLE_SECONDS or (steady >= _FINISHED_STEADY_SECONDS and _is_finished(turn)):
+            return text
     return last
 
 
@@ -383,7 +440,7 @@ def _act_connect() -> str:
 
 
 def _say(player, instruction: str) -> None:
-    """Speak while run() is still blocked, the way phone_notifications does."""
+    """Ask Lumina to speak. Called from the background job, after run() has returned."""
     try:
         say = getattr(player, "request_say", None)
         if callable(say):
@@ -392,21 +449,76 @@ def _say(player, instruction: str) -> None:
         pass
 
 
-# One question at a time. _ask_copilot blocks for up to ninety seconds while
-# Copilot streams its answer, and the user keeps talking the whole time — a
-# stray remark, a cough the transcriber turns into words, the assistant's own
-# voice returning through the speakers. Every one of those reaches the model as
-# a fresh turn, and this plugin's description is emphatic enough that the model
-# routes them straight back here. Measured in a real session: one question sent
-# to Copilot three times and three answers spoken over each other, which is
-# also what "I cannot hear you properly" sounds like from the other side.
+# One question at a time. While Copilot answers, the user keeps talking — a stray
+# remark, a cough the transcriber turns into words, the assistant's own voice
+# returning through the speakers — and this plugin's description is emphatic
+# enough that the model routes those straight back here. Measured in a real
+# session: one question sent to Copilot three times and three answers spoken
+# over each other, which is also what "I cannot hear you properly" sounds like
+# from the other side.
 #
 # The model cannot know the bridge is busy. The bridge can.
 _ask_lock = threading.Lock()
 _asking = ""
 
 
+def _deliver(question: str, answer: str, player=None) -> None:
+    """Speak an answer that arrived after its tool call had returned."""
+    print(f"[Copilot] answered after the fact: {len(answer)} chars")
+    if player:
+        try:
+            player.write_log(f"[Copilot] answer received ({len(answer)} chars)")
+        except Exception:
+            pass
+    _say(
+        player,
+        "[DELAYED_ANSWER] Copilot has answered the question you put to it "
+        f"('{question[:120]}'). Its answer follows.\n\n" + spoken_answer(answer),
+    )
+
+
+def _run_job(question: str, timeout: int, player=None) -> None:
+    """Background worker: put the question to Copilot, wait, speak the answer."""
+    global _asking
+    answer, error = "", ""
+    try:
+        window = _window()
+        if window is None:
+            error = "Copilot would not open; it may not be installed on this machine"
+        else:
+            box = _composer(window)
+            if box is None:
+                error = "Copilot's chat box was not there; it may still have been loading"
+            else:
+                turns = _reply_turns(window)
+                baseline = _turn_text(turns[-1]) if turns else ""
+                _send(window, box, question)
+                answer = _await_reply(window, baseline, timeout)
+                if not answer:
+                    error = "Copilot did not answer in time; the question is in its chat"
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
+    finally:
+        with _ask_lock:
+            _asking = ""
+
+    if answer:
+        _deliver(question, answer, player)
+        return
+    print(f"[Copilot] ask failed: {error}")
+    _say(player, "The question you put to Copilot earlier did not get an answer. "
+                 f"Tell the user so in one sentence, and say why: {error}")
+
+
 def _act_ask(question: str, timeout: int, player=None) -> str:
+    """Hand the question over and return at once.
+
+    Gemini 3.1 Flash Live cancels an open tool call the moment any text reaches
+    it. This call used to stay open while Copilot answered and say "I have asked
+    Copilot" in the middle of it: the call was cancelled, the model called tools
+    again, and the answer returned later was never read (measured against the
+    API on 2026-09-15). Returning now and delivering the answer as a
+    [DELAYED_ANSWER] is what ChatGPT's and OpenClaw's bridges already do."""
     global _asking
     if not question:
         return "What would you like me to ask Copilot, sir?"
@@ -419,37 +531,14 @@ def _act_ask(question: str, timeout: int, player=None) -> str:
             )
         _asking = question
 
-    try:
-        return _ask_copilot(question, timeout, player)
-    finally:
-        with _ask_lock:
-            _asking = ""
-
-
-def _ask_copilot(question: str, timeout: int, player=None) -> str:
-    window = _window()
-    if window is None:
-        return "I could not open Copilot, sir. It may not be installed on this machine."
-
-    box = _composer(window)
-    if box is None:
-        return "I found Copilot, sir, but not its chat box — it may still be loading."
-
-    turns = _reply_turns(window)
-    baseline = _turn_text(turns[-1]) if turns else ""
-    _send(window, box, question)
-    # Copilot can take half a minute to answer. Say so now rather than leaving
-    # the user with silence until the tool response finally lands.
-    _say(player, "Tell the user briefly that you have put the question to Copilot "
-                 "and are waiting for its answer.")
-    answer = _await_reply(window, baseline, timeout)
-
-    if not answer:
-        return (
-            "I put the question to Copilot, sir, but it had not answered before I "
-            "stopped waiting. The question is in its chat if you want to look."
-        )
-    return _Detailed(answer)
+    threading.Thread(
+        target=_run_job,
+        args=(question, max(timeout, _BACKGROUND_TIMEOUT), player),
+        name="lumina-copilot-ask",
+        daemon=True,
+    ).start()
+    return ("I have put that question to Copilot, sir. I will read its answer out loud "
+            "the moment it arrives.")
 
 
 def _act_read() -> str:

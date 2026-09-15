@@ -88,6 +88,50 @@ class GeminiLiveTests(unittest.IsolatedAsyncioTestCase):
         )
         session.send_realtime_input.assert_not_called()
 
+    async def test_a_plugin_waits_for_an_open_tool_call_before_speaking_on_gemini(self):
+        session = _GeminiSession()
+        controller = _controller(session)
+        controller._loop = asyncio.get_running_loop()
+        controller._tool_calls_open = 1
+        controller.plugin_say("[DELAYED_ANSWER] Copilot answered.")
+        await asyncio.sleep(0.3)
+        self.assertEqual(session.calls, [])
+        controller._tool_calls_open = 0
+        deadline = time.monotonic() + 2.0
+        while not session.calls and time.monotonic() < deadline:
+            await asyncio.sleep(0.02)
+        self.assertEqual(session.calls, [("realtime", {"text": "[DELAYED_ANSWER] Copilot answered."})])
+
+    async def test_openai_speaks_a_plugin_line_without_waiting(self):
+        session = _openai_session()
+        controller = _controller(session)
+        controller._loop = asyncio.get_running_loop()
+        controller._tool_calls_open = 1
+        controller.plugin_say("Hola")
+        deadline = time.monotonic() + 2.0
+        while not session.send_client_content.await_count and time.monotonic() < deadline:
+            await asyncio.sleep(0.02)
+        session.send_client_content.assert_awaited_once_with(
+            turns={"parts": [{"text": "Hola"}]}, turn_complete=True,
+        )
+
+    async def test_a_tool_call_stays_open_until_its_result_is_sent(self):
+        session = _GeminiSession()
+        session.send_tool_response = mock.AsyncMock()
+        controller = _controller(session)
+        controller._tool_calls_open = 0
+        seen = []
+
+        async def execute(fc):
+            seen.append(controller._tool_calls_open)
+            return "result"
+
+        controller._execute_tool = execute
+        await controller._answer_tool_calls(session, ["call"])
+        self.assertEqual(seen, [1])
+        self.assertEqual(controller._tool_calls_open, 0)
+        session.send_tool_response.assert_awaited_once_with(function_responses=["result"])
+
 
 if __name__ == "__main__":
     unittest.main()
