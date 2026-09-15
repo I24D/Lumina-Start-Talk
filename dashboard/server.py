@@ -479,6 +479,7 @@ class DashboardServer:
         self._learning_state_callback     = None
         self._learning_action_callback    = None
         self._learning_session_callback   = None
+        self._learning_openai_call_callback = None
         self._learning_turn_callback      = None
         self._learning_voice_callback       = None
         self._learning_placement_callback = None
@@ -579,11 +580,12 @@ class DashboardServer:
 
     def set_learning_callbacks(
         self, *, state=None, action=None, session=None, turn=None, voice=None,
-        placement=None, activity=None,
+        placement=None, activity=None, openai_call=None,
     ) -> None:
         self._learning_state_callback = state
         self._learning_action_callback = action
         self._learning_session_callback = session
+        self._learning_openai_call_callback = openai_call
         self._learning_turn_callback = turn
         self._learning_voice_callback = voice
         self._learning_placement_callback = placement
@@ -826,6 +828,31 @@ class DashboardServer:
             except Exception as exc:
                 return JSONResponse(
                     {"error": f"Tutor session unavailable ({type(exc).__name__})"}, status_code=503
+                )
+
+        @app.post("/api/learning/openai-call")
+        async def learning_openai_call(req: Request):
+            """Proxy the WebRTC offer; the OpenAI key remains in this process."""
+            if not _auth(req):
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
+            try:
+                body = await req.json()
+            except Exception:
+                return JSONResponse({"error": "Invalid request"}, status_code=400)
+            sdp = str(body.get("sdp") or "")
+            if not sdp or len(sdp) > 100_000:
+                return JSONResponse({"error": "Invalid WebRTC offer"}, status_code=400)
+            if not self._learning_openai_call_callback:
+                return JSONResponse({"error": "OpenAI tutor is unavailable"}, status_code=503)
+            try:
+                answer = await _invoke(self._learning_openai_call_callback, sdp)
+                return JSONResponse(answer or {})
+            except (RuntimeError, ValueError) as exc:
+                return JSONResponse({"error": str(exc)[:200]}, status_code=409)
+            except Exception as exc:
+                return JSONResponse(
+                    {"error": f"OpenAI tutor unavailable ({type(exc).__name__})"},
+                    status_code=503,
                 )
 
         @app.post("/api/learning/turn")

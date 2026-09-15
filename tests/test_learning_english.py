@@ -432,6 +432,7 @@ class LearningWebApiTests(unittest.TestCase):
         self.sessions = []
         self.turns = []
         self.voices = []
+        self.openai_calls = []
         self.actions = []
         self.server.set_learning_callbacks(
             state=lambda: self.state,
@@ -441,6 +442,7 @@ class LearningWebApiTests(unittest.TestCase):
             voice=lambda pcm, rate, details: self.voices.append(
                 (pcm, rate, details)
             ) or {"pronunciation": {"score": 92}, "saved": True},
+            openai_call=lambda sdp: self.openai_calls.append(sdp) or {"sdp": "answer"},
         )
         self.client = TestClient(self.server.app)
 
@@ -474,6 +476,12 @@ class LearningWebApiTests(unittest.TestCase):
         self.assertEqual(session.status_code, 200)
         self.assertEqual(session.json()["token"], "t")
         self.assertEqual(self.sessions, ["h1"])
+        openai = self.client.post(
+            "/api/learning/openai-call", headers=self.headers, json={"sdp": "offer"}
+        )
+        self.assertEqual(openai.status_code, 200)
+        self.assertEqual(openai.json()["sdp"], "answer")
+        self.assertEqual(self.openai_calls, ["offer"])
         turn = self.client.post(
             "/api/learning/turn", headers=self.headers,
             json={"user": "I study English", "assistant": "Great!"},

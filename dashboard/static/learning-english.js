@@ -35,6 +35,8 @@
   const MAX_TURN_BLOCKS = 600;  // 30 s of 50 ms microphone blocks
   const live = {
     ws: null, ready: false, closing: false, handle: "", retries: 0, retryTimer: null,
+    provider: "gemini", pc: null, dc: null, remoteAudio: null,
+    heardParts: {}, untranscribed: new Set(), turnTimer: null,
     micStream: null, micContext: null, micNode: null,
     voiceContext: null, voiceSources: new Set(), voiceClock: 0,
     heard: "", said: "", typed: "", pendingControls: [],
@@ -133,8 +135,13 @@
     $("#onboarding-card").classList.toggle("hidden", snapshot.state !== "onboarding");
     $("#mic-chip").classList.toggle("online", !!live.micStream && snapshot.active && !snapshot.inputMuted && !snapshot.paused);
     $("#mic-chip").classList.toggle("warn", snapshot.inputMuted || snapshot.paused);
+    for (const track of live.micStream?.getAudioTracks() || []) {
+      track.enabled = !!snapshot.active && !snapshot.inputMuted && !snapshot.paused;
+    }
     $("#rec-chip").classList.toggle("hidden", !(snapshot.recordings?.available && snapshot.privacy?.save_recordings !== false));
     $("#mic-chip").childNodes[$("#mic-chip").childNodes.length - 1].textContent = snapshot.inputMuted ? " Micrófono silenciado" : " Micrófono";
+    const provider = snapshot.voiceProvider === "openai" ? "openai" : "gemini";
+    $("#gemini-chip").childNodes[$("#gemini-chip").childNodes.length - 1].textContent = provider === "openai" ? " OpenAI · Sol" : " Gemini";
     $$("#mode-list button").forEach(button => button.classList.toggle("active", button.dataset.mode === snapshot.currentMode));
     $("#mute-button").classList.toggle("active", !snapshot.inputMuted);
     $("#mute-button").setAttribute("aria-pressed", String(!snapshot.inputMuted));
@@ -341,7 +348,25 @@
   }
 
   function liveSend(message) {
-    if (live.ws && live.ws.readyState === WebSocket.OPEN && live.ready) live.ws.send(JSON.stringify(message));
+    if (!live.ready) return;
+    if (live.provider === "openai") {
+      if (live.dc?.readyState === "open") live.dc.send(JSON.stringify(message));
+    } else if (live.ws && live.ws.readyState === WebSocket.OPEN) {
+      live.ws.send(JSON.stringify(message));
+    }
+  }
+
+  function sendLiveText(text) {
+    if (live.provider === "openai") {
+      liveSend({type:"conversation.item.create", item:{
+        type:"message", role:"user", content:[{type:"input_text", text}],
+      }});
+      liveSend({type:"response.create"});
+    } else {
+      liveSend({clientContent:{
+        turns:[{role:"user", parts:[{text}]}], turnComplete:true,
+      }});
+    }
   }
 
   function sendTeacherControl(instruction) {
@@ -350,7 +375,7 @@
       toast("Instrucción preparada; se aplicará al conectar");
       return;
     }
-    liveSend({clientContent: {turns: [{role: "user", parts: [{text: `[TEACHER_CONTROL]\n${instruction}`}]}], turnComplete: true}});
+    sendLiveText(`[TEACHER_CONTROL]\n${instruction}`);
   }
 
   async function ensureVoice() {
@@ -378,7 +403,9 @@
         live.turnPcm.push(event.data.slice(0));
         if (live.turnPcm.length > MAX_TURN_BLOCKS) live.turnPcm.shift();
       }
-      liveSend({realtimeInput: {audio: {mimeType: `audio/pcm;rate=${MIC_RATE}`, data: toBase64(event.data)}}});
+      if (live.provider === "gemini") {
+        liveSend({realtimeInput: {audio: {mimeType: `audio/pcm;rate=${MIC_RATE}`, data: toBase64(event.data)}}});
+      }
     };
     // Pulled through a silent output so the worklet keeps running; nothing is heard.
     const silent = live.micContext.createGain(); silent.gain.value = 0;
@@ -413,6 +440,11 @@
   }
 
   function stopVoice() {
+    if (live.provider === "openai" && live.tutorAnswering && live.ready) {
+      liveSend({type:"response.cancel"});
+      liveSend({type:"output_audio_buffer.clear"});
+      live.tutorAnswering = false;
+    }
     live.voiceSources.forEach(source => { try { source.stop(); } catch (_) {} });
     live.voiceSources.clear();
     live.voiceClock = 0;
@@ -420,13 +452,18 @@
 
   async function connectLive() {
     clearTimeout(live.retryTimer);
-    if (live.closing || (live.ws && live.ws.readyState <= WebSocket.OPEN)) return;
+    if (live.closing || live.pc || (live.ws && live.ws.readyState <= WebSocket.OPEN)) return;
     setTutorStatus("connecting", "Conectando con la maestra");
     let session;
     try {
       session = await postJson("/api/learning/live-session", {handle: live.handle});
     } catch (error) { toast(error.message, true); scheduleLiveRetry(); return; }
     if (live.closing) return;
+    live.provider = session.provider === "openai" ? "openai" : "gemini";
+    if (live.provider === "openai") {
+      await connectOpenAI(session);
+      return;
+    }
     const ws = new WebSocket(`${LIVE_URL}?access_token=${encodeURIComponent(session.token)}`);
     live.ws = ws; live.ready = false;
     ws.onopen = () => ws.send(JSON.stringify({setup: {model: session.model}}));
@@ -441,6 +478,137 @@
       $("#gemini-chip").classList.remove("online");
       if (!live.closing) { setTutorStatus("reconnecting", "Reconectando con la maestra"); scheduleLiveRetry(event.reason); }
     };
+  }
+
+  async function waitForIce(pc) {
+    if (pc.iceGatheringState === "complete") return;
+    await new Promise(resolve => {
+      const timeout = setTimeout(done, 3000);
+      function done() {
+        clearTimeout(timeout);
+        pc.removeEventListener("icegatheringstatechange", changed);
+        resolve();
+      }
+      function changed() { if (pc.iceGatheringState === "complete") done(); }
+      pc.addEventListener("icegatheringstatechange", changed);
+    });
+  }
+
+  async function connectOpenAI(session) {
+    const pc = new RTCPeerConnection();
+    const dc = pc.createDataChannel("oai-events");
+    const audio = new Audio();
+    audio.autoplay = true;
+    live.pc = pc; live.dc = dc; live.remoteAudio = audio; live.ready = false;
+    for (const track of live.micStream?.getAudioTracks() || []) {
+      pc.addTrack(track, live.micStream);
+    }
+    pc.ontrack = event => {
+      audio.srcObject = event.streams[0];
+      audio.play().catch(() => {
+        $("#start-button").classList.remove("hidden");
+        setTutorStatus("waiting", "Pulsa Empezar clase para oír a Lumina");
+      });
+    };
+    dc.onopen = () => {
+      if (live.pc !== pc) return;
+      live.ready = true; live.retries = 0;
+      $("#gemini-chip").classList.add("online");
+      setTutorStatus("listening", "Escuchando · OpenAI Sol");
+      if (session.opening) sendTeacherControl(session.opening);
+      while (live.pendingControls.length) sendTeacherControl(live.pendingControls.shift());
+    };
+    dc.onmessage = event => {
+      let message; try { message = JSON.parse(event.data); } catch (_) { return; }
+      if (live.pc === pc) handleOpenAIMessage(message);
+    };
+    pc.onconnectionstatechange = () => {
+      if (live.pc !== pc || live.closing) return;
+      if (["failed", "disconnected", "closed"].includes(pc.connectionState)) {
+        live.pc = null; live.dc = null; live.ready = false;
+        $("#gemini-chip").classList.remove("online");
+        try { pc.close(); } catch (_) {}
+        setTutorStatus("reconnecting", "Reconectando con la maestra");
+        scheduleLiveRetry(pc.connectionState);
+      }
+    };
+    try {
+      await pc.setLocalDescription(await pc.createOffer());
+      await waitForIce(pc);
+      const answer = await postJson("/api/learning/openai-call", {
+        sdp: pc.localDescription.sdp,
+      });
+      await pc.setRemoteDescription({type:"answer", sdp:answer.sdp});
+    } catch (error) {
+      if (live.pc === pc) { live.pc = null; live.dc = null; }
+      try { pc.close(); } catch (_) {}
+      toast(error.message, true);
+      scheduleLiveRetry(error.message);
+    }
+  }
+
+  function handleOpenAIMessage(message) {
+    const kind = String(message.type || "");
+    if (kind === "error") {
+      toast(message.error?.message || "OpenAI no pudo continuar la clase", true);
+      return;
+    }
+    if (kind === "input_audio_buffer.speech_started") {
+      live.tutorAnswering = false;
+      setTutorStatus("listening", "Escuchando · OpenAI Sol");
+      return;
+    }
+    if (kind === "input_audio_buffer.committed") {
+      if (message.item_id) live.untranscribed.add(message.item_id);
+      return;
+    }
+    if (kind === "conversation.item.input_audio_transcription.delta") {
+      const item = message.item_id || "input";
+      live.heardParts[item] = (live.heardParts[item] || "") + (message.delta || "");
+      showHeard();
+      return;
+    }
+    if (["conversation.item.input_audio_transcription.completed", "conversation.item.input_audio_transcription.failed"].includes(kind)) {
+      const item = message.item_id || "input";
+      if (message.transcript) live.heardParts[item] = message.transcript;
+      live.untranscribed.delete(item);
+      showHeard();
+      if (live.turnTimer && !live.untranscribed.size) finishOpenAITurn();
+      return;
+    }
+    if (["response.output_audio_transcript.delta", "response.output_text.delta"].includes(kind)) {
+      live.tutorAnswering = true;
+      live.said += message.delta || "";
+      $("#assistant-text").textContent = live.said.trim();
+      setTutorStatus("speaking", "Hablando · OpenAI Sol");
+      return;
+    }
+    if (kind === "response.done") {
+      const response = message.response || {};
+      // A pause mid-sentence starts a response that is cancelled, empty, when
+      // the student carries on: the sentence is not over yet.
+      if (response.status === "cancelled" && !(response.output || []).length) return;
+      // The transcription can land after the answer, so the turn waits for it.
+      if (live.untranscribed.size) {
+        clearTimeout(live.turnTimer);
+        live.turnTimer = setTimeout(finishOpenAITurn, 2500);
+        return;
+      }
+      finishOpenAITurn();
+    }
+  }
+
+  function showHeard() {
+    live.heard = Object.values(live.heardParts).join(" ").replace(/\s+/g, " ").trim();
+    $("#student-text").textContent = live.heard;
+  }
+
+  function finishOpenAITurn() {
+    clearTimeout(live.turnTimer);
+    live.turnTimer = null;
+    finishTurn();
+    live.heardParts = {};
+    live.untranscribed.clear();
   }
 
   function scheduleLiveRetry(reason) {
@@ -496,6 +664,12 @@
       live.queuedPronunciationTarget = "";
     }
     if (!user && !assistant) return;
+    if (live.ready) {
+      setTutorStatus(
+        "listening",
+        live.provider === "openai" ? "Escuchando · OpenAI Sol" : "Escuchando",
+      );
+    }
     if (spoken) sendVoiceTurn(turnAudio, user, assistant, pronunciationTarget);
     postJson("/api/learning/turn", {user, assistant})
       .then(data => { if (data.state) render(data.state); })
@@ -519,7 +693,15 @@
     live.closing = true; clearTimeout(live.retryTimer);
     stopVoice(); stopMicrophone();
     const ws = live.ws; live.ws = null; live.ready = false; live.handle = "";
+    const pc = live.pc; live.pc = null; live.dc = null;
+    clearTimeout(live.turnTimer); live.turnTimer = null;
+    live.heardParts = {}; live.untranscribed.clear();
+    if (live.remoteAudio) {
+      live.remoteAudio.pause(); live.remoteAudio.srcObject = null;
+    }
+    live.remoteAudio = null;
     try { ws?.close(); } catch (_) {}
+    try { pc?.close(); } catch (_) {}
     live.heard = ""; live.said = ""; live.typed = "";
     live.turnPcm = []; live.tutorAnswering = false; live.pronunciationTarget = "";
     live.queuedPronunciationTarget = "";
@@ -539,7 +721,7 @@
     stopVoice();
     live.typed = text; live.heard = "";
     $("#student-text").textContent = text; setTutorStatus("thinking", "Lumina está pensando");
-    liveSend({clientContent: {turns: [{role: "user", parts: [{text}]}], turnComplete: true}});
+    sendLiveText(text);
     $("#message-input").value = "";
   }
 
@@ -925,18 +1107,31 @@
       $("#speed-select").value = state?.profile?.preferred_speed || "normal";
       $("#translation-select").value = String(state?.translationEnabled !== false);
       $("#weekly-select").value = String(state?.curriculum?.weekly_target || 3);
+      $("#voice-provider-select").value = state?.voiceProvider || "gemini";
+      $("#voice-provider-select").querySelector('option[value="openai"]').disabled = !state?.voiceProviders?.openai;
       $("#recordings-select").value = String(state?.privacy?.save_recordings !== false);
       $("#settings-dialog").showModal();
     });
     $("#save-settings").addEventListener("click", event => {
       event.preventDefault();
+      const selectedProvider = $("#voice-provider-select").value;
+      const providerChanged = selectedProvider !== (state?.voiceProvider || "gemini");
       action("settings", {
         preferred_speed: $("#speed-select").value,
         translation_enabled: $("#translation-select").value === "true",
         audience: $("#audience-select").value,
         weekly_target: Number($("#weekly-select").value),
+        voice_provider: selectedProvider,
         save_recordings: $("#recordings-select").value === "true",
-      }).then(data => { if (data) toast("Preferencias guardadas"); });
+      }).then(data => {
+        if (!data) return;
+        toast("Preferencias guardadas");
+        if (providerChanged) {
+          shutdownLive();
+          live.closing = false;
+          startClass();
+        }
+      });
       $("#settings-dialog").close();
     });
     $("#delete-recordings").addEventListener("click", async () => {

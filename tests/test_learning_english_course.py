@@ -409,6 +409,8 @@ def _service_with(models):
     return LearningEnglishService(
         api_key_loader=lambda: "key", client_factory=lambda _key: client,
         ollama=OllamaCloud(), grammar_provider=_NoGrammar(),
+        # Never the user's real OpenAI key: selecting OpenAI would put it first.
+        openai_key_loader=lambda: None,
     )
 
 

@@ -4,6 +4,11 @@ google-genai>=2.8.0
 google-generativeai
 pillow
 requests
+httpx>=0.28.0
+websockets>=15.0
+# The echo canceller that keeps the microphone open on speakers while
+# OpenAI speaks: livekit's bundled native library, no server or account.
+livekit>=1.1
 beautifulsoup4
 ddgs>=9.0.0
 playwright

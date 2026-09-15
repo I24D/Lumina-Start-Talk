@@ -1,6 +1,4 @@
-"""Gemini services for the English tutor: the browser's live session token,
-the structured analysis of each finished turn, generated practice, and the
-local engines that back them."""
+"""Gemini and OpenAI services for the English tutor."""
 
 from __future__ import annotations
 
@@ -14,8 +12,16 @@ from typing import Any, Callable
 
 from google import genai
 from google.genai import types
+import httpx
 
-from memory.config_manager import get_gemini_key
+from memory.config_manager import (
+    get_gemini_key, get_openai_key, get_learning_voice_provider,
+)
+from core.openai_realtime import (
+    OPENAI_REALTIME_MODEL,
+    create_call as create_realtime_call,
+    session_config as realtime_session_config,
+)
 from .activities import build_request as build_activity_request
 from .activities import schema_for, validate as validate_activity
 from .ollama_cloud import OllamaCloud, OllamaCloudError
@@ -35,11 +41,18 @@ MODEL = "gemini-3.6-flash"
 # a day on 2026-09-14, and every analysed turn spends one. When a model's quota
 # is spent, the next lighter model takes over instead of the corrections stopping.
 GEMINI_TEXT_MODELS = (MODEL, "gemini-3.5-flash-lite", "gemini-2.5-flash-lite")
+OPENAI_TEXT_MODEL = "gpt-5.6-luna"
 # Gemma 4 on Ollama Cloud answered an analysis in 2-3 s with every key and
 # Gemini-grade corrections, so it leads the per-turn analysis and saves Gemini's
 # quota. Writing a whole activity stalled past 180 s, so there it comes last.
-ANALYSIS_CHAIN = (("ollama", ""), *(("gemini", model) for model in GEMINI_TEXT_MODELS))
-ACTIVITY_CHAIN = (*(("gemini", model) for model in GEMINI_TEXT_MODELS), ("ollama", ""))
+ANALYSIS_CHAIN = (
+    ("ollama", ""), *(("gemini", model) for model in GEMINI_TEXT_MODELS),
+    ("openai", OPENAI_TEXT_MODEL),
+)
+ACTIVITY_CHAIN = (
+    *(("gemini", model) for model in GEMINI_TEXT_MODELS),
+    ("openai", OPENAI_TEXT_MODEL), ("ollama", ""),
+)
 
 _RESPONSE_SCHEMA = {
     "type": "object",
@@ -107,11 +120,15 @@ _RESPONSE_SCHEMA = {
 
 
 def _quota_spent(exc: Exception) -> bool:
-    return getattr(exc, "code", None) == 429 or "RESOURCE_EXHAUSTED" in str(exc)
+    status = getattr(getattr(exc, "response", None), "status_code", None)
+    return (getattr(exc, "code", None) == 429 or status == 429
+            or "RESOURCE_EXHAUSTED" in str(exc))
 
 
 def _busy(exc: Exception) -> bool:
-    return getattr(exc, "code", None) in (500, 502, 503) or "UNAVAILABLE" in str(exc)
+    status = getattr(getattr(exc, "response", None), "status_code", None)
+    return (getattr(exc, "code", None) in (500, 502, 503)
+            or status in (500, 502, 503) or "UNAVAILABLE" in str(exc))
 
 
 def _complete_analysis(raw: Any) -> dict[str, Any]:
@@ -126,23 +143,33 @@ class LearningEnglishService:
         self,
         *,
         api_key_loader: Callable[[], str | None] = get_gemini_key,
+        openai_key_loader: Callable[[], str | None] = get_openai_key,
         generator: Callable[..., Any] | None = None,
         token_factory: Callable[[dict[str, Any]], str] | None = None,
         client_factory: Callable[[str], Any] | None = None,
         ollama: OllamaCloud | None = None,
         grammar_provider: LanguageToolProvider | None = None,
         pronunciation_provider: OpenPronounceProvider | None = None,
+        openai_call_factory: Callable[[dict[str, Any], str], str] | None = None,
+        openai_response_factory: Callable[[dict[str, Any], str], Any] | None = None,
     ):
         self._api_key_loader = api_key_loader
+        self._openai_key_loader = openai_key_loader
         self._generator = generator
         self._token_factory = token_factory
         self._client_factory = client_factory or (lambda key: genai.Client(api_key=key))
         self._ollama = ollama if ollama is not None else OllamaCloud.from_env()
         self._grammar = grammar_provider or LanguageToolProvider()
         self._pronunciation = pronunciation_provider or OpenPronounceProvider()
+        self._openai_call_factory = openai_call_factory
+        self._openai_response_factory = openai_response_factory
         self._system_prompt = PROMPT_PATH.read_text(encoding="utf-8")
         # Text models whose quota ran out, and until when they are skipped.
         self._spent_until: dict[str, float] = {}
+
+    @property
+    def openai_available(self) -> bool:
+        return bool((self._openai_key_loader() or "").strip())
 
     def provider_status(self) -> list[dict[str, Any]]:
         return [self._grammar.status(), self._pronunciation.status()]
@@ -259,10 +286,97 @@ class LearningEnglishService:
             client = genai.Client(api_key=key, http_options={"api_version": "v1alpha"})
             token = client.auth_tokens.create(config=token_config).name
         return {
+            "provider": "gemini",
             "token": token,
             "model": LIVE_MODEL,
             "opening": "" if resume_handle else self.opening_instruction(snapshot),
         }
+
+    def openai_session_description(
+        self,
+        snapshot: dict[str, Any],
+        *,
+        assistant_name: str,
+        user_name: str,
+        voice_name: str,
+    ) -> dict[str, Any]:
+        """Safe metadata the browser needs before it creates its WebRTC offer."""
+        if not self.openai_available:
+            raise RuntimeError(
+                "OpenAI API key is not configured. Add it in Lumina > API Keys."
+            )
+        return {
+            "provider": "openai",
+            "model": OPENAI_REALTIME_MODEL,
+            "voice": voice_name,
+            "opening": self.opening_instruction(snapshot),
+        }
+
+    def create_openai_call(
+        self,
+        snapshot: dict[str, Any],
+        *,
+        assistant_name: str,
+        user_name: str,
+        voice_name: str,
+        sdp: str,
+    ) -> str:
+        """Exchange the browser offer for an answer without exposing the key."""
+        key = (self._openai_key_loader() or "").strip()
+        if not key:
+            raise RuntimeError(
+                "OpenAI API key is not configured. Add it in Lumina > API Keys."
+            )
+        payload = {
+            "sdp": sdp,
+            "session": realtime_session_config(
+                instructions=self.build_live_system_prompt(
+                    snapshot, assistant_name=assistant_name, user_name=user_name
+                ),
+                voice=voice_name,
+            ),
+        }
+        if self._openai_call_factory:
+            return str(self._openai_call_factory(payload, key))
+        return create_realtime_call(key, payload["sdp"], payload["session"])
+
+    @staticmethod
+    def _openai_output_text(response: Any) -> str:
+        if isinstance(response, str):
+            return response
+        for item in (response or {}).get("output") or []:
+            for content in item.get("content") or []:
+                if content.get("type") == "output_text" and content.get("text"):
+                    return str(content["text"])
+        raise ValueError("OpenAI response contained no output text")
+
+    def _openai_json(
+        self, *, request: dict[str, Any], schema: dict[str, Any],
+        system_instruction: str, max_output_tokens: int, timeout: float,
+    ) -> str:
+        key = (self._openai_key_loader() or "").strip()
+        if not key:
+            raise RuntimeError("OpenAI API key is not configured")
+        payload = {
+            "model": OPENAI_TEXT_MODEL,
+            "instructions": system_instruction,
+            "input": json.dumps(request, ensure_ascii=False),
+            "reasoning": {"effort": "none"},
+            "max_output_tokens": max_output_tokens,
+            "text": {"format": {
+                "type": "json_schema", "name": "lumina_learning",
+                "strict": False, "schema": schema,
+            }},
+        }
+        if self._openai_response_factory:
+            return self._openai_output_text(self._openai_response_factory(payload, key))
+        with httpx.Client(timeout=timeout) as client:
+            response = client.post(
+                "https://api.openai.com/v1/responses",
+                headers={"Authorization": f"Bearer {key}"}, json=payload,
+            )
+            response.raise_for_status()
+            return self._openai_output_text(response.json())
 
     def _generate_json(
         self,
@@ -278,7 +392,13 @@ class LearningEnglishService:
     ) -> Any:
         """The first usable, validated JSON result along a chain of text models."""
         failure: Exception | None = None
-        for provider, model in chain:
+        ordered = list(chain)
+        # Selecting OpenAI for the class means OpenAI leads both conversation
+        # and the structured corrections/activities. Gemini remains available
+        # as a fallback; selecting Gemini preserves the measured old ordering.
+        if get_learning_voice_provider() == "openai":
+            ordered.sort(key=lambda item: 0 if item[0] == "openai" else 1)
+        for provider, model in ordered:
             name = f"{provider}:{model or self._ollama.model}"
             if self._spent_until.get(name, 0.0) > time.monotonic():
                 continue
@@ -290,7 +410,7 @@ class LearningEnglishService:
                         system=system_instruction, request=request, schema=schema,
                         temperature=temperature, timeout=timeout,
                     )
-                else:
+                elif provider == "gemini":
                     key = self._api_key_loader()
                     if not key:
                         continue
@@ -305,6 +425,16 @@ class LearningEnglishService:
                             max_output_tokens=max_output_tokens,
                         ),
                     ).text
+                else:
+                    if not self.openai_available:
+                        continue
+                    text = self._openai_json(
+                        request=request,
+                        schema=schema,
+                        system_instruction=system_instruction,
+                        max_output_tokens=max_output_tokens,
+                        timeout=timeout,
+                    )
                 return validate(json.loads(text) if isinstance(text, str) else text)
             except ValueError as exc:
                 # Unusable JSON or content: the next model may do better.

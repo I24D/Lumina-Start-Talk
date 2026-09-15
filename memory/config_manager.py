@@ -66,6 +66,16 @@ def is_configured() -> bool:
 
 OPTIONAL_KEYS: list[dict] = [
     {
+        "config_key": "openai_api_key",
+        "label":      "OPENAI",
+        "purpose":    (
+            "Realtime voice and vision for the general assistant and "
+            "Learning English. The key stays on this PC."
+        ),
+        "signup":     "https://platform.openai.com/api-keys",
+        "prefix":     "sk-",
+    },
+    {
         "config_key": "tavily_api_key",
         "label":      "TAVILY",
         "purpose":    "Web search that keeps working when Gemini's search quota runs out.",
@@ -88,6 +98,11 @@ def save_optional_key(config_key: str, value: str) -> None:
 
 def get_tavily_key() -> str:
     return get_optional_key("tavily_api_key")
+
+
+def get_openai_key() -> str:
+    """OpenAI project key, re-read on every use so UI changes are live."""
+    return get_optional_key("openai_api_key")
 
 
 def get_assistant_name() -> str:
@@ -119,6 +134,18 @@ def save_assistant_config(assistant_name: str, user_name: str) -> None:
 # language, so this list is safe to show verbatim in any locale.
 AVAILABLE_VOICES = ["Charon", "Puck", "Kore", "Fenrir", "Aoede"]
 DEFAULT_VOICE    = "Charon"
+
+# OpenAI does not expose a built-in API voice literally named ``Sol``. Shimmer
+# is the closest built-in profile to the soft, youthful voice requested for
+# Lumina, so the UI presents it honestly as "Sol · OpenAI (Shimmer)". Keeping
+# the real API identifier here avoids ever sending the display alias upstream.
+OPENAI_VOICES = [
+    "shimmer", "marin", "cedar", "coral", "ballad", "sage", "verse",
+    "alloy", "ash", "echo",
+]
+DEFAULT_OPENAI_VOICE = "shimmer"
+VOICE_PROVIDERS = ("gemini", "openai")
+DEFAULT_VOICE_PROVIDER = "gemini"
 
 
 def get_voice() -> str:
@@ -157,6 +184,52 @@ def save_brief_enabled(enabled: bool) -> None:
             data = {}
     data["morning_brief_enabled"] = enabled
     CONFIG_FILE.write_text(json.dumps(data, indent=4), encoding="utf-8")
+
+
+def get_voice_provider() -> str:
+    provider = str(load_api_keys().get("voice_provider", DEFAULT_VOICE_PROVIDER)).lower()
+    return provider if provider in VOICE_PROVIDERS else DEFAULT_VOICE_PROVIDER
+
+
+def get_learning_voice_provider() -> str:
+    """Tutor provider; follows the general assistant until explicitly changed."""
+    data = load_api_keys()
+    provider = str(data.get("learning_voice_provider") or get_voice_provider()).lower()
+    return provider if provider in VOICE_PROVIDERS else get_voice_provider()
+
+
+def get_openai_voice() -> str:
+    voice = str(load_api_keys().get("openai_voice", DEFAULT_OPENAI_VOICE)).lower()
+    return voice if voice in OPENAI_VOICES else DEFAULT_OPENAI_VOICE
+
+
+def save_voice_settings(
+    *,
+    provider: str | None = None,
+    gemini_voice: str | None = None,
+    openai_voice: str | None = None,
+    learning_provider: str | None = None,
+) -> None:
+    """Persist both providers atomically without erasing unrelated settings."""
+    fields: dict = {}
+    if provider is not None:
+        value = str(provider).strip().lower()
+        fields["voice_provider"] = value if value in VOICE_PROVIDERS else DEFAULT_VOICE_PROVIDER
+    if learning_provider is not None:
+        value = str(learning_provider).strip().lower()
+        fields["learning_voice_provider"] = (
+            value if value in VOICE_PROVIDERS else get_voice_provider()
+        )
+    if gemini_voice is not None:
+        value = str(gemini_voice).strip()
+        fields["voice_name"] = value if value in AVAILABLE_VOICES else DEFAULT_VOICE
+    if openai_voice is not None:
+        value = str(openai_voice).strip().lower()
+        fields["openai_voice"] = (
+            value if value in OPENAI_VOICES else DEFAULT_OPENAI_VOICE
+        )
+    if fields:
+        _patch_config(**fields)
 
 
 # ── Live Vision privacy acknowledgement ────────────────────────────────────

@@ -1520,11 +1520,12 @@ class HueWheel(QWidget):
 class CustomizeOverlay(QWidget):
     """Floating overlay — change assistant name, user name, UI colour and voice."""
 
-    saved = pyqtSignal(str, str, str, str)   # assistant_name, user_name, ui_color, voice
+    saved = pyqtSignal(str, str, str, str, str, str)
     _OW, _OH = 400, 588
 
     def __init__(self, assistant_name=APP_NAME, user_name="",
-                 ui_color=DEFAULT_UI_COLOR, voice="", parent=None):
+                 ui_color=DEFAULT_UI_COLOR, voice="", provider="gemini",
+                 openai_voice="shimmer", parent=None):
         super().__init__(parent)
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setStyleSheet(f"""
@@ -1575,26 +1576,41 @@ class CustomizeOverlay(QWidget):
         # ── Assistant voice — Gemini prebuilt voices ─────────────────────────
         # Names are language-neutral proper nouns, so the row reads the same in
         # every locale. Selecting one and applying rebuilds the Live session.
-        from memory.config_manager import AVAILABLE_VOICES, DEFAULT_VOICE
+        from memory.config_manager import (
+            AVAILABLE_VOICES, DEFAULT_VOICE, OPENAI_VOICES,
+            DEFAULT_OPENAI_VOICE, VOICE_PROVIDERS,
+        )
         lay.addSpacing(4)
-        lay.addWidget(_lbl("ASSISTANT VOICE", 8, color=C.TEXT_DIM,
+        lay.addWidget(_lbl("VOICE ENGINE  ·  VOICE", 8, color=C.TEXT_DIM,
                             align=Qt.AlignmentFlag.AlignLeft))
-        self._sel_voice   = (voice or DEFAULT_VOICE)
-        if self._sel_voice not in AVAILABLE_VOICES:
-            self._sel_voice = DEFAULT_VOICE
-        self._voice_btns: dict[str, QPushButton] = {}
-        voice_row = QHBoxLayout(); voice_row.setSpacing(4)
-        for _v in AVAILABLE_VOICES:
-            b = QPushButton(_v)
-            b.setCheckable(True)
-            b.setFixedHeight(28)
-            b.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
-            b.setCursor(Qt.CursorShape.PointingHandCursor)
-            b.clicked.connect(lambda _=False, name=_v: self._on_voice_pick(name))
-            self._voice_btns[_v] = b
-            voice_row.addWidget(b)
+        self._sel_provider = provider if provider in VOICE_PROVIDERS else "gemini"
+        self._gemini_voice = voice if voice in AVAILABLE_VOICES else DEFAULT_VOICE
+        self._openai_voice = (
+            openai_voice if openai_voice in OPENAI_VOICES else DEFAULT_OPENAI_VOICE
+        )
+        combo_css = f"""
+            QComboBox {{ background: {C.DARK}; color: {C.TEXT};
+                border: 1px solid {C.BORDER}; border-radius: 3px; padding: 4px 8px; }}
+            QComboBox:hover {{ border-color: {C.BORDER_B}; }}
+            QComboBox QAbstractItemView {{ background: {C.DARK}; color: {C.TEXT};
+                selection-background-color: {C.PRI_GHO}; }}
+        """
+        self._provider_box = QComboBox()
+        self._provider_box.addItem("Gemini Live", "gemini")
+        self._provider_box.addItem("OpenAI Realtime", "openai")
+        self._provider_box.setCurrentIndex(0 if self._sel_provider == "gemini" else 1)
+        self._provider_box.setFixedHeight(30)
+        self._provider_box.setStyleSheet(combo_css)
+        self._voice_box = QComboBox()
+        self._voice_box.setFixedHeight(30)
+        self._voice_box.setStyleSheet(combo_css)
+        voice_row = QHBoxLayout(); voice_row.setSpacing(6)
+        voice_row.addWidget(self._provider_box, 2)
+        voice_row.addWidget(self._voice_box, 3)
         lay.addLayout(voice_row)
-        self._refresh_voice_btns()
+        self._provider_box.currentIndexChanged.connect(self._on_provider_pick)
+        self._voice_box.currentIndexChanged.connect(self._remember_voice_pick)
+        self._refresh_voice_options()
 
         # ── UI colour — hue wheel ────────────────────────────────────────────
         lay.addSpacing(4)
@@ -1669,26 +1685,36 @@ class CustomizeOverlay(QWidget):
         lay.addLayout(btn_row)
 
     # ── Voice selection ──────────────────────────────────────────────────────
-    def _on_voice_pick(self, name: str):
-        self._sel_voice = name
-        self._refresh_voice_btns()
+    def _remember_voice_pick(self):
+        value = self._voice_box.currentData()
+        if not value:
+            return
+        if self._sel_provider == "openai":
+            self._openai_voice = value
+        else:
+            self._gemini_voice = value
 
-    def _refresh_voice_btns(self):
-        """Highlight the selected voice pill; dim the rest."""
-        for name, b in self._voice_btns.items():
-            on = (name == self._sel_voice)
-            b.setChecked(on)
-            if on:
-                b.setStyleSheet(f"""
-                    QPushButton {{ background: {C.PRI_GHO}; color: {C.PRI};
-                        border: 1px solid {C.PRI}; border-radius: 3px; }}
-                """)
-            else:
-                b.setStyleSheet(f"""
-                    QPushButton {{ background: transparent; color: {C.TEXT_MED};
-                        border: 1px solid {C.BORDER}; border-radius: 3px; }}
-                    QPushButton:hover {{ color: {C.TEXT}; border-color: {C.BORDER_B}; }}
-                """)
+    def _on_provider_pick(self):
+        self._remember_voice_pick()
+        self._sel_provider = self._provider_box.currentData() or "gemini"
+        self._refresh_voice_options()
+
+    def _refresh_voice_options(self):
+        from memory.config_manager import AVAILABLE_VOICES, OPENAI_VOICES
+        self._voice_box.blockSignals(True)
+        self._voice_box.clear()
+        if self._sel_provider == "openai":
+            labels = {"shimmer": "Sol · soft and youthful (Shimmer)"}
+            for voice in OPENAI_VOICES:
+                self._voice_box.addItem(labels.get(voice, voice.title()), voice)
+            selected = self._openai_voice
+        else:
+            for voice in AVAILABLE_VOICES:
+                self._voice_box.addItem(voice, voice)
+            selected = self._gemini_voice
+        index = self._voice_box.findData(selected)
+        self._voice_box.setCurrentIndex(max(0, index))
+        self._voice_box.blockSignals(False)
 
     # ── colour flow ──────────────────────────────────────────────────────────
     def _set_color(self, hx: str, update_wheel: bool = True, preview: bool = True):
@@ -1731,7 +1757,11 @@ class CustomizeOverlay(QWidget):
     def _save(self):
         name = self._name_input.text().strip() or APP_NAME
         user = self._user_input.text().strip()
-        self.saved.emit(name, user, self._sel_color or DEFAULT_UI_COLOR, self._sel_voice)
+        self._remember_voice_pick()
+        self.saved.emit(
+            name, user, self._sel_color or DEFAULT_UI_COLOR,
+            self._sel_provider, self._gemini_voice, self._openai_voice,
+        )
         self.hide()
 
 
@@ -2709,9 +2739,9 @@ class ApiKeysOverlay(_HudOverlay):
         lay.addWidget(hdr)
 
         intro = QLabel(
-            f"All optional — {APP_NAME} runs on the Gemini key alone. Each one "
-            "below switches on a feature; leaving it blank just leaves that "
-            "feature off. Changes apply immediately, no restart."
+            f"Add OpenAI here to enable its Realtime voice in {APP_NAME} and "
+            "Learning English. Gemini remains available. Other services are "
+            "optional. Keys stay in this PC; changes apply without an app restart."
         )
         intro.setWordWrap(True)
         intro.setFont(QFont("Courier New", 7))
@@ -5051,6 +5081,8 @@ class MainWindow(QMainWindow):
             cfg.get("user_name", ""),
             _effective_ui_color(cfg),
             cfg.get("voice_name", ""),
+            cfg.get("voice_provider", "gemini"),
+            cfg.get("openai_voice", "shimmer"),
             parent=cw,
         )
         ow, oh = CustomizeOverlay._OW, CustomizeOverlay._OH
@@ -5072,8 +5104,10 @@ class MainWindow(QMainWindow):
             apply_night_palette(self._night_mode)
             retheme_all_widgets(old, current_palette())
 
-    def _apply_name_update(self, name: str, user_name: str, ui_color: str = "",
-                           voice: str = ""):
+    def _apply_name_update(
+        self, name: str, user_name: str, ui_color: str = "",
+        provider: str = "gemini", gemini_voice: str = "", openai_voice: str = "",
+    ):
         """Update all name/theme-dependent UI elements and persist to config."""
         self._assistant_name = name.strip() or APP_NAME
         self._user_name = user_name.strip() or "You"
@@ -5096,12 +5130,21 @@ class MainWindow(QMainWindow):
 
         # Voice change → persist and, if it actually changed, rebuild the Live
         # session so the new voice takes effect (it's fixed at connect time).
-        voice_changed = False
-        if voice:
-            from memory.config_manager import get_voice, save_voice
-            if voice != get_voice():
-                save_voice(voice)
-                voice_changed = True
+        from memory.config_manager import (
+            get_voice, get_voice_provider, get_openai_voice, get_openai_key,
+            save_voice_settings,
+        )
+        voice_changed = (
+            provider != get_voice_provider()
+            or (gemini_voice and gemini_voice != get_voice())
+            or (openai_voice and openai_voice != get_openai_voice())
+        )
+        if voice_changed:
+            save_voice_settings(
+                provider=provider,
+                gemini_voice=gemini_voice,
+                openai_voice=openai_voice,
+            )
 
         try:
             data = _read_full_config()
@@ -5114,7 +5157,18 @@ class MainWindow(QMainWindow):
             if color_changed:
                 self._log.append_log(f"SYS: UI colour applied — {ui_color}")
             if voice_changed:
-                self._log.append_log(f"SYS: Voice set — {voice}")
+                shown = (
+                    "Sol · OpenAI (Shimmer)"
+                    if provider == "openai" and openai_voice == "shimmer"
+                    else (openai_voice.title() if provider == "openai" else gemini_voice)
+                )
+                self._log.append_log(
+                    f"SYS: Voice engine set — {provider.title()} · {shown}"
+                )
+                if provider == "openai" and not get_openai_key():
+                    self._log.append_log(
+                        "ERR: Add your OpenAI key in API Keys before using this voice."
+                    )
         except Exception as e:
             self._log.append_log(f"ERR: Config save failed — {e}")
 

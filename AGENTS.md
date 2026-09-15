@@ -155,6 +155,84 @@ Three consequences:
   tool returns. Do not collapse those two into one "busy" state — the user's
   whole complaint was never knowing whether talking was worth it.
 
+### 4b. Tool calls run beside the receive loop, for both providers
+
+`_receive_audio` hands each tool call to `_answer_tool_calls` as a task and
+keeps reading. It used to await the tool itself, so for as long as a search, a
+file or another assistant took, nothing from the model was read — no
+transcript and no voice. The result is dropped, not sent, if the session it
+belongs to has closed meanwhile.
+
+## The OpenAI voice path
+
+Selected in CUSTOMIZE as the voice engine, or `voice_provider: "openai"` in
+`config/api_keys.json`. Gemini stays available beside it and none of what
+follows touches its path.
+
+### 4c. The desktop talks to OpenAI over the WebSocket, not WebRTC
+
+aiortc runs RTP in Python and shares the interpreter lock with the HUD, which
+keeps about one core busy painting. Measured in the real app on 2026-09-14:
+her voice chopped 289 times in 20 s (274 with audio already queued), the
+user's words arrived as nonsense ("bilibili Eura esa ora" for "Hola Lumina,
+¿qué hora es?") and the call dropped. Beside a thread holding the lock the same
+way, WebRTC delivered no audio in 16 s; the WebSocket delivered 20 s and the
+player never ran dry, because the server sends audio ahead of real time.
+WebRTC stays in the Learning English tutor, where Chrome runs it natively; its
+offer goes to `/v1/realtime/calls` as multipart `sdp` and `session` fields.
+
+**Symptom when broken:** choppy speech, garbled transcripts and `OpenAI audio
+track ended` reconnects, with `lag` in the hundreds of milliseconds.
+
+### 4d. The echo canceller hears the speaker on the writer thread, and the speaker never runs empty
+
+`core/echo_canceller.py` wraps livekit's WebRTC audio processing, locally, no
+server. Two things decide whether it works on these speakers, both measured:
+
+- The reference is fed in `_play_audio`'s `_write`, on the writer thread,
+  immediately before `stream.write`. Fed from the event loop, sessions measured
+  -1 to -9 dB and interrupted themselves; fed there, -17.8 dB.
+- While she is silent the player writes 100 ms of silence and feeds it as the
+  reference. An emptied speaker buffer changes how late her voice is heard by
+  her next answer, which leaked at -3 to -5 dB and swallowed the user's words
+  in the pause; with silence written, -9 dB and the words came through.
+
+### 4e. The microphone opens during an answer only once the canceller proves itself in it
+
+Every answer starts with the microphone closed, exactly as on speakers before.
+It opens for the rest of that answer when the canceller has removed at least
+15 dB of her voice over at least 1 s of it (`OPEN_BELOW_DB`,
+`OPEN_AFTER_SECONDS`), and it does not close again until she stops: when the
+user talks over her the numbers look like a failing canceller, and closing then
+would shut out the interruption. `[VOICE REC]` prints `aec -NNdB open|gated`.
+
+On this laptop the canceller needs part of each answer to find her echo again,
+so there is no barge-in in an answer's first second or so. That is the price of
+never hearing herself; the INTERRUPT button still works throughout.
+
+**Symptom when broken:** she cuts herself off a second or two into an answer
+(`✋ You spoke over her` with nobody speaking) and the log shows her own words
+as the user's, in any language — "Nie.", "那是好事。", "Hello.".
+
+### 4f. A turn is what the user finished saying, not what the server cancelled
+
+- A pause mid-sentence commits the audio and starts a response that is
+  cancelled, with no output, when the user carries on. It is not a turn.
+- `turn_complete` waits up to 3 s for the user's transcription, which can land
+  after her answer has started.
+- `semantic_vad` runs with `eagerness: "low"`: on `auto` she began answering
+  "Hola Lumina." while the question after it was still being asked.
+- On a socket the server cannot know how much of her answer was played, so a
+  barge-in sends `conversation.item.truncate` with an estimate.
+
+### 4g. Synthetic speech through the same speakers does not test the user's voice
+
+Playing a recorded phrase through the speakers is a fair test of her echo and
+of the Gemini path. With the canceller on it is not a test of the user: the
+canceller is learning to remove exactly what comes out of those speakers, and
+such phrases arrived mangled ("不要!") or not at all. Only a person talking
+proves the user side.
+
 ## The ChatGPT desktop bridge
 
 ### 5. Copy is requested with `invoke()`, and a sentinel proves it happened

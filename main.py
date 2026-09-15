@@ -31,7 +31,7 @@ if _platform.system() == "Windows":
     _subprocess.Popen = _Popen
 
 # ── Single UI instance ───────────────────────────────────────────────────────
-# One HUD owns one microphone and one Gemini Live session. A Windows named
+# One HUD owns one microphone and one selected Live session. A Windows named
 # mutex makes that invariant independent of which launcher was clicked and is
 # released automatically even after a crash. A duplicate raises the existing
 # LUMINA window and exits before importing the heavy audio and model modules.
@@ -165,11 +165,17 @@ from actions.background_monitor import (
 from actions.web_search        import _news as _fetch_news_sync
 from memory.config_manager     import (
     get_brief_enabled, get_voice, get_input_device, get_output_device,
+    get_voice_provider, get_learning_voice_provider, get_openai_key,
+    get_openai_voice, save_voice_settings,
 )
 from core.plugin_loader        import discover_plugins
 from core                      import undo as undo_stack
 from core                      import confirm as confirm_gate
 from core                      import audio_devices
+from core.openai_realtime      import (
+    OpenAIRealtimeSession, OPENAI_REALTIME_MODEL, OPENAI_SAMPLE_RATE,
+)
+from core.echo_canceller       import EchoCanceller
 from learning_english import LearningEnglishController, LearningEnglishService
 from learning_english.recordings import VoiceRecordings
 from learning_english.intent import confirmation_answer, detect_learning_english_intent
@@ -333,6 +339,16 @@ def _pcm_level(samples) -> float:
     if rms <= _LEVEL_FLOOR:
         return 0.0
     return min(1.0, (rms - _LEVEL_FLOOR) / (_LEVEL_FULL - _LEVEL_FLOOR))
+
+
+def _resample_pcm16(data: bytes, from_rate: int, to_rate: int) -> bytes:
+    """Linear resampling of 16-bit mono PCM; plenty for speech."""
+    samples = np.frombuffer(data, dtype=np.int16)
+    if from_rate == to_rate or samples.size == 0:
+        return data
+    count = max(1, int(round(samples.size * to_rate / from_rate)))
+    positions = np.linspace(0, samples.size - 1, count)
+    return np.interp(positions, np.arange(samples.size), samples).astype(np.int16).tobytes()
 
 
 def _get_api_key() -> str:
@@ -1208,6 +1224,10 @@ class JarvisLive:
         self.session              = None
         self.audio_in_queue       = None
         self.out_queue            = None
+        # Gemini's measured path is 16 kHz. OpenAI Realtime takes 24 kHz PCM,
+        # the rate her voice plays at, so its session opens the same device at
+        # 24 kHz and the echo canceller compares like with like.
+        self._input_sample_rate   = SEND_SAMPLE_RATE
         self._loop                = None
         self._is_speaking         = False
         # When her own audio last stopped. Her voice keeps reaching the
@@ -1216,6 +1236,12 @@ class JarvisLive:
         self._last_spoke_at       = 0.0
         # Set once the speaker is open, from the name of the device it opened.
         self._full_duplex         = False
+        # The OpenAI call's echo canceller, or None. With it the microphone
+        # stays open while she speaks on speakers, as it does on headphones.
+        self._echo: EchoCanceller | None = None
+        self._echo_announced      = False
+        self._mic_latency         = 0.0
+        self._speaker_latency     = 0.0
         # Audio blocks that actually reached the model. Proof of the
         # one link that used to report nothing either way.
         self._sent_blocks         = 0
@@ -1282,7 +1308,7 @@ class JarvisLive:
         # conversation that never ends never produces a summary, and the
         # "yesterday we talked about…" line silently disappears.
         self._resume_handle: str | None = None
-        # Learning English runs its own Gemini Live session in the browser.
+        # Learning English runs its own selected Live session in the browser.
         # This session stays the general assistant throughout, tools included;
         # only its microphone and voice pause while a class is open.
         self._learning_confirmation_pending = False
@@ -1316,6 +1342,8 @@ class JarvisLive:
         # deafness watchdog for why.
         self._deaf_rebuilds = 0
         self._tool_running = 0
+        # Tool calls run beside the conversation, not inside the receive loop.
+        self._tool_tasks: set[asyncio.Task] = set()
         # Transcriptions this session has produced since it connected. The
         # failure the watchdog below exists for is a session born deaf: it
         # connects, answers typed text, and never transcribes one word of
@@ -1658,8 +1686,27 @@ class JarvisLive:
 
     def _learning_snapshot(self) -> dict:
         snapshot = self._learning.snapshot()
-        snapshot["providers"] = self._learning_service.provider_status()
+        selected_provider = get_learning_voice_provider()
+        snapshot["providers"] = [
+            {
+                "id": "gemini-live", "label": "Gemini Live",
+                "state": "ready" if bool(_get_api_key()) else "missing",
+                "detail": "Motor de voz disponible" if selected_provider == "gemini" else "Disponible como alternativa",
+            },
+            {
+                "id": "openai-realtime", "label": "OpenAI · Sol (Shimmer)",
+                "state": "ready" if bool(get_openai_key()) else "missing",
+                "detail": "Motor de voz disponible" if get_openai_key() else "Añade la API key en Lumina",
+            },
+            *self._learning_service.provider_status(),
+        ]
         snapshot["recordings"] = {"available": self._learning_recordings.available}
+        snapshot["voiceProvider"] = selected_provider
+        snapshot["voiceProviders"] = {
+            "gemini": bool(_get_api_key()),
+            "openai": bool(get_openai_key()),
+        }
+        snapshot["openaiVoice"] = get_openai_voice()
         return snapshot
 
     def _broadcast_learning(self, message: dict) -> None:
@@ -1785,10 +1832,17 @@ class JarvisLive:
         return self._learning_snapshot()
 
     async def _learning_live_session(self, handle: str = "") -> dict:
-        """The browser tutor's single-use Gemini Live token."""
+        """Describe/connect the browser tutor without exposing either API key."""
         if not self._learning.active:
             raise RuntimeError("Learning English is not active")
         snapshot = self._learning_snapshot()
+        if get_learning_voice_provider() == "openai":
+            return self._learning_service.openai_session_description(
+                snapshot,
+                assistant_name=self._asst_name,
+                user_name=self._user_name,
+                voice_name=get_openai_voice(),
+            )
         session = await asyncio.get_running_loop().run_in_executor(
             None,
             lambda: self._learning_service.create_live_session(
@@ -1805,6 +1859,31 @@ class JarvisLive:
                 "type": "learning.snapshot", "state": self._learning_snapshot()
             })
         return session
+
+    async def _learning_openai_call(self, sdp: str) -> dict:
+        """Server-side WebRTC handshake; the OpenAI key never reaches JavaScript."""
+        if not self._learning.active:
+            raise RuntimeError("Learning English is not active")
+        if get_learning_voice_provider() != "openai":
+            raise RuntimeError("Learning English is currently using Gemini")
+        if not sdp or len(sdp) > 100_000:
+            raise ValueError("Invalid WebRTC offer")
+        snapshot = self._learning_snapshot()
+        answer = await asyncio.get_running_loop().run_in_executor(
+            None,
+            lambda: self._learning_service.create_openai_call(
+                snapshot,
+                assistant_name=self._asst_name,
+                user_name=self._user_name,
+                voice_name=get_openai_voice(),
+                sdp=sdp,
+            ),
+        )
+        self._learning.session_ready()
+        self._broadcast_learning({
+            "type": "learning.snapshot", "state": self._learning_snapshot()
+        })
+        return {"sdp": answer}
 
     async def _learning_turn(self, user_text: str, assistant_text: str) -> dict:
         """A finished turn from the browser tutor, analysed for the studio."""
@@ -1938,6 +2017,15 @@ class JarvisLive:
                 self._learning.store.set_weekly_target(body.get("weekly_target"))
             if "save_recordings" in body:
                 self._learning.store.set_save_recordings(bool(body.get("save_recordings")))
+            if "voice_provider" in body:
+                provider = str(body.get("voice_provider") or "").lower()
+                if provider not in {"gemini", "openai"}:
+                    raise ValueError("Invalid voice provider")
+                if provider == "openai" and not get_openai_key():
+                    raise RuntimeError(
+                        "Añade primero tu OpenAI API key en Lumina > API Keys."
+                    )
+                save_voice_settings(learning_provider=provider)
             self._learning.translation_enabled = bool(body.get("translation_enabled", True))
             self._learning.store.update_profile({"preferred_speed": preferred})
         snapshot = self._learning_snapshot()
@@ -2040,12 +2128,39 @@ class JarvisLive:
             self._loop
         )
 
+    @property
+    def _mic_open_while_speaking(self) -> bool:
+        """Headphones, or speakers with an echo canceller that has proven it
+        removes her voice in this answer: the microphone need not close."""
+        return self._full_duplex or (self._echo is not None and self._echo.open)
+
+    def _echo_opened(self, echo: EchoCanceller) -> None:
+        """The canceller has proven itself on this answer, so the microphone
+        stays open for the rest of it. Called from the microphone thread."""
+        if not self._echo_announced:
+            self._echo_announced = True
+            print(f"[JARVIS] 🔊 Echo cancellation measured at {echo.reduction_db():.0f} dB — "
+                  "the microphone opens while she speaks; you can interrupt her",
+                  flush=True)
+            self.ui.write_log("SYS: Echo cancellation ready — you can interrupt me by speaking.")
+        self._refresh_mic_state()
+
+    def _note_audio_latency(self, *, mic=None, speaker=None) -> None:
+        """Tell the echo canceller how late her voice comes back: the
+        speaker's latency plus the microphone's."""
+        if mic is not None:
+            self._mic_latency = float(getattr(mic, "latency", 0.0) or 0.0)
+        if speaker is not None:
+            self._speaker_latency = float(getattr(speaker, "latency", 0.0) or 0.0)
+        if self._echo is not None:
+            self._echo.set_delay(self._mic_latency + self._speaker_latency)
+
     def _refresh_mic_state(self) -> None:
         """Tell the HUD what she is doing and whether the microphone is live.
 
         Two different questions, and conflating them is what made every
-        silence ambiguous. She is deaf while speaking through speakers, but
-        not while speaking on headphones, and not while waiting on another
+        silence ambiguous. She is deaf while speaking through speakers without
+        echo cancellation, but not on headphones, and not while waiting on another
         assistant — that audio still reaches the model, it simply cannot be
         answered until the tool returns. The button says which, so the user
         never has to wonder whether talking is worth it.
@@ -2057,7 +2172,7 @@ class JarvisLive:
         else:
             reason = ""
         try:
-            self.ui.set_busy(reason, self._full_duplex or not self._is_speaking)
+            self.ui.set_busy(reason, self._mic_open_while_speaking or not self._is_speaking)
         except Exception:
             pass
 
@@ -2072,20 +2187,32 @@ class JarvisLive:
             self.ui.set_state("LISTENING")
         self._refresh_mic_state()
 
+    def _drain_playback(self) -> int:
+        """Discard her queued audio; returns how many chunks were dropped."""
+        q = self.audio_in_queue
+        drained = 0
+        while q is not None:
+            try:
+                q.get_nowait()
+            except Exception:
+                break
+            drained += 1
+        return drained
+
     def interrupt(self) -> None:
         """Stop JARVIS mid-speech: drain queued audio and open mic immediately."""
         self._interrupted = True
-        q = self.audio_in_queue
-        if q:
-            drained = 0
-            while True:
-                try:
-                    q.get_nowait()
-                    drained += 1
-                except Exception:
-                    break
-            if drained:
-                print(f"[JARVIS] ✋ Interrupted — {drained} audio chunks discarded")
+        with self._speaking_lock:
+            was_speaking = self._is_speaking
+        cancel = getattr(self.session, "cancel_response", None)
+        if was_speaking and cancel and self._loop:
+            try:
+                asyncio.run_coroutine_threadsafe(cancel(), self._loop)
+            except Exception:
+                pass
+        drained = self._drain_playback()
+        if drained:
+            print(f"[JARVIS] ✋ Interrupted — {drained} audio chunks discarded")
         self.set_speaking(False)
         if self._turn_done_event:
             self._turn_done_event.clear()
@@ -2107,7 +2234,8 @@ class JarvisLive:
         self.ui.write_log(f"ERR: {tool_name} — {short}")
         self.speak(f"Sir, {tool_name} encountered an error. {short}")
 
-    def _build_config(self) -> types.LiveConnectConfig:
+    def _build_system_instruction(self) -> str:
+        """Shared identity, time, memory and operating rules for either provider."""
         from datetime import datetime
 
         # Load customization from config
@@ -2153,6 +2281,13 @@ class JarvisLive:
             parts.append(mem_str)
         parts.append(sys_prompt)
 
+        return "\n".join(parts)
+
+    def _all_tool_declarations(self) -> list[dict]:
+        return TOOL_DECLARATIONS + self._plugin_registry.get_tool_declarations()
+
+    def _build_config(self) -> types.LiveConnectConfig:
+        """Gemini's proven Live configuration. Keep this path provider-local."""
         cfg = dict(
             response_modalities=["AUDIO"],
             output_audio_transcription={},
@@ -2166,7 +2301,7 @@ class JarvisLive:
             # life of the session. Measured on one such session: thirty-one
             # utterances captured and sent, zero transcriptions returned.
             # The service's defaults handle turn-taking perfectly well.
-            system_instruction="\n".join(parts),
+            system_instruction=self._build_system_instruction(),
             # Hand back the handle captured from the last session_resumption
             # update. `handle=None` is exactly the old behaviour (ask for
             # handles, start fresh), so the first connect of a run is unchanged.
@@ -2182,11 +2317,7 @@ class JarvisLive:
             ),
         )
 
-        cfg["tools"] = [{
-            "function_declarations": (
-                TOOL_DECLARATIONS + self._plugin_registry.get_tool_declarations()
-            )
-        }]
+        cfg["tools"] = [{"function_declarations": self._all_tool_declarations()}]
 
         # Sliding-window compression: the session never dies of a full context
         # window, so one conversation can run for hours. Added here rather than
@@ -2214,6 +2345,24 @@ class JarvisLive:
             self._voice_blocks_unheard = 0
             self._last_user_speech = time.monotonic()
             self._refresh_mic_state()
+
+    async def _answer_tool_calls(self, session, calls) -> None:
+        """Run one batch of tool calls beside the conversation and answer it.
+
+        The receive loop used to await each tool itself, so for as long as a
+        search, a file or another assistant took, nothing from the model was
+        read: no transcript and no voice. It now keeps reading while this runs.
+        """
+        responses = [await self._execute_tool(fc) for fc in calls]
+        if self.session is not session:
+            print(f"[JARVIS] 📤 {len(responses)} tool result(s) dropped — "
+                  "their session has closed", flush=True)
+            return
+        try:
+            await session.send_tool_response(function_responses=responses)
+        except Exception as exc:
+            print(f"[JARVIS] ⛔ tool result not sent: {type(exc).__name__}: {exc}",
+                  flush=True)
 
     async def _dispatch_tool(self, fc) -> types.FunctionResponse:
         name = fc.name
@@ -2523,7 +2672,8 @@ class JarvisLive:
                 # audio delivered in a minute is a live microphone. A minute of
                 # audio delivered in two is a model answering the past, and it
                 # reads as "she got slow" rather than as the backlog it is.
-                _audio = (self._sent_blocks - _began_at) * CHUNK_SIZE / SEND_SAMPLE_RATE
+                _audio = ((self._sent_blocks - _began_at) * CHUNK_SIZE
+                          / self._input_sample_rate)
                 _wall = time.monotonic() - _began
                 print(f"[JARVIS] ⇢ {self._sent_blocks} audio blocks sent "
                       f"({_audio:.0f}s of audio in {_wall:.0f}s)",
@@ -2696,14 +2846,34 @@ class JarvisLive:
             # Her own speech only has to close the microphone when it can come
             # back through it. On headphones it cannot, so it stays open and
             # the user can talk over her at any point — which is the whole
-            # difference between a voice assistant and a monologue.
+            # difference between a voice assistant and a monologue. With echo
+            # cancellation it does come back, and is removed before it is sent.
             # While a Learning English class is open the browser tutor has the
             # student's voice; this session must not answer it too.
-            if ((not jarvis_speaking or self._full_duplex)
+            echo = self._echo
+            her_voice = jarvis_speaking
+            data = None
+            if (echo is not None and not self.ui.muted and not self._phone_active
+                    and not self._learning.active):
+                # The canceller hears every block, gated or not: it cannot
+                # learn her echo, or prove it removes it, from blocks it never
+                # sees. Her voice is removed before anything reads the block,
+                # so the meters, the local detector and the model hear the user.
+                her_voice = jarvis_speaking or (
+                    time.monotonic() - self._last_spoke_at < echo.TAIL_SECONDS
+                )
+                was_open = echo.open
+                data = echo.capture(indata.tobytes(), her_voice=her_voice)
+                if echo.open and not was_open:
+                    self._echo_opened(echo)
+            if ((not her_voice or self._mic_open_while_speaking)
                     and not self.ui.muted and not self._phone_active
                     and not self._learning.active):
-                data = indata.tobytes()
-                level = _pcm_level(indata)
+                if data is None:
+                    data = indata.tobytes()
+                    level = _pcm_level(indata)
+                else:
+                    level = _pcm_level(np.frombuffer(data, dtype=np.int16))
                 # Loudest block the model was actually given since the last
                 # record. A silence with nothing above the noise floor in it is
                 # the user not talking; a silence full of clear speech is the
@@ -2763,7 +2933,7 @@ class JarvisLive:
         try:
             def _open_mic(dev):
                 return sd.InputStream(
-                    samplerate=SEND_SAMPLE_RATE,
+                    samplerate=self._input_sample_rate,
                     channels=CHANNELS,
                     dtype="int16",
                     blocksize=CHUNK_SIZE,
@@ -2800,6 +2970,7 @@ class JarvisLive:
             _mic_stream.start()
             try:
                 print("[JARVIS] 🎤 Mic stream open")
+                self._note_audio_latency(mic=_mic_stream)
                 self._last_mic_block = time.monotonic()
 
                 # A microphone can stop delivering without anything raising:
@@ -2836,7 +3007,8 @@ class JarvisLive:
                         self._voice_blocks_unheard = 0
                         self._last_user_speech = time.monotonic()
 
-                    _spoke_seconds = self._voice_blocks_unheard * CHUNK_SIZE / SEND_SAMPLE_RATE
+                    _spoke_seconds = (self._voice_blocks_unheard * CHUNK_SIZE
+                                      / self._input_sample_rate)
                     if (
                         self._heard_this_session == 0
                         and (time.monotonic() - self._session_started) > _DEAF_MIN_SESSION
@@ -2905,6 +3077,7 @@ class JarvisLive:
                         _mic_stream = _open_mic(None)
                         _mic_stream.start()
                     self._last_mic_block = time.monotonic()
+                    self._note_audio_latency(mic=_mic_stream)
                     print("[JARVIS] 🎤 Mic stream reopened", flush=True)
                     self.ui.write_log("SYS: Microphone back online.")
             finally:
@@ -3047,6 +3220,16 @@ class JarvisLive:
         age = now - self._session_started
         out_q = self.out_queue.qsize() if self.out_queue else 0
         play_q = self.audio_in_queue.qsize() if self.audio_in_queue else 0
+        # How much quieter the microphone was after the echo canceller while
+        # her voice was in the room. Near 0 dB means it is reaching the model;
+        # "open" means the canceller has proven itself on the answer she is
+        # giving and the microphone stays open through it.
+        echo = ""
+        canceller = self._echo
+        if canceller is not None:
+            db = canceller.interval_db()
+            if db is not None:
+                echo = f" | aec {db:.0f}dB {'open' if canceller.open else 'gated'}"
 
         print(
             f"[VOICE REC] {int(age // 60):d}:{int(age % 60):02d}"
@@ -3055,7 +3238,8 @@ class JarvisLive:
             f" | snd {sent - last_sent} q{out_q}"
             f"{f' drop {drop - last_drop}' if drop != last_drop else ''}"
             f" | play q{play_q}"
-            f" | lag {lag_max * 1000:.0f}ms",
+            f" | lag {lag_max * 1000:.0f}ms"
+            f"{echo}",
             flush=True,
         )
 
@@ -3139,6 +3323,17 @@ class JarvisLive:
 
                     if response.server_content:
                         sc = response.server_content
+
+                        if getattr(sc, "interrupted", False):
+                            # The user spoke over her. The server has stopped
+                            # her; what is still queued here must stop too.
+                            drained = self._drain_playback()
+                            with self._speaking_lock:
+                                speaking = self._is_speaking
+                            if drained or speaking:
+                                print(f"[JARVIS] ✋ You spoke over her — {drained} "
+                                      "audio chunks discarded", flush=True)
+                                self.set_speaking(False)
 
                         if sc.output_transcription and sc.output_transcription.text:
                             was_empty = not out_buf.text
@@ -3394,14 +3589,17 @@ class JarvisLive:
                                 asyncio.create_task(_cam_close())
 
                     if response.tool_call:
-                        fn_responses = []
-                        for fc in response.tool_call.function_calls:
+                        calls = list(response.tool_call.function_calls)
+                        for fc in calls:
                             print(f"[JARVIS] 📞 {fc.name}")
-                            fr = await self._execute_tool(fc)
-                            fn_responses.append(fr)
-                        await self.session.send_tool_response(
-                            function_responses=fn_responses
+                        # Beside the conversation, never inside it: while a tool
+                        # works this loop keeps reading her voice and the user's
+                        # words, and the result is answered when it is ready.
+                        task = asyncio.create_task(
+                            self._answer_tool_calls(self.session, calls)
                         )
+                        self._tool_tasks.add(task)
+                        task.add_done_callback(self._tool_tasks.discard)
         except Exception as e:
             print(f"[JARVIS] ❌ Recv: {e}")
             traceback.print_exc()
@@ -3430,6 +3628,10 @@ class JarvisLive:
             print("[JARVIS] 🎧 Headphones — microphone stays open while she "
                   "speaks; you can interrupt her by talking", flush=True)
             self.ui.write_log("SYS: Headphones detected — you can interrupt me by speaking.")
+        elif self._echo is not None:
+            print(f"[JARVIS] 🔊 '{_spk_actual or 'system default'}' with echo "
+                  "cancellation — each answer starts with the microphone closed "
+                  "and it opens once the canceller proves itself", flush=True)
         else:
             print(f"[JARVIS] 🔇 '{_spk_actual or 'system default'}' is not "
                   "headphones — microphone closes while she speaks, to stop "
@@ -3485,6 +3687,7 @@ class JarvisLive:
             print(f"[JARVIS] ⚠️  Output device '{_spk_name}' failed: {_e} — using default")
             self.ui.write_log(f"SYS: Speaker '{_spk_name}' unavailable — using system default.")
             stream = _open_spk(None)
+        self._note_audio_latency(speaker=stream)
 
         # The sound card gets a thread of its own. Every tool in this app runs
         # through run_in_executor(None, ...) and asyncio.to_thread uses that same
@@ -3497,6 +3700,18 @@ class JarvisLive:
             max_workers=1, thread_name_prefix="lumina-audio-out"
         )
         loop = asyncio.get_running_loop()
+
+        def _write(pcm: bytes) -> None:
+            # The echo canceller hears what the speakers play on this thread,
+            # immediately before the write. Fed from the event loop instead,
+            # the sessions that interrupted themselves measured -1 to -9 dB;
+            # fed here, the same speakers measured -17.8 dB.
+            echo = self._echo
+            if echo is not None:
+                echo.render(pcm)
+            stream.write(pcm)
+
+        _SILENCE = bytes(2400 * 2)   # 100 ms at 24 kHz / 16-bit mono
 
         _spoken = 0          # bytes written to the sound card this turn
 
@@ -3586,6 +3801,14 @@ class JarvisLive:
                         _dry_at = 0.0
                         self.set_speaking(False)
                         self._turn_done_event.clear()
+                    if self._echo is not None:
+                        # Never let the speaker run empty while the canceller
+                        # listens. An emptied buffer changes how late her voice
+                        # is heard by the next answer, which then leaked through
+                        # at -3 to -5 dB; with silence written and fed as its
+                        # reference, -9 dB, and words the user said in the
+                        # pause were heard instead of lost.
+                        await loop.run_in_executor(_writer, _write, _SILENCE)
                     continue
 
                 # Whether the audio was already here when we came for it.
@@ -3650,7 +3873,7 @@ class JarvisLive:
 
                 try:
                     _t0 = time.monotonic()
-                    await loop.run_in_executor(_writer, stream.write, bytes(batch))
+                    await loop.run_in_executor(_writer, _write, bytes(batch))
                     _t_write += time.monotonic() - _t0
                     _spoken += len(batch)
                 except (RuntimeError, asyncio.CancelledError):
@@ -3993,6 +4216,11 @@ class JarvisLive:
             with self._speaking_lock:
                 speaking = self._is_speaking
             if not speaking and not self.ui.muted and not self._learning.active:
+                if self._input_sample_rate != SEND_SAMPLE_RATE:
+                    # The phone sends 16 kHz; OpenAI Realtime takes the PC
+                    # microphone's 24 kHz.
+                    chunk = {**chunk, "data": _resample_pcm16(
+                        chunk["data"], SEND_SAMPLE_RATE, self._input_sample_rate)}
                 try:
                     self.out_queue.put_nowait(chunk)
                 except asyncio.QueueFull:
@@ -4051,7 +4279,12 @@ class JarvisLive:
         # Tell the device picker the exact rates the streams open at, from the
         # constants that actually open them — so it can never list a device that
         # cannot be opened at them.
-        audio_devices.configure(SEND_SAMPLE_RATE, RECEIVE_SAMPLE_RATE)
+        self._input_sample_rate = (
+            OPENAI_SAMPLE_RATE if get_voice_provider() == "openai"
+            else SEND_SAMPLE_RATE
+        )
+        audio_devices.configure(self._input_sample_rate, RECEIVE_SAMPLE_RATE)
+        _configured_input_rate = self._input_sample_rate
 
         # Enumerate audio devices off-thread. The settings drawer must never pay
         # for host-API enumeration on the Qt thread.
@@ -4066,6 +4299,7 @@ class JarvisLive:
                 state=self._learning_snapshot,
                 action=self._learning_web_action,
                 session=self._learning_live_session,
+                openai_call=self._learning_openai_call,
                 turn=self._learning_turn,
                 voice=self._learning_voice,
                 placement=self._learning_placement,
@@ -4094,30 +4328,50 @@ class JarvisLive:
             try:
                 print("[JARVIS] Connecting...")
                 self.ui.set_state("THINKING")
-                _resumed_with = self._resume_handle is not None
-                config = self._build_config()
-
-                # A fresh client avoids stale HTTP session state on reconnect.
-                # Keep the voice session on v1beta: server-side proactive audio
-                # is intentionally absent from the configuration above.
-                client = genai.Client(
-                    api_key=_get_api_key(),
-                    http_options={"api_version": LIVE_API_VERSION},
+                provider = get_voice_provider()
+                desired_input_rate = (
+                    OPENAI_SAMPLE_RATE if provider == "openai"
+                    else SEND_SAMPLE_RATE
                 )
-                # Which arm of the experiment produced the log that follows.
-                # A session that behaved differently is worth nothing if the
-                # configuration it ran under has to be remembered rather than
-                # read.
-                print(
-                    f"[JARVIS] Live transport: {LIVE_API_VERSION}; "
-                    "optional server audio features: off; "
-                    f"context compression: {'on' if _COMPRESSION_ON else 'off'}"
-                )
+                self._input_sample_rate = desired_input_rate
+                if desired_input_rate != _configured_input_rate:
+                    audio_devices.configure(desired_input_rate, RECEIVE_SAMPLE_RATE)
+                    audio_devices.prefetch()
+                    _configured_input_rate = desired_input_rate
+                _resumed_with = provider == "gemini" and self._resume_handle is not None
 
-                async with (
-                    client.aio.live.connect(model=LIVE_MODEL, config=config) as session,
-                    asyncio.TaskGroup() as tg,
-                ):
+                if provider == "openai":
+                    session_cm = OpenAIRealtimeSession.open(
+                        api_key=get_openai_key(),
+                        instructions=self._build_system_instruction(),
+                        voice=get_openai_voice(),
+                        tools=self._all_tool_declarations(),
+                        assistant_name=self._asst_name,
+                    )
+                    self._echo = EchoCanceller.create(OPENAI_SAMPLE_RATE)
+                    self._echo_announced = False
+                    print(
+                        f"[JARVIS] Live provider: OpenAI; transport: WebSocket; "
+                        f"model: {OPENAI_REALTIME_MODEL}; voice: {get_openai_voice()}; "
+                        f"echo cancellation: {'on' if self._echo else 'unavailable'}"
+                    )
+                else:
+                    self._echo = None
+                    config = self._build_config()
+                    # A fresh client avoids stale HTTP session state on reconnect.
+                    # Keep Gemini on its measured v1beta path.
+                    client = genai.Client(
+                        api_key=_get_api_key(),
+                        http_options={"api_version": LIVE_API_VERSION},
+                    )
+                    session_cm = client.aio.live.connect(model=LIVE_MODEL, config=config)
+                    print(
+                        f"[JARVIS] Live provider: Gemini; transport: {LIVE_API_VERSION}; "
+                        "optional server audio features: off; "
+                        f"context compression: {'on' if _COMPRESSION_ON else 'off'}"
+                    )
+
+                async with session_cm as session, asyncio.TaskGroup() as tg:
                     self.session          = session
                     self.audio_in_queue   = asyncio.Queue()
                     self.out_queue        = asyncio.Queue(maxsize=200)
@@ -4263,8 +4517,22 @@ class JarvisLive:
                 # having died.
                 if any(k in err_str for k in (
                     "API key not valid", "API_KEY_INVALID",
-                    "UNAUTHENTICATED", "PERMISSION_DENIED",
+                    "UNAUTHENTICATED", "PERMISSION_DENIED", "invalid_api_key",
+                    "Incorrect API key",
                 )):
+                    if provider == "openai":
+                        self.ui.write_log(
+                            "ERR: OpenAI API key invalid — update it in API Keys."
+                        )
+                        self.ui.set_state("SLEEPING")
+                        # The same key fails the same way, as fast as this loop
+                        # can spin. Wait for the key or the engine to change.
+                        rejected = get_openai_key()
+                        while (get_voice_provider() == "openai"
+                               and get_openai_key() == rejected):
+                            await asyncio.sleep(2)
+                        self._conn_backoff = 0
+                        continue
                     self.ui.write_log("ERR: API key invalid — please re-enter your key.")
                     self.ui.set_state("SLEEPING")
                     self.ui.prompt_reconfig()
@@ -4290,6 +4558,7 @@ class JarvisLive:
                     self._conn_backoff = 3
             finally:
                 self.session = None
+                self._echo = None
                 if self._live_vision_source:
                     state = "paused" if self._live_vision_paused else "starting"
                     detail = (

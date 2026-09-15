@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#071410">
   <title>Learning English · Lumina</title>
-  <link rel="stylesheet" href="/static/learning-english.css?v=20260914-course-tools">
+  <link rel="stylesheet" href="/static/learning-english.css?v=20260914-openai-voice">
 </head>
 <body>
   <div class="ambient ambient-one"></div>
@@ -165,7 +165,7 @@
     </main>
 
     <footer class="voice-dock" aria-label="Controles de voz">
-      <div class="voice-status"><span class="sound-wave"><i></i><i></i><i></i><i></i><i></i></span><div><strong id="dock-state">Esperando a Gemini</strong><small id="dock-detail">Tu progreso se guarda automáticamente</small></div></div>
+      <div class="voice-status"><span class="sound-wave"><i></i><i></i><i></i><i></i><i></i></span><div><strong id="dock-state">Esperando a Lumina</strong><small id="dock-detail">Tu progreso se guarda automáticamente</small></div></div>
       <div class="dock-controls">
         <button type="button" id="mute-button" data-action="mute" aria-pressed="false"><span>◉</span> Micrófono</button>
         <button type="button" class="stop-control" data-action="stop"><span>■</span> Detener</button>
@@ -185,6 +185,7 @@
       <label>Velocidad preferida<select id="speed-select"><option value="slow">Lenta</option><option value="normal" selected>Normal</option><option value="natural">Natural</option></select></label>
       <label>Mostrar traducciones<select id="translation-select"><option value="true">Cuando sean necesarias</option><option value="false">Solo inglés</option></select></label>
       <label>Meta semanal<select id="weekly-select"><option value="1">1 clase</option><option value="2">2 clases</option><option value="3" selected>3 clases</option><option value="4">4 clases</option><option value="5">5 clases</option><option value="7">Todos los días</option></select></label>
+      <label>Motor de voz<select id="voice-provider-select"><option value="gemini">Gemini Live</option><option value="openai">OpenAI · Sol (Shimmer)</option></select></label>
       <label>Grabaciones de voz<select id="recordings-select"><option value="true">Guardar mis respuestas habladas en Supabase</option><option value="false">No guardar grabaciones</option></select></label>
       <button type="button" class="ghost-button danger-inline" id="delete-recordings">Borrar todas mis grabaciones</button>
       <p>LanguageTool y OpenPronounce corren en este equipo y se activan al empezar la clase. Las grabaciones van al Supabase privado de Lumina; si quien aprende es un niño, guárdalas solo con permiso de su madre, padre o tutor.</p>
@@ -211,7 +212,7 @@
 
   <dialog id="roadmap-dialog" class="wide-dialog">
     <div class="dialog-heading"><div><span class="section-kicker">Currículo propio de Lumina</span><h2>Ruta de aprendizaje desde cero hasta C2</h2></div><button type="button" data-close-dialog="roadmap-dialog" aria-label="Cerrar">×</button></div>
-    <p>Cada unidad define qué practicar y en qué orden; Gemini enseña dentro de esos límites. Una unidad se completa al terminar sus lecciones o al aprobar su prueba.</p>
+    <p>Cada unidad define qué practicar y en qué orden; el motor de voz elegido enseña dentro de esos límites. Una unidad se completa al terminar sus lecciones o al aprobar su prueba.</p>
     <div class="roadmap-note hidden" id="roadmap-note"><p id="roadmap-note-copy"></p><button type="button" data-mode-shortcut="assessment">Evaluación de nivel</button></div>
     <div class="roadmap" id="roadmap"></div>
   </dialog>
@@ -240,6 +241,6 @@
     <button class="dialog-save" id="summary-close" type="button">Volver a Lumina</button>
   </dialog>
 
-  <script src="/static/learning-english.js?v=20260914-course-tools" defer></script>
+  <script src="/static/learning-english.js?v=20260914-openai-webrtc" defer></script>
 </body>
 </html>
