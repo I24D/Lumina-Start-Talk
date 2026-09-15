@@ -35,27 +35,40 @@ network fault, not a bug. A second Wi-Fi adapter took the default route on
 
 ## The voice path
 
-### 1. Microphone audio goes to Gemini as `media=`, never `audio=types.Blob`
+### 1. Gemini 3.1 Flash Live takes the microphone as `audio=`, and text as realtime input
 
-In `_send_realtime`:
+In `_send_realtime`, for Gemini:
 
 ```python
-await self.session.send_realtime_input(media=msg)
-# msg = {"data": ..., "mime_type": "audio/pcm;rate=16000"}
+await self.session.send_realtime_input(
+    audio=types.Blob(data=msg["data"], mime_type=msg["mime_type"])
+)
 ```
 
-The typed `Blob` path is the documented modern transport and it is the right
-answer for most configurations. It is the wrong answer for this one: the
-session runs with `proactive_audio` and `enable_affective_dialog`, and with
-those enabled the audio never arrives.
+Until 2026-09-14 Lumina ran `gemini-2.5-flash-native-audio-preview-12-2025`,
+and on that model the rule was the opposite: `media=`, because `audio=` arrived
+nowhere while proactive audio and affective dialog were on (broken in
+`137714b`, restored in `3eb8a12`). 3.1 closes the session on `media_chunks`
+with 1007 "media_chunks is deprecated".
 
-**Symptom when broken:** total deafness. The microphone captures, every block
-is handed to the session, no exception is raised anywhere, and Gemini
-transcribes nothing for the entire life of the process. It looks like a model
-problem, a quota problem or a microphone problem. It is none of those.
+3.1 also takes `send_client_content` only to seed the start of a session. Every
+text turn in the middle of a conversation goes through `_send_text_turn`, which
+sends `send_realtime_input(text=...)`; the photo turn sends the image as
+`video=` and then the question as text. The OpenAI session keeps `media=` and
+`send_client_content`, which it maps itself. Do not route it through the Gemini
+calls.
 
-Measured under `media=`: live fragments in the console and answers 1.1–3.9 s
-after the user stops speaking. Broken in `137714b`, restored in `3eb8a12`.
+**Why 3.1, measured:** the same recorded Spanish question, streamed straight
+into each model with no microphone and no Lumina in between, came back as text
+1.6 s after the speech ended on 3.1 in three runs of three, against 12–14 s on
+2.5, where one run of three never answered in 40 s. First reply audio: 1.6–1.7 s
+against 15–16 s. Neither model sent `interim_input_transcription`, so on either
+one the words appear when the user stops, not while he is still speaking.
+
+3.1 does not support asynchronous (`NON_BLOCKING`) function calls, affective
+dialog or proactive audio. On 2026-09-05 a regional slowdown of 3.1 was reported
+from EU traffic (first audio 16–26 s); replies that suddenly take that long are
+the service, not this code.
 
 ### 1b. Do not set `realtime_input_config`. The upstream project does not
 

@@ -46,7 +46,11 @@ class _FakeSession:
         self.turns = []
 
     async def send_realtime_input(self, **kwargs):
-        self.frames.append((time.monotonic(), kwargs))
+        # Gemini 3.1 takes a mid-session text turn as realtime text.
+        if "text" in kwargs:
+            self.turns.append(kwargs)
+        else:
+            self.frames.append((time.monotonic(), kwargs))
 
     async def send_client_content(self, **kwargs):
         self.turns.append(kwargs)

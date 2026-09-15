@@ -182,7 +182,11 @@ from learning_english.intent import confirmation_answer, detect_learning_english
 
 BASE_DIR        = get_base_dir()
 PROMPT_PATH     = BASE_DIR / "core" / "prompt.txt"
-LIVE_MODEL          = "models/gemini-2.5-flash-native-audio-preview-12-2025"
+# Measured on 2026-09-14 by streaming the same recorded question straight into
+# each model: on 3.1 Flash Live the user's words came back 1.6 s after he stopped
+# and her reply 1.7 s after, in three runs of three; on 2.5 native audio 12-14 s
+# and 15-16 s, and one run of three never answered at all.
+LIVE_MODEL          = "models/gemini-3.1-flash-live-preview"
 LIVE_API_VERSION    = "v1beta"
 
 # Sliding-window context compression, on by default, and switchable without an
@@ -1395,10 +1399,7 @@ class JarvisLive:
 
         async def _say():
             try:
-                await self.session.send_client_content(
-                    turns={"parts": [{"text": instruction}]},
-                    turn_complete=True,
-                )
+                await self._send_text_turn(instruction)
             except Exception as e:
                 print(f"[PluginSay] {e}")
 
@@ -1465,14 +1466,11 @@ class JarvisLive:
 
         try:
             asyncio.run_coroutine_threadsafe(
-                self.session.send_client_content(
-                    turns={"parts": [{"text": (
+                self._send_text_turn(
                         "The user just said your wake phrase because you were not "
                         "responding. Greet them in one short sentence, in their "
                         "language, and ask what they need."
-                    )}]},
-                    turn_complete=True,
-                ),
+                    ),
                 loop,
             )
         except Exception as e:
@@ -2109,10 +2107,7 @@ class JarvisLive:
         log_turn(BASE_DIR, text, "")
 
         asyncio.run_coroutine_threadsafe(
-            self.session.send_client_content(
-                turns={"parts": [{"text": text}]},
-                turn_complete=True
-            ),
+            self._send_text_turn(text),
             self._loop
         )
 
@@ -2206,14 +2201,25 @@ class JarvisLive:
             self._turn_done_event.clear()
         self.ui.write_log("SYS: Interrupted — listening...")
 
+    async def _send_text_turn(self, text: str) -> None:
+        """One text turn for whichever model is live.
+
+        Gemini 3.1 Flash Live accepts send_client_content only to seed the start
+        of a session; mid-conversation it takes text as realtime input. The
+        OpenAI session maps client content itself and keeps it."""
+        session = self.session
+        if isinstance(session, OpenAIRealtimeSession):
+            await session.send_client_content(
+                turns={"parts": [{"text": text}]}, turn_complete=True,
+            )
+        else:
+            await session.send_realtime_input(text=text)
+
     def speak(self, text: str):
         if not self._loop or not self.session:
             return
         asyncio.run_coroutine_threadsafe(
-            self.session.send_client_content(
-                turns={"parts": [{"text": text}]},
-                turn_complete=True
-            ),
+            self._send_text_turn(text),
             self._loop
         )
 
@@ -2583,10 +2589,7 @@ class JarvisLive:
                     await self._save_session_summary()
                     if self.session:
                         try:
-                            await self.session.send_client_content(
-                                turns={"parts": [{"text": "Say a brief natural goodbye to the user."}]},
-                                turn_complete=True,
-                            )
+                            await self._send_text_turn("Say a brief natural goodbye to the user.")
                         except Exception:
                             pass
                     await asyncio.sleep(1.5)
@@ -2628,9 +2631,10 @@ class JarvisLive:
         _began_at = self._sent_blocks
         while True:
             msg = await self.out_queue.get()
-            # This project's proven 2.5 native-audio path uses the legacy media
-            # dictionary. Changing it to audio=Blob produced accepted calls but
-            # no input transcriptions in a measured session.
+            # Gemini 3.1 Flash Live takes the microphone only as audio=, and
+            # closes the session on the media chunks 2.5 native audio needed
+            # (1007 "media_chunks is deprecated"). The OpenAI session reads its
+            # own media= entry.
             #
             # Nothing else goes down this channel. A client-side detector used
             # to send audio_stream_end after every pause of 640 ms, to hurry
@@ -2641,7 +2645,12 @@ class JarvisLive:
             # its audio thirty-one times while transcribing nothing at all.
             # The service's default activity detection does not need the help.
             try:
-                await self.session.send_realtime_input(media=msg)
+                if isinstance(self.session, OpenAIRealtimeSession):
+                    await self.session.send_realtime_input(media=msg)
+                else:
+                    await self.session.send_realtime_input(
+                        audio=types.Blob(data=msg["data"], mime_type=msg["mime_type"])
+                    )
             except Exception as exc:
                 # This task is the only path audio has to the model. If it
                 # dies the microphone keeps working, the meters keep moving
@@ -2771,16 +2780,13 @@ class JarvisLive:
                         source_label = (
                             "camera" if source == "camera" else self._live_vision_label
                         )
-                        await self.session.send_client_content(
-                            turns={"parts": [{"text": (
+                        await self._send_text_turn(
                                 f"[VISION_SESSION_STARTED] The user explicitly enabled live "
                                 f"{source_label} sharing from the interface. You can now see "
                                 f"fresh frames continuously. In one short sentence in the "
                                 f"user's language, confirm that Vision is active and ask what "
                                 f"they want help with. Do not call screen_process."
-                            )}]},
-                            turn_complete=True,
-                        )
+                            )
                 elif self._live_vision_frames % 15 == 0:
                     print(
                         f"[VISION LIVE] ⇢ {self._live_vision_frames} frames sent "
@@ -3532,13 +3538,10 @@ class JarvisLive:
 
                             if self._learning_confirmation_prompt_pending and self.session:
                                 self._learning_confirmation_prompt_pending = False
-                                await self.session.send_client_content(
-                                    turns={"parts": [{"text": (
+                                await self._send_text_turn(
                                         "[SYSTEM_ALERT] Pregunta solamente si el usuario quiere "
                                         "activar Learning English y abrir el estudio."
-                                    )}]},
-                                    turn_complete=True,
-                                )
+                                    )
 
                             # Vision injection: model finished tool-response turn → now send the image
                             if self._pending_vision and self.session:
@@ -3547,13 +3550,19 @@ class JarvisLive:
                                 self._pending_vision = None
                                 b64 = _b64.b64encode(img_b).decode("ascii")
                                 print(f"[Vision] 📤 {len(img_b):,} bytes (angle={angle}) → main session")
-                                await self.session.send_client_content(
-                                    turns={"parts": [
-                                        {"inline_data": {"mime_type": mime_t, "data": b64}},
-                                        {"text": question},
-                                    ]},
-                                    turn_complete=True,
-                                )
+                                if isinstance(self.session, OpenAIRealtimeSession):
+                                    await self.session.send_client_content(
+                                        turns={"parts": [
+                                            {"inline_data": {"mime_type": mime_t, "data": b64}},
+                                            {"text": question},
+                                        ]},
+                                        turn_complete=True,
+                                    )
+                                else:
+                                    await self.session.send_realtime_input(
+                                        video=types.Blob(data=img_b, mime_type=mime_t)
+                                    )
+                                    await self.session.send_realtime_input(text=question)
                                 # Mark next turn_complete behaviour depending on angle
                                 if self._vision_cam_active:
                                     # Camera: keep busy until JARVIS finishes speaking the answer
@@ -3940,10 +3949,7 @@ class JarvisLive:
         if self._turn_done_event:
             self._turn_done_event.clear()
 
-        await self.session.send_client_content(
-            turns={"parts": [{"text": p1}]},
-            turn_complete=True,
-        )
+        await self._send_text_turn(p1)
         self.ui.write_log("SYS: Briefing phase 1 (greeting) sent.")
 
         # ── Phase 2: fire as soon as Phase 1 audio is done ───────────────────
@@ -4003,10 +4009,7 @@ class JarvisLive:
                         f"Let the user know briefly.{lang_str}"
                     )
 
-                await self.session.send_client_content(
-                    turns={"parts": [{"text": p2}]},
-                    turn_complete=True,
-                )
+                await self._send_text_turn(p2)
                 self.ui.write_log("SYS: Briefing phase 2 (news) sent.")
             except Exception as e:
                 print(f"[Briefing] Phase 2 error: {e}")
@@ -4063,10 +4066,7 @@ class JarvisLive:
             if speaking or (time.monotonic() - self._last_user_speech) < 10:
                 continue
             try:
-                await self.session.send_client_content(
-                    turns={"parts": [{"text": alert}]},
-                    turn_complete=True,
-                )
+                await self._send_text_turn(alert)
             except Exception as e:
                 print(f"[Monitor] ⚠️ Could not send alert: {e}")
 
@@ -4101,10 +4101,7 @@ class JarvisLive:
                 print(f"[Announce] dropped news older than {_ANNOUNCE_MAX_AGE:.0f}s")
                 continue
             try:
-                await self.session.send_client_content(
-                    turns={"parts": [{"text": instruction}]},
-                    turn_complete=True,
-                )
+                await self._send_text_turn(instruction)
             except Exception as e:
                 # The session is going away; the next one can still say it.
                 self._announcements.appendleft((queued_at, instruction))
@@ -4137,10 +4134,7 @@ class JarvisLive:
                                 f"Inform the user about this development naturally in {lang}. "
                                 "One brief sentence only."
                             )
-                            await self.session.send_client_content(
-                                turns={"parts": [{"text": msg}]},
-                                turn_complete=True,
-                            )
+                            await self._send_text_turn(msg)
                             self.ui.write_log(f"SYS: Monitor alert sent.")
                             await asyncio.sleep(6)   # gap between consecutive alerts
                     except Exception as e:
@@ -4180,10 +4174,7 @@ class JarvisLive:
                     monitors     = monitors or None,
                     recent_turns = recent_turns or None,
                 )
-                await self.session.send_client_content(
-                    turns={"parts": [{"text": prompt}]},
-                    turn_complete=True,
-                )
+                await self._send_text_turn(prompt)
                 self.ui.write_log("SYS: Proactive check-in.")
             except Exception as e:
                 print(f"[Proactive] ⚠️ {e}")
@@ -4234,10 +4225,7 @@ class JarvisLive:
                         break
                     await asyncio.sleep(0.1)
                 if self.session:
-                    await self.session.send_client_content(
-                        turns={"parts": [{"text": text}]},
-                        turn_complete=True,
-                    )
+                    await self._send_text_turn(text)
                     self.ui.write_log(f"[Web]: {text}")
                 else:
                     print(f"[Dashboard] Dropped command (no session): {text}")
@@ -4354,7 +4342,8 @@ class JarvisLive:
                     )
                     session_cm = client.aio.live.connect(model=LIVE_MODEL, config=config)
                     print(
-                        f"[JARVIS] Live provider: Gemini; transport: {LIVE_API_VERSION}; "
+                        f"[JARVIS] Live provider: Gemini; model: {LIVE_MODEL.removeprefix('models/')}; "
+                        f"transport: {LIVE_API_VERSION}; "
                         "optional server audio features: off; "
                         f"context compression: {'on' if _COMPRESSION_ON else 'off'}"
                     )

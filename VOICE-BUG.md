@@ -13,6 +13,16 @@ it was wrong. See *The flight recorder* below.
 Read it before changing anything. Most of a day was lost to fixes aimed at
 parts that turned out to be working perfectly.
 
+## 2026-09-14: the model changed
+
+Everything below was measured on `gemini-2.5-flash-native-audio-preview-12-2025`.
+On 2026-09-14 the same recorded question, streamed straight into each model with
+no microphone and no Lumina in between, came back as text 12–14 s after the
+speech ended on 2.5 (one run of three never answered) and 1.6 s after on
+`gemini-3.1-flash-live-preview`, in three runs of three. Lumina moved to 3.1 that
+day; AGENTS.md item 1 says what changed with it. Measure again on 3.1 before
+reading the rest of this file as current.
+
 ## What the user needs
 
 Exactly this, in his words: he speaks, **his words appear in the chat as he
