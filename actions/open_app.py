@@ -1,13 +1,8 @@
+import os
 import time
 import subprocess
 import platform
 import shutil
-
-try:
-    import psutil
-    _PSUTIL = True
-except ImportError:
-    _PSUTIL = False
 
 _SYSTEM = platform.system()
 
@@ -95,11 +90,13 @@ def _normalize(raw: str) -> str:
 
 def _launch_windows(app_name: str) -> bool:
 
-    if shutil.which(app_name) or shutil.which(app_name.split(".")[0]):
+    # No shell on either path. The name comes from the model, and through cmd.exe
+    # anything after an "&" in it ran as a command of its own.
+    exe = shutil.which(app_name) or shutil.which(app_name.split(".")[0])
+    if exe:
         try:
             subprocess.Popen(
-                app_name,
-                shell=True,
+                [exe],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
@@ -108,9 +105,11 @@ def _launch_windows(app_name: str) -> bool:
         except Exception as e:
             print(f"[open_app] subprocess failed: {e}")
 
+    # Protocols such as "ms-settings:", and full paths, opened the way a
+    # double-click opens them.
     if ":" in app_name:
         try:
-            subprocess.Popen(f"start {app_name}", shell=True)
+            os.startfile(app_name)
             time.sleep(1.0)
             return True
         except Exception:

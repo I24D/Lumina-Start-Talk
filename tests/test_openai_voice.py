@@ -13,7 +13,6 @@ from unittest import mock
 import httpx
 import numpy as np
 
-import core.openai_realtime as realtime
 import learning_english.service as learning_service_module
 import main
 from core.echo_canceller import EchoCanceller

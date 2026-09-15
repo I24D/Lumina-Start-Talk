@@ -19,27 +19,22 @@ else:
     _WIN_HIDE: dict = {}
 
 from PyQt6.QtCore import (
-    QEasingCurve, QMimeData, QObject, QPoint, QPointF, QRectF, QSize, Qt,
-    QTimer, QUrl, pyqtSignal,
+    QPoint, QPointF, QRectF, QSize, Qt, QTimer, pyqtSignal,
 )
 from PyQt6.QtGui import (
     QBrush, QColor, QConicalGradient, QDragEnterEvent, QDropEvent, QFont,
-    QFontDatabase, QIcon, QKeySequence, QLinearGradient, QPainter, QPainterPath,
-    QPen, QPixmap, QRadialGradient, QShortcut,
+    QIcon, QKeySequence, QPainter, QPainterPath, QPen, QPixmap, QShortcut,
 )
 from PyQt6.QtWidgets import (
     QApplication, QComboBox, QFileDialog, QFrame, QGridLayout, QHBoxLayout,
-    QLabel, QLineEdit, QMainWindow, QPushButton, QProgressBar, QScrollArea,
+    QLabel, QLineEdit, QMainWindow, QPushButton, QScrollArea,
     QSizePolicy, QSplitter, QStackedWidget, QTabWidget, QTextEdit, QToolButton,
     QVBoxLayout, QWidget,
 )
 
-def _base_dir() -> Path:
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).parent
-    return Path(__file__).resolve().parent
+from memory.config_manager import get_base_dir
 
-BASE_DIR   = _base_dir()
+BASE_DIR   = get_base_dir()
 CONFIG_DIR = BASE_DIR / "config"
 API_FILE   = CONFIG_DIR / "api_keys.json"
 APP_NAME   = "LUMINA"
@@ -1172,7 +1167,7 @@ class _DropCanvas(QWidget):
                    "Images · Video · Audio · PDF · Docs · Code · Data")
 
     def _paint_drag_over(self, p, W, H):
-        cx, cy = W / 2, H / 2
+        cy = H / 2
         p.setFont(QFont("Courier New", 20))
         p.setPen(QPen(qcol(C.PRI), 1))
         p.drawText(QRectF(0, cy - 24, W, 32), Qt.AlignmentFlag.AlignCenter, "⬇")
@@ -3692,7 +3687,7 @@ class MainWindow(QMainWindow):
             cam_idx = 0
             try:
                 import json as _j
-                cfg = _j.loads((CONFIG_DIR / "api_keys.json").read_text())
+                cfg = _j.loads((CONFIG_DIR / "api_keys.json").read_text(encoding="utf-8"))
                 cam_idx = int(cfg.get("camera_index", 0))
             except Exception:
                 pass
@@ -3952,7 +3947,8 @@ class MainWindow(QMainWindow):
                 launcher.write_text(
                     "#!/usr/bin/env bash\n"
                     f'cd "{script.parent}"\n'
-                    f'exec "{python}" "{script}"\n'
+                    f'exec "{python}" "{script}"\n',
+                    encoding="utf-8"
                 )
                 launcher.chmod(launcher.stat().st_mode
                                | _stat.S_IEXEC | _stat.S_IXGRP | _stat.S_IXOTH)
@@ -3969,7 +3965,8 @@ class MainWindow(QMainWindow):
                     '  <key>CFBundleName</key><string>LUMINA</string>\n'
                     '  <key>CFBundlePackageType</key><string>APPL</string>\n'
                     '  <key>CFBundleVersion</key><string>1.0</string>\n'
-                    '</dict></plist>\n'
+                    '</dict></plist>\n',
+                    encoding="utf-8"
                 )
 
                 # Optional: copy icon as .icns (skip silently if Pillow is missing)
@@ -3979,13 +3976,14 @@ class MainWindow(QMainWindow):
                     PIL.Image.open(ico_path).save(icns, format="ICNS")
                     # Inject icon reference into plist
                     plist = app / "Contents" / "Info.plist"
-                    txt = plist.read_text()
+                    txt = plist.read_text(encoding="utf-8")
                     plist.write_text(
                         txt.replace(
                             '</dict></plist>',
                             '  <key>CFBundleIconFile</key>'
                             '<string>AppIcon</string>\n</dict></plist>\n',
-                        )
+                        ),
+                        encoding="utf-8"
                     )
                 except Exception:
                     pass  # icon is optional
@@ -4013,7 +4011,8 @@ class MainWindow(QMainWindow):
                     "Type=Application\n"
                     "Terminal=false\n"
                     "Categories=Utility;\n"
-                    + icon_line
+                    + icon_line,
+                    encoding="utf-8"
                 )
                 desk.chmod(desk.stat().st_mode | 0o755)
 
@@ -4950,7 +4949,8 @@ class MainWindow(QMainWindow):
                         f'    <string>{script}</string>\n'
                         '  </array>\n'
                         '  <key>RunAtLoad</key><true/>\n'
-                        '</dict></plist>\n'
+                        '</dict></plist>\n',
+                        encoding="utf-8"
                     )
             else:
                 desk_dir = Path.home() / ".config" / "autostart"
@@ -4965,7 +4965,8 @@ class MainWindow(QMainWindow):
                         f"Name={self._assistant_name}\n"
                         f"Exec={sys.executable} {script}\n"
                         "Type=Application\nTerminal=false\n"
-                        "X-GNOME-Autostart-enabled=true\n"
+                        "X-GNOME-Autostart-enabled=true\n",
+                        encoding="utf-8"
                     )
             enabled = not currently_on
             self._update_autostart_btn(enabled)

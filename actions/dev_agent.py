@@ -2,31 +2,23 @@ import subprocess
 import sys
 import json
 import re
+import shutil
 import time
 from pathlib import Path
 
-
-def get_base_dir():
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).parent
-    return Path(__file__).resolve().parent.parent
+from config import GEMINI_MODEL
+from memory.config_manager import get_gemini_key
 
 
-BASE_DIR         = get_base_dir()
-API_CONFIG_PATH  = BASE_DIR / "config" / "api_keys.json"
 PROJECTS_DIR     = Path.home() / "Desktop" / "JarvisProjects"
 MAX_FIX_ATTEMPTS = 5
-MODEL_PLANNER    = "gemini-flash-latest"
-MODEL_WRITER     = "gemini-flash-latest"
-
-def _get_api_key() -> str:
-    with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)["gemini_api_key"]
+MODEL_PLANNER    = GEMINI_MODEL
+MODEL_WRITER     = GEMINI_MODEL
 
 
 def _get_model(model_name: str):
     from google import genai
-    _c = genai.Client(api_key=_get_api_key())
+    _c = genai.Client(api_key=get_gemini_key())
 
     class _W:
         def generate_content(self, contents):
@@ -276,10 +268,15 @@ def _open_vscode(project_dir: Path) -> bool:
         r"C:\Program Files\Microsoft VS Code\bin\code.cmd",
     ]
     for cmd in vscode_candidates:
+        # Resolved here instead of by a shell: cmd.exe started even when VS Code
+        # was missing, so the first candidate always "opened" and the installed
+        # copies further down the list were never tried.
+        exe = shutil.which(cmd)
+        if not exe:
+            continue
         try:
             subprocess.Popen(
-                [cmd, str(project_dir)],
-                shell=True,
+                [exe, str(project_dir)],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL
             )

@@ -4,10 +4,8 @@ Checks DDG news once per day per topic; alerts JARVIS when a new headline appear
 No crypto, no finance, no uninvited tracking.
 """
 import hashlib
-import json
 import re
 from datetime import datetime
-from pathlib import Path
 
 
 # ── Blocked categories (never monitor regardless of what user says) ────────────
@@ -32,7 +30,8 @@ def _slug(topic: str) -> str:
     return re.sub(r"[^a-z0-9]+", "_", topic.lower().strip())[:40].strip("_")
 
 def _title_hash(title: str) -> str:
-    return hashlib.md5(title.encode("utf-8", errors="ignore")).hexdigest()[:12]
+    # A dedupe key, not a security measure.
+    return hashlib.md5(title.encode("utf-8", errors="ignore"), usedforsecurity=False).hexdigest()[:12]
 
 
 # ── Memory I/O ─────────────────────────────────────────────────────────────────
@@ -43,15 +42,12 @@ def _load() -> dict:
     return data if isinstance(data, dict) else {}
 
 def _save(monitors: dict) -> None:
-    from memory.memory_manager import load_memory, MEMORY_PATH, _lock
+    from memory.memory_manager import load_memory, MEMORY_PATH, _lock, _replace_memory_file
     memory = load_memory()
     memory["monitors"] = monitors
     with _lock:
         MEMORY_PATH.parent.mkdir(parents=True, exist_ok=True)
-        MEMORY_PATH.write_text(
-            json.dumps(memory, indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
+        _replace_memory_file(memory)
 
 
 # ── Public API ─────────────────────────────────────────────────────────────────

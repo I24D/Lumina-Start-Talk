@@ -5,7 +5,6 @@ import platform
 import re
 import string
 import subprocess
-import sys
 
 if platform.system() == "Windows":
     _WIN_HIDE: dict = {"creationflags": subprocess.CREATE_NO_WINDOW}
@@ -13,6 +12,7 @@ else:
     _WIN_HIDE: dict = {}
 import time
 import random
+import secrets
 from pathlib import Path
 
 try:
@@ -29,13 +29,10 @@ try:
 except ImportError:
     _PYPERCLIP = False
 
-def _base_dir() -> Path:
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).parent
-    return Path(__file__).resolve().parent.parent
+from config import GEMINI_LITE_MODEL
+from memory.config_manager import get_base_dir, get_gemini_key
 
-
-_BASE         = _base_dir()
+_BASE         = get_base_dir()
 _CONFIG_PATH  = _BASE / "config" / "api_keys.json"
 _MEMORY_PATH  = _BASE / "memory" / "long_term.json"
 
@@ -53,9 +50,6 @@ def _platform_os() -> str:
 def _get_os() -> str:
     return _load_config().get("os_system", _platform_os()).lower()
 
-
-def _get_api_key() -> str:
-    return _load_config().get("gemini_api_key", "")
 
 _SAFE_SCREENSHOT_ROOTS = (
     Path.home(),
@@ -112,14 +106,16 @@ def _random_data(data_type: str) -> str:
         return f"{random.choice(_FIRST_NAMES).lower()}{random.randint(100, 9999)}"
 
     if dt == "password":
+        # Typed into a real sign-up form, so it comes from the OS's secure
+        # generator, not the predictable one the names above are drawn from.
         chars = string.ascii_letters + string.digits + "!@#$%"
         raw   = (
-            random.choice(string.ascii_uppercase)
-            + random.choice(string.digits)
-            + random.choice("!@#$%")
-            + "".join(random.choices(chars, k=9))
+            secrets.choice(string.ascii_uppercase)
+            + secrets.choice(string.digits)
+            + secrets.choice("!@#$%")
+            + "".join(secrets.choice(chars) for _ in range(9))
         )
-        return "".join(random.sample(raw, len(raw)))
+        return "".join(secrets.SystemRandom().sample(raw, len(raw)))
 
     if dt == "phone":
         return f"+1{random.randint(200,999)}{random.randint(1_000_000, 9_999_999)}"
@@ -311,7 +307,7 @@ def _focus_window(title: str) -> str:
     return f"focus_window: unknown OS '{os_name}'"
 
 def _screen_find(description: str) -> tuple[int, int] | None:
-    api_key = _get_api_key()
+    api_key = get_gemini_key()
     if not api_key:
         print("[ComputerControl] ⚠️ No API key for screen_find")
         return None
@@ -336,7 +332,7 @@ def _screen_find(description: str) -> tuple[int, int] | None:
         )
 
         response = client.models.generate_content(
-            model="gemini-flash-lite-latest",
+            model=GEMINI_LITE_MODEL,
             contents=[
                 gtypes.Part.from_bytes(data=image_bytes, mime_type="image/png"),
                 prompt,

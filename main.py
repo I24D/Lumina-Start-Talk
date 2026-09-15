@@ -113,8 +113,6 @@ import concurrent.futures
 import re
 import threading
 import time
-import json
-import sys
 import traceback
 import webbrowser
 from collections import deque
@@ -164,10 +162,12 @@ from actions.background_monitor import (
 )
 from actions.web_search        import _news as _fetch_news_sync
 from memory.config_manager     import (
-    get_brief_enabled, get_voice, get_input_device, get_output_device,
-    get_voice_provider, get_learning_voice_provider, get_openai_key,
-    get_openai_voice, save_voice_settings,
+    get_base_dir, get_brief_enabled, get_gemini_key, get_voice,
+    get_input_device, get_output_device, get_voice_provider,
+    get_learning_voice_provider, get_openai_key, get_openai_voice,
+    load_api_keys, save_voice_settings,
 )
+from config                    import GEMINI_MODEL
 from core.plugin_loader        import discover_plugins
 from core                      import undo as undo_stack
 from core                      import confirm as confirm_gate
@@ -180,13 +180,7 @@ from learning_english import LearningEnglishController, LearningEnglishService
 from learning_english.recordings import VoiceRecordings
 from learning_english.intent import confirmation_answer, detect_learning_english_intent
 
-def get_base_dir():
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).parent
-    return Path(__file__).resolve().parent
-
 BASE_DIR        = get_base_dir()
-API_CONFIG_PATH = BASE_DIR / "config" / "api_keys.json"
 PROMPT_PATH     = BASE_DIR / "core" / "prompt.txt"
 LIVE_MODEL          = "models/gemini-2.5-flash-native-audio-preview-12-2025"
 LIVE_API_VERSION    = "v1beta"
@@ -349,11 +343,6 @@ def _resample_pcm16(data: bytes, from_rate: int, to_rate: int) -> bytes:
     count = max(1, int(round(samples.size * to_rate / from_rate)))
     positions = np.linspace(0, samples.size - 1, count)
     return np.interp(positions, np.arange(samples.size), samples).astype(np.int16).tobytes()
-
-
-def _get_api_key() -> str:
-    with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)["gemini_api_key"]
 
 
 def _load_system_prompt() -> str:
@@ -845,11 +834,10 @@ TOOL_DECLARATIONS = [
         "parameters": {
             "type": "OBJECT",
             "properties": {
-                "action": {"type": "STRING", "description": "wallpaper | wallpaper_url | organize | clean | list | stats | task"},
+                "action": {"type": "STRING", "description": "wallpaper | wallpaper_url | current_wallpaper | organize | clean | list | stats"},
                 "path":   {"type": "STRING", "description": "Image path for wallpaper"},
                 "url":    {"type": "STRING", "description": "Image URL for wallpaper_url"},
                 "mode":   {"type": "STRING", "description": "by_type or by_date for organize"},
-                "task":   {"type": "STRING", "description": "Natural language desktop task"},
             },
             "required": ["action"]
         }
@@ -1316,7 +1304,7 @@ class JarvisLive:
         self._learning_seen_turns: deque[tuple[int, float]] = deque(maxlen=50)
         self._learning_analysis_lock: asyncio.Lock | None = None
         self._learning = LearningEnglishController(event_sink=self._emit_learning_event)
-        self._learning_service = LearningEnglishService(api_key_loader=_get_api_key)
+        self._learning_service = LearningEnglishService(api_key_loader=get_gemini_key)
         self._learning_recordings = VoiceRecordings(BASE_DIR)
         self._turn_done_event: asyncio.Event | None = None
         self._dashboard     = None
@@ -1690,7 +1678,7 @@ class JarvisLive:
         snapshot["providers"] = [
             {
                 "id": "gemini-live", "label": "Gemini Live",
-                "state": "ready" if bool(_get_api_key()) else "missing",
+                "state": "ready" if bool(get_gemini_key()) else "missing",
                 "detail": "Motor de voz disponible" if selected_provider == "gemini" else "Disponible como alternativa",
             },
             {
@@ -1703,7 +1691,7 @@ class JarvisLive:
         snapshot["recordings"] = {"available": self._learning_recordings.available}
         snapshot["voiceProvider"] = selected_provider
         snapshot["voiceProviders"] = {
-            "gemini": bool(_get_api_key()),
+            "gemini": bool(get_gemini_key()),
             "openai": bool(get_openai_key()),
         }
         snapshot["openaiVoice"] = get_openai_voice()
@@ -2240,7 +2228,7 @@ class JarvisLive:
 
         # Load customization from config
         try:
-            _cfg = json.loads(open(API_CONFIG_PATH, encoding="utf-8").read())
+            _cfg = load_api_keys()
             self._asst_name = (_cfg.get("assistant_name") or "LUMINA").strip()
             _user_name = (_cfg.get("user_name") or "").strip()
         except Exception:
@@ -4048,10 +4036,10 @@ class JarvisLive:
         )
         try:
             from google import genai as _genai
-            client = _genai.Client(api_key=_get_api_key())
+            client = _genai.Client(api_key=get_gemini_key())
             resp   = await asyncio.to_thread(
                 client.models.generate_content,
-                model="gemini-flash-latest",
+                model=GEMINI_MODEL,
                 contents=prompt,
             )
             summary = (resp.text or "").strip()
@@ -4361,7 +4349,7 @@ class JarvisLive:
                     # A fresh client avoids stale HTTP session state on reconnect.
                     # Keep Gemini on its measured v1beta path.
                     client = genai.Client(
-                        api_key=_get_api_key(),
+                        api_key=get_gemini_key(),
                         http_options={"api_version": LIVE_API_VERSION},
                     )
                     session_cm = client.aio.live.connect(model=LIVE_MODEL, config=config)

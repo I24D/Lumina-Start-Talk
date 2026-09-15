@@ -1,15 +1,12 @@
 #web_search.py
-import json
 import re
-import sys
 import threading
 import time
 import xml.etree.ElementTree as ET
 from datetime import datetime
 from email.utils import parsedate_to_datetime
-from pathlib import Path
 
-from memory.config_manager import get_tavily_key
+from memory.config_manager import get_gemini_key, get_tavily_key
 
 
 def _searched_on() -> str:
@@ -97,20 +94,6 @@ def _run_bounded(fn, timeout: float, label: str = "task"):
         print(f"[WebSearch] {label} exceeded {timeout:.0f}s — moving on")
     return box[0]
 
-def _get_base_dir() -> Path:
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).parent
-    return Path(__file__).resolve().parent.parent
-
-
-BASE_DIR        = _get_base_dir()
-API_CONFIG_PATH = BASE_DIR / "config" / "api_keys.json"
-
-
-def _get_api_key() -> str:
-    with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)["gemini_api_key"]
-
 
 def _gemini_search(query: str) -> str:
     if not _gemini_available():
@@ -118,7 +101,7 @@ def _gemini_search(query: str) -> str:
 
     from google import genai
 
-    client = genai.Client(api_key=_get_api_key())
+    client = genai.Client(api_key=get_gemini_key())
     try:
         response = client.models.generate_content(
             model=_SEARCH_MODEL,

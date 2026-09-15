@@ -1,7 +1,5 @@
 #desktop.py
 import os
-import sys
-import json
 import shutil
 import subprocess
 import tempfile
@@ -9,25 +7,9 @@ import platform
 from pathlib import Path
 from datetime import datetime
 
-try:
-    import pyautogui
-    _PYAUTOGUI = True
-except ImportError:
-    _PYAUTOGUI = False
-
 _OS = platform.system()  # "Windows" | "Darwin" | "Linux"
 
 
-def _get_base_dir() -> Path:
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).parent
-    return Path(__file__).resolve().parent.parent
-
-def _get_api_key() -> str:
-    path = _get_base_dir() / "config" / "api_keys.json"
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)["gemini_api_key"]
-    
 def _get_desktop() -> Path:
     if _OS == "Linux":
         xdg = os.environ.get("XDG_DESKTOP_DIR", "")
@@ -35,121 +17,6 @@ def _get_desktop() -> Path:
             return Path(xdg)
     return Path.home() / "Desktop"
 
-def _build_sandbox() -> dict:
-    import time
-
-    safe_builtins = {
-        "print": print,
-        "len": len, "str": str, "int": int, "float": float,
-        "bool": bool, "list": list, "dict": dict, "tuple": tuple,
-        "range": range, "enumerate": enumerate, "sorted": sorted,
-        "isinstance": isinstance, "hasattr": hasattr, "getattr": getattr,
-        "max": max, "min": min, "sum": sum, "abs": abs,
-        "zip": zip, "map": map, "filter": filter,
-    }
-
-    sandbox = {
-        "__builtins__": safe_builtins,
-        "Path": Path,
-        "time": time,
-        "shutil": type("shutil", (), {
-            "copy2":      shutil.copy2,
-            "copytree":   shutil.copytree,
-            "disk_usage": shutil.disk_usage,
-        })(),
-        "os_path": os.path,  
-    }
-
-    if _PYAUTOGUI:
-        sandbox["pyautogui"] = pyautogui
-
-    if _OS == "Windows":
-        try:
-            import ctypes
-            import winreg
-            sandbox["ctypes"] = ctypes
-            sandbox["winreg"] = type("winreg", (), {
-                # Sadece okuma
-                "OpenKey":      winreg.OpenKey,
-                "QueryValueEx": winreg.QueryValueEx,
-                "HKEY_CURRENT_USER": winreg.HKEY_CURRENT_USER,
-            })()
-        except ImportError:
-            pass
-
-    return sandbox
-
-
-def _execute_generated_code(code: str, player=None) -> str:
-    if not code or code.strip() == "UNSAFE":
-        return "This action cannot be performed safely."
-
-    # Kod temizleme
-    if code.startswith("```"):
-        lines = code.split("\n")
-        code  = "\n".join(lines[1:-1]).strip()
-
-    sandbox      = _build_sandbox()
-    output_lines = []
-    sandbox["__builtins__"]["print"] = lambda *a: output_lines.append(" ".join(str(x) for x in a))
-
-    try:
-        exec(compile(code, "<jarvis_desktop>", "exec"), sandbox)
-        return "\n".join(output_lines) if output_lines else "Done."
-    except Exception as e:
-        print(f"[Desktop] Exec error: {e}\nCode:\n{code[:300]}")
-        return f"Execution error: {e}"
-
-
-def _ask_gemini_for_desktop_action(task: str) -> str:
-
-    from google import genai as _genai
-    _client = _genai.Client(api_key=_get_api_key())
-
-    desktop = str(_get_desktop())
-
-    os_specific = ""
-    if _OS == "Windows":
-        os_specific = "- ctypes (Windows API calls, read-only)\n- winreg (registry READ only)"
-    elif _OS == "Darwin":
-        os_specific = "- subprocess is NOT available; use pyautogui or Path only"
-    else:
-        os_specific = "- subprocess is NOT available; use pyautogui or Path only"
-
-    prompt = f"""You are a desktop automation assistant.
-Current OS: {_OS}
-Desktop path: {desktop}
-
-Generate safe Python code to accomplish the task below.
-Allowed modules ONLY:
-- pyautogui (mouse, keyboard — if needed)
-- pathlib.Path (file/folder inspection only, no deletion)
-- shutil.copy2, shutil.copytree, shutil.disk_usage (NO move, NO rmtree)
-- os_path (os.path equivalent, read-only)
-- time.sleep
-{os_specific}
-
-Hard rules:
-- NO file deletion (no unlink, no rmtree, no remove)
-- NO subprocess calls
-- NO exec() or eval() inside the code
-- NO import statements (modules are pre-injected)
-- NO file write operations except explicitly requested
-- If task cannot be done safely with these tools, output exactly: UNSAFE
-
-Output ONLY the Python code. No explanation, no markdown, no backticks.
-
-Task: {task}"""
-
-    try:
-        response = _client.models.generate_content(model="gemini-flash-latest", contents=prompt)
-        code = response.text.strip()
-        if code.startswith("```"):
-            lines = code.split("\n")
-            code  = "\n".join(lines[1:-1]).strip()
-        return code
-    except Exception as e:
-        return f"ERROR: {e}"
 
 def set_wallpaper(image_path: str) -> str:
     path = Path(image_path).expanduser().resolve()
@@ -240,7 +107,10 @@ def set_wallpaper_from_url(url: str) -> str:
         import urllib.request
         suffix = Path(url.split("?")[0]).suffix or ".jpg"
         tmp    = Path(tempfile.mktemp(suffix=suffix))
-        urllib.request.urlretrieve(url, str(tmp))
+        # urlretrieve takes no timeout: a server that stopped answering held the
+        # tool call open indefinitely.
+        with urllib.request.urlopen(url, timeout=30) as resp:
+            tmp.write_bytes(resp.read())
         result = set_wallpaper(str(tmp))
         try:
             tmp.unlink()
@@ -419,19 +289,20 @@ def desktop_control(
     """
     parameters:
         action : wallpaper | wallpaper_url | current_wallpaper |
-                 organize  | clean | list | stats |
-                 task (AI-powered)
+                 organize  | clean | list | stats
         path   : image path for 'wallpaper'
         url    : image URL for 'wallpaper_url'
         mode   : 'by_type' or 'by_date' for 'organize'
-        task   : natural language description for AI-powered actions
+
+    There is no free-form action on purpose. One used to have Gemini write Python
+    and run it with exec(): no sandbox inside this process can contain generated
+    code, and computer_control already does clicks and typing with fixed operations.
     """
     params = parameters or {}
     action = params.get("action", "").lower().strip()
-    task   = params.get("task", "").strip()
 
     if player:
-        player.write_log(f"[desktop] {action or task[:40]}")
+        player.write_log(f"[desktop] {action}")
 
     try:
         if action == "wallpaper":
@@ -457,23 +328,10 @@ def desktop_control(
         elif action == "stats":
             return get_desktop_stats()
 
-        elif action == "task" or task:
-            actual_task = task or params.get("description", "")
-            if not actual_task:
-                return "Please describe what you want to do on the desktop."
-
-            print(f"[Desktop] Asking Gemini: {actual_task}")
-            if player:
-                player.write_log("[Desktop] Generating action...")
-
-            code = _ask_gemini_for_desktop_action(actual_task)
-            return _execute_generated_code(code, player=player)
-
-        else:
-            if action:
-                code = _ask_gemini_for_desktop_action(action)
-                return _execute_generated_code(code, player=player)
-            return "No action or task specified."
+        return (
+            f"Unknown desktop action '{action}'. Available: wallpaper, wallpaper_url, "
+            "current_wallpaper, organize, clean, list, stats."
+        )
 
     except Exception as e:
         print(f"[Desktop] Error: {e}")

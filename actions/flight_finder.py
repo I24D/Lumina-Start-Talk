@@ -2,25 +2,11 @@
 import json
 import re
 import subprocess
-import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from config import is_windows, is_mac, is_linux
-
-def _get_base_dir() -> Path:
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).parent
-    return Path(__file__).resolve().parent.parent
-
-
-BASE_DIR        = _get_base_dir()
-API_CONFIG_PATH = BASE_DIR / "config" / "api_keys.json"
-
-
-def _get_api_key() -> str:
-    with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)["gemini_api_key"]
+from config import GEMINI_LITE_MODEL, GEMINI_MODEL, is_windows, is_mac
+from memory.config_manager import get_gemini_key
 
 # Month names in the two languages Lumina is spoken to in. Matching is done by
 # substring, so any name that contains a shorter one has to be tested first —
@@ -74,9 +60,9 @@ def _parse_date(raw: str) -> str:
 
     try:
         from google import genai as _genai
-        _client  = _genai.Client(api_key=_get_api_key())
+        _client  = _genai.Client(api_key=get_gemini_key())
         response = _client.models.generate_content(
-            model="gemini-flash-lite-latest",
+            model=GEMINI_LITE_MODEL,
             contents=(
                 f"Today is {today.strftime('%Y-%m-%d')}. "
                 f"Convert this date expression to YYYY-MM-DD: '{raw}'. "
@@ -129,7 +115,6 @@ def _build_google_flights_url(
     return (
         f"{base}"
         f"?q={trip}"
-        f"&tfs=CBwQAhoeEgoyMDI1LTAzLTE1agcIARIDSVNUcgcIARIDTEhS"   
         f"&curr=USD"
         f"&cabin={cabin_code}"
         f"&adults={passengers}"
@@ -168,7 +153,7 @@ def _parse_flights_with_gemini(
     from google import genai as _genai
     from google.genai import types
 
-    _client = _genai.Client(api_key=_get_api_key())
+    _client = _genai.Client(api_key=get_gemini_key())
     prompt  = (
         f"Extract flight options from {origin} to {destination} on {date} "
         f"from this Google Flights page text:\n\n{raw_text[:12000]}\n\n"
@@ -180,7 +165,7 @@ def _parse_flights_with_gemini(
 
     try:
         response = _client.models.generate_content(
-            model="gemini-flash-latest",
+            model=GEMINI_MODEL,
             contents=prompt,
             config=types.GenerateContentConfig(
                 system_instruction=(

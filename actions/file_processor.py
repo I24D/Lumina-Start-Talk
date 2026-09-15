@@ -16,28 +16,29 @@ Supported types:
   pptx    → summarize, extract_text, to_pdf
 """
 
-import os
 import re
 import json
 import shutil
 import subprocess
 import tempfile
 from pathlib import Path
-from datetime import datetime
 
-def _get_api_key() -> str:
-    config_path = Path(__file__).resolve().parent.parent / "config" / "api_keys.json"
-    with open(config_path, "r", encoding="utf-8") as f:
-        return json.load(f)["gemini_api_key"]
+from config import GEMINI_MODEL
+from memory.config_manager import get_gemini_key
+
+# Gemini accepts inline audio only in a request of up to 20 MB.
+_INLINE_LIMIT_BYTES = 20 * 1024 * 1024
+# The text, code and JSON handlers read the whole file into memory first.
+_TEXT_LIMIT_BYTES   = 50 * 1024 * 1024
 
 
 def _gemini_client():
     from google import genai
-    _c = genai.Client(api_key=_get_api_key())
+    _c = genai.Client(api_key=get_gemini_key())
 
     class _W:
         def generate_content(self, contents):
-            return _c.models.generate_content(model="gemini-flash-latest", contents=contents)
+            return _c.models.generate_content(model=GEMINI_MODEL, contents=contents)
 
     return _W()
 
@@ -529,6 +530,9 @@ def _process_audio(path: Path, action: str, params: dict, speak=None) -> str:
             return f"Info failed: {e}"
 
     if action == "transcribe":
+        if path.stat().st_size > _INLINE_LIMIT_BYTES:
+            return (f"{path.name} is {_file_size_str(path)}, and transcription sends the "
+                    "audio inline, which Gemini limits to 20 MB. Trim or compress it first.")
         try:
             model   = _gemini_client()
             content = path.read_bytes()
@@ -797,9 +801,16 @@ def file_processor(parameters: dict, player=None, speak=None) -> str:
     if player:
         player.write_log(log_msg)
 
+    if file_type in ("text", "code", "json", "xml") and path.stat().st_size > _TEXT_LIMIT_BYTES:
+        return (f"{path.name} is {_file_size_str(path)}, too large to read as text "
+                "(the limit is 50 MB).")
+
     if file_type == "unknown":
         try:
-            content = path.read_text(encoding="utf-8", errors="ignore")[:10000]
+            # Only a preview is sent. Reading the whole file first loaded a file
+            # of any size into memory to keep its first 10,000 characters.
+            with path.open(encoding="utf-8", errors="ignore") as f:
+                content = f.read(10000)
             model   = _gemini_client()
             prompt  = f"File: {path.name}\nContent preview:\n{content}\n\nTask: {action or instruction or 'Describe what this file contains and what can be done with it.'}"
             response = model.generate_content(prompt)

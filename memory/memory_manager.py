@@ -1,22 +1,16 @@
 import json
+import os
 import re
 from datetime import datetime, timezone
 from threading import Lock
-from pathlib import Path
-import sys
 
+from memory.config_manager import get_base_dir
 from memory.supabase_store import (
     SupabaseStoreError,
     document_hash,
     get_store,
     queue_upsert,
 )
-
-
-def get_base_dir() -> Path:
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).parent
-    return Path(__file__).resolve().parent.parent
 
 
 BASE_DIR         = get_base_dir()
@@ -87,13 +81,19 @@ def _read_local_memory() -> dict:
             return _empty_memory()
 
 
+def _replace_memory_file(memory: dict) -> None:
+    """Write beside the file and swap it in. Writing in place meant a crash or a
+    full disk mid-write left a truncated file, which loads as an empty memory and
+    is then saved over the old one."""
+    tmp = MEMORY_PATH.with_name(MEMORY_PATH.name + ".tmp")
+    tmp.write_text(json.dumps(memory, indent=2, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, MEMORY_PATH)
+
+
 def _write_local_memory(memory: dict) -> None:
     MEMORY_PATH.parent.mkdir(parents=True, exist_ok=True)
     with _lock:
-        MEMORY_PATH.write_text(
-            json.dumps(memory, indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
+        _replace_memory_file(memory)
 
 
 def _remote_is_newer(updated_at: str) -> bool:
@@ -555,10 +555,7 @@ def pop_last_session() -> dict | None:
                 return None
             entry = sessions.pop()          # remove the last entry
             memory["sessions"] = sessions
-            MEMORY_PATH.write_text(
-                json.dumps(memory, indent=2, ensure_ascii=False),
-                encoding="utf-8",
-            )
+            _replace_memory_file(memory)
             updated_memory = memory
         except Exception as e:
             print(f"[Memory] Session pop warning: {e}")

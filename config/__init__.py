@@ -1,8 +1,14 @@
 # config/__init__.py
-import json, os, platform
+import json, platform
 from pathlib import Path
 
 _CONFIG_PATH = Path(__file__).parent / "api_keys.json"
+
+# The Gemini models the tools call for text and images, named once so changing
+# one is a single edit. The Live voice model and web search's grounding model are
+# pinned where they are used, for the reasons given there.
+GEMINI_MODEL      = "gemini-flash-latest"
+GEMINI_LITE_MODEL = "gemini-flash-lite-latest"
 
 def _platform_os() -> str:
     """Auto-detect OS when config file is absent."""

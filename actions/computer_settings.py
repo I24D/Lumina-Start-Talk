@@ -1,7 +1,5 @@
 #computer_settings.py
-import json
 import re
-import sys
 import time
 import subprocess
 import platform
@@ -31,16 +29,6 @@ if _OS == "Windows":
 else:
     _WIN_HIDE: dict = {}
 
-
-def _get_base_dir() -> Path:
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).parent
-    return Path(__file__).resolve().parent.parent
-
-def _get_api_key() -> str:
-    path = _get_base_dir() / "config" / "api_keys.json"
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)["gemini_api_key"]
 
 def _get_macos_wifi_interface() -> str:
     try:
@@ -98,7 +86,6 @@ def volume_get() -> int | None:
     undoable — a wrong undo is worse than no undo."""
     try:
         if _OS == "Windows":
-            import math
             from ctypes import cast, POINTER
             from comtypes import CLSCTX_ALL
             from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
@@ -144,17 +131,34 @@ def brightness_get() -> int | None:
     return None
 
 
+# The current level, for the relative changes further down.
+_WMI_BRIGHTNESS = ("(Get-WmiObject -Namespace root/wmi -Class WmiMonitorBrightness)"
+                   ".CurrentBrightness")
+
+
+def _windows_set_brightness(level: str) -> None:
+    """Set the brightness to `level`, a PowerShell expression, through WMI.
+
+    WMI reaches only a panel Windows drives itself, like a laptop's. On an
+    external monitor the class is missing and PowerShell exits with an error.
+    That exit code used to be ignored, so she answered "Done" for a change that
+    never happened."""
+    result = subprocess.run(
+        ["powershell", "-Command",
+         "(Get-WmiObject -Namespace root/wmi -Class WmiMonitorBrightnessMethods)"
+         f".WmiSetBrightness(1, {level})"],
+        capture_output=True, timeout=5, **_WIN_HIDE
+    )
+    if result.returncode != 0:
+        raise RuntimeError("Windows cannot change the brightness of this display")
+
+
 def brightness_set(value: int) -> None:
     """Set brightness to an absolute percentage. Only used to restore a value
     captured before a change, so it is undo's counterpart to the up/down pair."""
     value = max(0, min(100, int(value)))
     if _OS == "Windows":
-        subprocess.run(
-            ["powershell", "-Command",
-             "(Get-WmiObject -Namespace root/wmi -Class WmiMonitorBrightnessMethods)"
-             f".WmiSetBrightness(1, {value})"],
-            capture_output=True, timeout=5, **_WIN_HIDE
-        )
+        _windows_set_brightness(str(value))
     elif _OS == "Linux":
         subprocess.run(["brightnessctl", "set", f"{value}%"], capture_output=True)
 
@@ -204,16 +208,7 @@ def brightness_up():
                 shell=True, capture_output=True
             )
     else:
-        try:
-            subprocess.run(
-                ["powershell", "-Command",
-                 "(Get-WmiObject -Namespace root/wmi -Class WmiMonitorBrightnessMethods)"
-                 ".WmiSetBrightness(1, [math]::Min(100, "
-                 "(Get-WmiObject -Namespace root/wmi -Class WmiMonitorBrightness).CurrentBrightness + 10))"],
-                capture_output=True, timeout=5, **_WIN_HIDE
-            )
-        except Exception as e:
-            print(f"[Settings] Brightness up failed on Windows: {e}")
+        _windows_set_brightness(f"[math]::Min(100, {_WMI_BRIGHTNESS} + 10)")
 
 def brightness_down():
     if _OS == "Darwin":
@@ -233,16 +228,7 @@ def brightness_down():
                 shell=True, capture_output=True
             )
     else:
-        try:
-            subprocess.run(
-                ["powershell", "-Command",
-                 "(Get-WmiObject -Namespace root/wmi -Class WmiMonitorBrightnessMethods)"
-                 ".WmiSetBrightness(1, [math]::Max(0, "
-                 "(Get-WmiObject -Namespace root/wmi -Class WmiMonitorBrightness).CurrentBrightness - 10))"],
-                capture_output=True, timeout=5, **_WIN_HIDE
-            )
-        except Exception as e:
-            print(f"[Settings] Brightness down failed on Windows: {e}")
+        _windows_set_brightness(f"[math]::Max(0, {_WMI_BRIGHTNESS} - 10)")
 
 def close_app():
     if _OS == "Darwin": pyautogui.hotkey("command", "q")

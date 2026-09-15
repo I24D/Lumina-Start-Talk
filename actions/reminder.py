@@ -1,22 +1,16 @@
 import json
-import os
 import platform
 import shutil
 import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
+from xml.sax.saxutils import escape as _xml_escape
 
 _CNW: dict = (
     {"creationflags": subprocess.CREATE_NO_WINDOW}
     if platform.system() == "Windows" else {}
 )
-
-def _base_dir() -> Path:
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).parent
-    return Path(__file__).resolve().parent.parent
-
 
 def _get_os() -> str:
     _sys = platform.system()
@@ -151,6 +145,8 @@ def _schedule_windows(target_dt: datetime, task_name: str,
         python_exe = pythonw
 
     xml_path = _scripts_dir() / f"{task_name}.xml"
+    # The paths are escaped: a folder name with "&" or "<" in it made the XML
+    # invalid, and schtasks refused to register the reminder.
     xml_content = (
         '<?xml version="1.0" encoding="UTF-16"?>\n'
         '<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">\n'
@@ -160,8 +156,8 @@ def _schedule_windows(target_dt: datetime, task_name: str,
         '    <Enabled>true</Enabled>\n'
         '  </TimeTrigger></Triggers>\n'
         '  <Actions><Exec>\n'
-        f'    <Command>{python_exe}</Command>\n'
-        f'    <Arguments>"{script_path}"</Arguments>\n'
+        f'    <Command>{_xml_escape(str(python_exe))}</Command>\n'
+        f'    <Arguments>"{_xml_escape(str(script_path))}"</Arguments>\n'
         '  </Exec></Actions>\n'
         '  <Settings>\n'
         '    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\n'
@@ -215,8 +211,8 @@ def _schedule_mac(target_dt: datetime, task_name: str,
   <key>Label</key>             <string>{label}</string>
   <key>ProgramArguments</key>
   <array>
-    <string>{sys.executable}</string>
-    <string>{script_path}</string>
+    <string>{_xml_escape(sys.executable)}</string>
+    <string>{_xml_escape(str(script_path))}</string>
   </array>
   <key>StartCalendarInterval</key>
   <dict>

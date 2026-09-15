@@ -9,7 +9,7 @@ import threading
 from pathlib import Path
 from datetime import datetime
 
-from config import get_os, is_windows, is_mac, is_linux
+from config import is_windows, is_mac, is_linux
 
 _CNW: dict = (
     {"creationflags": subprocess.CREATE_NO_WINDOW}

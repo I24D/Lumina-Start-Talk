@@ -3,7 +3,7 @@ dashboard/server.py — JARVIS Local HTTP Dashboard
 
 Plain HTTP on port 8000 (no SSL warnings, no firewall issues).
 Security at the application layer: AES-256-CBC with session-key-derived key.
-CryptoJS is auto-downloaded once and served locally — no CDN needed after that.
+CryptoJS ships in static/ and is served from there.
 
 Install deps:  pip install fastapi "uvicorn[standard]" cryptography
 """
@@ -69,14 +69,6 @@ def _make_uploads_dir() -> Path:
 
 UPLOADS_DIR = _make_uploads_dir()
 
-def _get_gemini_key() -> str | None:
-    try:
-        import json as _json
-        with open(BASE_DIR / "config" / "api_keys.json", "r", encoding="utf-8") as f:
-            return _json.load(f).get("gemini_api_key")
-    except Exception:
-        return None
-
 _KEY_CHARS = [c for c in (string.ascii_uppercase + string.digits)
               if c not in ('O', 'I', 'L', '0', '1')]
 
@@ -101,9 +93,10 @@ def _decrypt_cbc(aes_key: bytes, enc_b64: str) -> str:
     return (unpadder.update(padded) + unpadder.finalize()).decode('utf-8')
 
 
-# ── CryptoJS (auto-download once, served locally) ─────────────────────────────
-_CRYPTOJS_CDN  = ("https://cdnjs.cloudflare.com/ajax/libs/"
-                  "crypto-js/4.2.0/crypto-js.min.js")
+# ── CryptoJS ─────────────────────────────────────────────────────────────────
+# Committed in static/ and served only from there. It used to be downloaded from a
+# CDN when missing, and the browser sent to the CDN as a fallback, both with no
+# integrity check: the dashboard's encryption would have run whatever came back.
 _CRYPTOJS_FILE = STATIC_DIR / "crypto-js.min.js"
 
 
@@ -318,22 +311,6 @@ def _ensure_network_access(port: int) -> None:
         pass  # no iptables means firewall is probably off — nothing to do
 
 
-def _ensure_crypto_js() -> None:
-    if _CRYPTOJS_FILE.exists():
-        return
-    try:
-        import urllib.request
-        print("[Dashboard] Downloading CryptoJS (one-time setup)…")
-        urllib.request.urlretrieve(_CRYPTOJS_CDN, str(_CRYPTOJS_FILE))
-        print("[Dashboard] CryptoJS cached — will serve locally from now on.")
-    except Exception as e:
-        print(f"[Dashboard] CryptoJS download failed: {e}")
-        print(f"[Dashboard] Encryption will fall back to CDN load on client.")
-
-
-_ensure_crypto_js()
-
-
 # ── helpers ───────────────────────────────────────────────────────────────────
 
 def _local_ip() -> str:
@@ -464,6 +441,13 @@ def _read(name: str) -> str:
 
 # ── DashboardServer ───────────────────────────────────────────────────────────
 
+# A pairing key is only six characters, and nothing stopped a device on the
+# network from trying keys as fast as the server answered. After this many wrong
+# keys an address waits out the lockout, a correct key included.
+_LOGIN_ATTEMPTS  = 10
+_LOGIN_LOCKOUT_S = 300
+
+
 class DashboardServer:
 
     def __init__(self):
@@ -490,6 +474,7 @@ class DashboardServer:
         self._main_server                 = None
         self._loopback_server             = None
         self._pending_keys: dict[str, float] = {}
+        self._failed_logins: dict[str, list[float]] = {}  # address → failure times
         self._device_sessions: dict[str, dict] = {}  # device_token → {session_key}
         self._phone_audio_queue: asyncio.Queue    = asyncio.Queue(maxsize=200)
         self._uploads_dir                 = UPLOADS_DIR
@@ -614,20 +599,28 @@ class DashboardServer:
             tok = req.headers.get("authorization", "").removeprefix("Bearer ").strip()
             return bool(tok) and tok in self._tokens
 
+        def _locked_out(req: Request) -> bool:
+            address = req.client.host if req.client else ""
+            now     = time.time()
+            recent  = [t for t in self._failed_logins.get(address, [])
+                       if now - t < _LOGIN_LOCKOUT_S]
+            self._failed_logins[address] = recent
+            return len(recent) >= _LOGIN_ATTEMPTS
+
+        def _login_failed(req: Request) -> None:
+            address = req.client.host if req.client else ""
+            self._failed_logins.setdefault(address, []).append(time.time())
+
         async def _invoke(callback, *args):
             if callback is None:
                 raise RuntimeError("Learning English is not available yet")
             result = callback(*args)
             return await result if inspect.isawaitable(result) else result
 
-        # serve CryptoJS from local cache, fallback to CDN redirect
         @app.get("/static/crypto.js")
         async def serve_crypto():
-            if _CRYPTOJS_FILE.exists():
-                return FileResponse(str(_CRYPTOJS_FILE),
-                                    media_type="application/javascript")
-            from fastapi.responses import RedirectResponse
-            return RedirectResponse(_CRYPTOJS_CDN)
+            return FileResponse(str(_CRYPTOJS_FILE),
+                                media_type="application/javascript")
 
         @app.get("/static/learning-english.css")
         async def learning_css():
@@ -669,6 +662,9 @@ class DashboardServer:
 
         @app.post("/login")
         async def login(req: Request):
+            if _locked_out(req):
+                return JSONResponse({"ok": False, "error": "Too many attempts. Try again in a few minutes."},
+                                    status_code=429)
             body    = await req.json()
             entered = str(body.get("pin", "")).strip().upper()
             now     = time.time()
@@ -685,14 +681,18 @@ class DashboardServer:
                 ))
                 # Bearer token in response body — no cookies needed (works on any browser/HTTP)
                 return JSONResponse({"ok": True, "token": tok})
+            _login_failed(req)
             return JSONResponse({"ok": False, "error": "Invalid or expired key"},
                                 status_code=401)
 
         @app.get("/auto-login")
-        async def auto_login(key: str = "", next: str = "/"):
+        async def auto_login(req: Request, key: str = "", next: str = "/"):
             """QR code target — validates one-time key, creates session, redirects phone."""
             now = time.time()
-            if not key or key not in self._pending_keys or self._pending_keys[key] <= now:
+            locked = _locked_out(req)
+            if locked or not key or key not in self._pending_keys or self._pending_keys[key] <= now:
+                if not locked:
+                    _login_failed(req)
                 return HTMLResponse("""<!DOCTYPE html>
 <html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width">
 <style>

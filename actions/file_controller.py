@@ -94,14 +94,30 @@ _SAFE_ROOTS: list[Path] = [
     Path.home(),
 ]
 
+# Entries of the home folder that hold keys and tokens rather than the user's
+# files: SSH, GPG and cloud credentials, git and package-registry tokens, the
+# logins of the AI tools on this PC, and the browsers' saved passwords and cookies
+# inside AppData. No spoken request needs them, and a misheard one must not
+# reach them.
+_PROTECTED_HOME_ENTRIES = {
+    ".ssh", ".gnupg", ".aws", ".azure", ".kube", ".docker", ".config",
+    ".git-credentials", ".netrc", ".npmrc", ".pypirc",
+    ".claude", ".codex", ".openclaw", "appdata",
+}
+
 def _is_safe_path(target: Path) -> bool:
-    """Is the given path inside _SAFE_ROOTS? If not, refuse the operation."""
+    """Is the given path inside _SAFE_ROOTS and outside the protected entries?
+    If not, refuse the operation."""
     try:
         resolved = target.resolve()
-        return any(
-            resolved == root.resolve() or resolved.is_relative_to(root.resolve())
-            for root in _SAFE_ROOTS
-        )
+        for root in _SAFE_ROOTS:
+            root = root.resolve()
+            if resolved == root:
+                return True
+            if resolved.is_relative_to(root):
+                top = resolved.relative_to(root).parts[0].casefold()
+                return top not in _PROTECTED_HOME_ENTRIES
+        return False
     except Exception:
         return False
 

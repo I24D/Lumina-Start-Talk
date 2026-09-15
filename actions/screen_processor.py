@@ -4,7 +4,6 @@ import io
 import json
 import os
 import platform
-import sys
 from pathlib import Path
 
 import numpy as np
@@ -28,13 +27,9 @@ try:
 except ImportError:
     _PIL = False
 
-def _base_dir() -> Path:
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).parent
-    return Path(__file__).resolve().parent.parent
+from memory.config_manager import get_base_dir
 
-
-_BASE        = _base_dir()
+_BASE        = get_base_dir()
 _CONFIG_PATH = _BASE / "config" / "api_keys.json"
 
 
