@@ -7,7 +7,7 @@
 [![Licence: CC BY-NC 4.0](https://img.shields.io/badge/licence-CC%20BY--NC%204.0-lightgrey?style=flat-square)](LICENSE)
 [![Contributions welcome](https://img.shields.io/badge/contributions-welcome-brightgreen?style=flat-square)](CONTRIBUTING.md)
 
-A real-time voice AI that can hear, see, understand, and control your computer — on any OS. Supports Windows, macOS, and Linux. Built on the Gemini Live API for native audio streaming, delivering zero subscriptions and total digital autonomy.
+A real-time voice AI that can hear, see, understand and control your computer. It talks through **Gemini 3.1 Flash Live** or **OpenAI Realtime** (`gpt-realtime-2.1`), whichever you choose, and runs on Windows, macOS and Linux; the bridges to other desktop apps (Copilot, ChatGPT, Phone Link) are Windows-only.
 
 ---
 
@@ -44,9 +44,20 @@ Lumina Start Talk is a modified version of **[MARK LII](https://github.com/Fatih
 created by **[FatihMakes](https://github.com/FatihMakes)** and released under
 **[CC BY-NC 4.0](LICENSE)**. Full credit for the original engine goes to them.
 
-**Changes made in this fork:** renamed and re-themed as Lumina Start Talk, Spanish-first
-assistant configuration, and a new `phone_notifications` plugin that reads and clears the
-notifications mirrored from the phone through Windows Phone Link (Enlace Móvil).
+**Changes made in this fork** (the commit history has the full record):
+
+- Renamed and re-themed as Lumina Start Talk, spoken to in Spanish and English.
+- A second voice engine, OpenAI Realtime, beside Gemini, with local echo cancellation so the
+  microphone can stay open on speakers; the Gemini voice moved to 3.1 Flash Live.
+- Bridges to Microsoft Copilot, the ChatGPT desktop app and OpenClaw, and a reader and writer
+  for the Codex and Claude Code chats in VS Code.
+- A `phone_notifications` plugin that reads and clears the notifications mirrored from the
+  phone through Windows Phone Link (Enlace Móvil).
+- Learning English, a browser studio that teaches English from zero to C2.
+- Copilot-style Live Vision for a window, the whole screen or the camera.
+- Supabase-backed memory and conversation history, Tavily search and an API KEYS panel.
+- Reliability work on the live voice session, with the measurements behind it in `AGENTS.md`
+  and `VOICE-BUG.md`.
 
 The CC BY-NC licence carries over to this project: **use it freely, but not commercially**, and
 keep the attribution to FatihMakes if you build on it.
@@ -55,9 +66,9 @@ keep the attribution to FatihMakes if you build on it.
 
 ## ✨ Overview
 
-LUMINA is a personal assistant that becomes *yours*. Pick the voice it speaks with, tune the colour of the whole HUD, and watch it power on with a boot chime and a swelling animation like a machine coming to life. The interface breathes with you too — the waveform and core pulse to your **real** voice while you speak and to LUMINA's own voice while it answers.
+LUMINA is a personal assistant that becomes *yours*. Pick the engine and the voice it speaks with, and tune the colour of the whole HUD. The interface breathes with you too — the waveform and core pulse to your **real** voice while you speak and to LUMINA's own voice while it answers.
 
-It combines a plugin engine you can extend without touching the core, native audio that hears the emotion in your voice, and long-running conversations.
+It combines a plugin engine you can extend without touching the core, two real-time voice engines, and conversations that can run for hours.
 
 It's not just an assistant — it's an extension of your digital life.
 
@@ -68,8 +79,9 @@ It's not just an assistant — it's an extension of your digital life.
 ### Core Features
 | Feature | Description |
 |---|---|
-| 🎓 Learning English | Browser studio for children, teens and adults, from zero English to C2: Gemini Live voice lessons, placement test, CEFR route, scenarios, guided reading, corrections and FSRS reviews |
-| 🎙️ Voice Picker | Choose from 5 native Gemini voices and switch live from the UI — no restart |
+| 🎓 Learning English | Browser studio for children, teens and adults, from zero English to C2: live voice lessons on Gemini or OpenAI, placement test, CEFR route, scenarios, guided reading, corrections and FSRS reviews |
+| 🎙️ Voice Engines | Gemini 3.1 Flash Live with 5 voices or OpenAI Realtime with 10, chosen and switched live from the UI — no restart |
+| 🔇 Echo Cancellation | On OpenAI Realtime, WebRTC's echo canceller runs locally, so the microphone stays open while she speaks and you can talk over her |
 | 🎨 Live Theming | Recolour the entire HUD from a hue wheel or hex — applied instantly across every panel |
 | 〰️ Reactive HUD | Waveform and reactor core pulse to real audio — your mic while listening, LUMINA while speaking |
 | 🧠 Recallable Memory | No size limit and nothing silently forgotten — the prompt carries what fits, the rest is looked up on demand from a local search |
@@ -79,12 +91,14 @@ It's not just an assistant — it's an extension of your digital life.
 | 🎧 Audio Device Picker | Choose the microphone and speakers by name, filtered to the short list your OS shows — and measured, so every entry actually works |
 | 🔗 Session Continuity | A dropped connection, a voice change or a device change no longer wipes the conversation |
 | 🧩 Plugin System | Drop a single `.py` file into `plugins/` — LUMINA learns a new skill on next launch |
-| 🎙️ Real-time Voice | Ultra-low latency conversation in any language via Gemini Live API |
-| 💓 Affective Dialog | Hears the emotion in your voice and adapts its tone in response |
-| 🤫 Proactive Audio | Knows when you're not talking to it — background chatter never triggers a reply |
+| 🎙️ Real-time Voice | Conversation in any language; on Gemini 3.1 your words come back as text about 1.6 s after you stop speaking |
+| 🗣️ Wake Phrase | “Lumina, despierta” or “Lumina activate” brings back an assistant that has stopped answering |
 | ♾️ Unlimited Sessions | Sliding-window context compression — one conversation can last for hours |
 | 🖥️ System Control | Launch apps, adjust volume/brightness, WiFi, shortcuts, power — all by voice |
-| 🧩 Autonomous Tasks | High-level planning for complex multi-step goals via agent mode |
+| 🏗️ Dev Agent | Builds a multi-file project from a description: plans it, writes the files, installs dependencies, opens VS Code, runs it and fixes errors |
+| 🤝 Assistant Bridges | Asks Microsoft Copilot, the ChatGPT desktop app or OpenClaw for you and reads the answer out loud, in full up to 2,000 words |
+| 🧑‍💻 Codex & Claude Code | Reads and writes the Codex and Claude Code chats in VS Code, and tells you when they finish a task |
+| 📱 Phone Notifications | Reads and clears the notifications your phone mirrors through Windows Phone Link |
 | 👁️ Live Vision | Copilot-style screen sharing and camera vision in the main voice session, with visible source icons, status and STOP control |
 | 🧠 Persistent Memory | Deeply remembers projects, preferences, and personal context across sessions |
 | ⌨️ Hybrid Input | Seamlessly switch between keyboard typing and voice commands |
@@ -95,7 +109,7 @@ It's not just an assistant — it's an extension of your digital life.
 | 📊 Hardware Monitoring | Continuous CPU, RAM, GPU and temperature telemetry with localized voice alerts |
 | 🌤️ Weather Report | Live weather data for your city, personalized from memory |
 | 🗺️ Dynamic Content Panel | Scrollable display layer beneath the HUD that renders web results, news, and search data |
-| 🔍 Multi-Mode Web Search | `news` / `research` / `price` / `compare` / `search` — Gemini Grounded first, DDG fallback |
+| 🔍 Multi-Mode Web Search | `news` / `research` / `price` / `compare` / `search` — Gemini grounded search, then Tavily, then DuckDuckGo; news leads with Google News |
 | ⏰ Smart Reminders | OS-native scheduled notifications (Windows Task Scheduler / macOS LaunchAgent / Linux systemd) |
 | ✈️ Flight Finder | Live flight price and availability lookup |
 | 🎮 Game Updater | Checks and triggers game updates on Steam and Epic Games on demand |
@@ -104,7 +118,7 @@ It's not just an assistant — it's an extension of your digital life.
 | 🌐 Browser Control | Open URLs, navigate tabs, and interact with the browser by voice |
 | 📨 Send Message | Compose and send messages through WhatsApp, Telegram, and more |
 | 🎬 YouTube Control | Search, play, and control YouTube playback by voice |
-| 🖱️ Desktop Control | Taskbar, window management, and desktop-level operations |
+| 🖱️ Desktop Control | Wallpaper, and organising, cleaning, listing and measuring the desktop |
 | 🧑‍💻 Silent Language Memory | Detects spoken language on first use — all future sessions adapt automatically |
 | 📱 Remote Dashboard | Control the assistant from your phone via QR code pairing |
 | ⚡ Auto-Start on Boot | Registers with the OS startup system (registry / LaunchAgent / .desktop) |
@@ -117,8 +131,12 @@ It's not just an assistant — it's an extension of your digital life.
 
 LUMINA is designed to feel like *your own* machine, with portable behavior and no assumptions about your language or operating system.
 
-### 🎙️ Voice Picker — Give LUMINA the Voice You Want
-LUMINA is not stuck with one voice. Open **⚙ Customise Assistant** and choose between five native Gemini voices — **Charon, Puck, Kore, Fenrir, Aoede** — each with its own character. The switch is live: the session rebuilds itself the instant you apply, so the new voice takes over without you restarting anything, and session resumption keeps your conversation going. The voice names are language-neutral, so the picker reads the same in every locale.
+### 🎙️ Two voice engines — and the voice you want
+Open **⚙ Customise Assistant** and pick the engine and its voice. **Gemini Live** runs on `gemini-3.1-flash-live-preview` with five voices — **Charon, Puck, Kore, Fenrir, Aoede**. **OpenAI Realtime** runs `gpt-realtime-2.1` with ten, **Shimmer** (shown as *Sol*) by default, and needs an OpenAI key in **API KEYS**. The switch is live: the session rebuilds itself the instant you apply, without restarting anything.
+
+The Gemini engine moved from 2.5 native audio to 3.1 Flash Live after both were measured with the same recorded question, streamed straight into each model: 3.1 returned the words 1.6 s after the speech ended and began answering at 1.7 s, where 2.5 took 12–14 s and 15–16 s. Neither Gemini model streams words while you are still speaking; the sentence appears when you stop.
+
+OpenAI's voice travels over a WebSocket, with WebRTC's echo canceller running on this PC through the `livekit` package — no LiveKit server or account. Each answer starts with the microphone closed, and it opens once the canceller has shown it removes her voice, so on speakers you can talk over her. On Gemini the microphone closes while she speaks.
 
 ### 🎨 Live Theming — Recolour the Entire Interface
 LUMINA starts with a red visual identity inspired by its mascot. Drag the hue wheel (or type an exact hex code) to re-theme the HUD in real time, or use **Night Mode** in the controls drawer for black surfaces with restrained accent lighting. Your choice is saved and restored on the next launch.
@@ -126,9 +144,7 @@ LUMINA starts with a red visual identity inspired by its mascot. Drag the hue wh
 ### 〰️ Reactive HUD — The Interface Breathes With the Room
 The waveform and the core respond to **real audio**, not a random animation. While LUMINA listens, they pulse to your microphone; while LUMINA speaks, they pulse to its own voice — louder speech, taller bars and a brighter, wider core. When the room goes quiet, everything settles back into a gentle idle ripple.
 
-Every launch now opens with a proper boot: a ~2.4-second cinematic **transform** sound — a reactor spinning up, servos locking into place, and a bright chord confirming "online" — plays as the HUD swells up from a dim point, rings spin up, and a bright pulse sweeps outward. It's synthesized entirely in code (no sound file to ship, identical on Windows, macOS and Linux), and you can turn it on or off any time from the **🔊 BOOT SOUND** toggle in the ⚙ controls. If a machine has no audio output, it simply stays silent — never an error.
-
-The **🧩 Plugin System**, **💓 Affective Dialog**, **🤫 Proactive Audio**, and **♾️ Unlimited Sessions** work together as LUMINA's foundation.
+The **🧩 Plugin System** and **♾️ Unlimited Sessions** work together as LUMINA's foundation.
 
 ---
 
@@ -136,7 +152,7 @@ The **🧩 Plugin System**, **💓 Affective Dialog**, **🤫 Proactive Audio**,
 
 These improvements form one reliable base across supported operating systems.
 
-No new dependencies. No bundled asset files. No hardcoded language, and nothing that assumes one operating system.
+No hardcoded language, and nothing in the core that assumes one operating system.
 
 ### 🎓 Learning English — a separate teaching workspace
 
@@ -144,11 +160,14 @@ Open **⚙ Controls → 🎓 Learning English** to launch **English Learning Stu
 in the browser, or say “Lumina, quiero aprender inglés”, “Enséñame inglés”,
 “Teach me English” or “Let's practice English”.
 
-The class runs its own Gemini Live session inside the studio page, on
-`gemini-3.1-flash-live-preview`: the browser's microphone with echo
-cancellation, the tutor's own voice, and no tools. Lumina's server only mints a
-single-use ephemeral token — model, teacher prompt, voice and transcription are
-locked inside it, and the API key never reaches the browser. While a class is
+The class runs its own live voice session inside the studio page, on the engine
+chosen under **Motor de voz**: Gemini on `gemini-3.1-flash-live-preview`, or
+OpenAI `gpt-realtime-2.1` over WebRTC. Either way it uses the browser's microphone
+with echo cancellation, the tutor's own voice and no tools, and the API key never
+reaches the browser. For Gemini, Lumina's server mints a single-use ephemeral
+token with the model, teacher prompt, voice and transcription locked inside it;
+for OpenAI, the browser's WebRTC offer goes through Lumina's server, which holds
+the key. While a class is
 open, Lumina's general assistant keeps its tools but pauses its microphone and
 voice. Each finished student turn is analysed into validated structured
 corrections, vocabulary and progress.
@@ -257,8 +276,8 @@ pattern as Copilot Vision:
    can see, while the border and controls are excluded from the model's frames.
 3. A compact always-on-top bar keeps the source, truthful microphone state,
    **PAUSE / RESUME**, and **STOP** available even when Lumina is covered.
-4. Keep talking normally. Fresh frames enter the existing Gemini Live voice
-   session, so follow-up questions refer to what is visible now. Ask “show me
+4. Keep talking normally. Fresh frames enter the live voice session, on either
+   engine, so follow-up questions refer to what is visible now. Ask “show me
    where” and Lumina can place a temporary pointer on the shared source without
    clicking or controlling the computer.
 
@@ -382,13 +401,25 @@ It is held in memory only, deliberately: writing it to disk would make a fresh l
 
 ## ⚡ Quick Start
 
-```bash
-cd "Lumina Start talk"
-pip install -r requirements.txt
-python main.py
+On Windows, from the project folder:
+
+```powershell
+py -3 -m venv .venv
+.venv\Scripts\python.exe setup.py   # installs requirements.txt and Playwright's browsers
 ```
 
-> ⚠️ **Installation Note:** Some OS-specific dependencies are not bundled in `requirements.txt` to keep the repo lightweight. If you hit a `ModuleNotFoundError`, install the missing package with `pip install <module_name>`.
+Then start it with **Abrir LUMINA.bat**, or with `.venv\Scripts\python.exe main.py` to see its
+console output. On macOS or Linux:
+
+```bash
+python3 -m venv .venv
+.venv/bin/python setup.py
+.venv/bin/python main.py
+```
+
+The first launch asks for a Gemini API key. OpenAI, for its Realtime voice, and Tavily, for search,
+are optional and go in **⚙ → API KEYS**. `requirements-lock.txt` pins the exact versions Lumina is
+developed on (Windows 11, Python 3.14), if you want that environment instead.
 
 ---
 
@@ -396,23 +427,32 @@ python main.py
 
 | Requirement | Details |
 | --- | --- |
-| **OS** | Windows 10/11, macOS, or Linux |
-| **Python** | 3.11 or 3.12 |
+| **OS** | Windows 10/11, macOS or Linux — the Copilot, ChatGPT and Phone Link bridges are Windows-only |
+| **Python** | 3.11 or newer (developed on 3.14) |
 | **Microphone** | Required for voice interaction |
 | **Speakers** | Required for voice replies |
-| **API Key** | Free Gemini API key (`config/api_keys.json`) |
+| **API keys** | Gemini (required); OpenAI (optional, for its Realtime voice); Tavily (optional, for search) |
 
 ---
 
 ## 🗂️ Project Structure
 
 ```
-Lumina Start talk/
-├── main.py                   # Core loop — Gemini Live session, audio I/O, live audio levels, tool dispatch
+Lumina Start Talk/
+├── main.py                   # Core loop — live voice session (Gemini or OpenAI), audio I/O, live audio levels, tool dispatch
 ├── ui.py                     # PyQt6 HUD — waveform, Live Vision controls/consent, log, camera preview
-├── setup.py                  # First-run configuration wizard
+├── setup.py                  # Installs requirements.txt and Playwright's browsers
+├── Abrir LUMINA.bat          # Windows launcher — checks for .venv, then starts Lumina without a console
+├── requirements.txt          # Dependencies; requirements-lock.txt pins the versions it is developed on
+├── AGENTS.md                 # Rules for changing the voice path, with the measurements behind them
 ├── plugins/
-│   └── _template.py          # Copy this to write a new plugin — one file, drop in, done
+│   ├── _template.py          # Copy this to write a new plugin — one file, drop in, done
+│   ├── copilot_bridge.py     # Microsoft Copilot desktop app — asks, then reads the answer aloud when it arrives
+│   ├── chatgpt_bridge.py     # ChatGPT desktop app — asks, reads answers, starts new chats
+│   ├── openclaw_bridge.py    # OpenClaw gateway over a persistent WebSocket, with a CLI fallback
+│   ├── developer_chat_reader.py # Codex and Claude Code chats in VS Code — reads, writes, announces finished work
+│   ├── phone_notifications.py   # Phone Link notifications — reads and clears them
+│   └── _spoken_answer.py     # Relayed answers read in full up to 2,000 words, summarised past that
 ├── actions/
 │   ├── web_search.py         # Gemini → Tavily → DDG fallback chain (research, price, compare); news: Google News → Tavily → DDG → Gemini
 │   ├── screen_processor.py   # Compressed screen & webcam capture used by Live Vision
@@ -424,7 +464,7 @@ Lumina Start talk/
 │   ├── computer_control.py   # Keyboard shortcuts, mouse, window management
 │   ├── open_app.py           # Application launcher
 │   ├── browser_control.py    # Web browser control
-│   ├── file_controller.py    # File system operations
+│   ├── file_controller.py    # File system operations, kept out of credential folders
 │   ├── file_processor.py     # Document reading and summarization
 │   ├── send_message.py       # Messaging integration
 │   ├── weather_report.py     # Live weather data
@@ -432,22 +472,28 @@ Lumina Start talk/
 │   ├── youtube_video.py      # YouTube playback control
 │   ├── game_updater.py       # Game update management (Steam / Epic)
 │   ├── code_helper.py        # Code review and generation
-│   ├── dev_agent.py          # Developer task agent
-│   └── desktop.py            # Desktop and taskbar control
-├── memory/
-│   ├── memory_manager.py     # Offline-first memory, recall, sessions, and remote reconciliation
-│   ├── supabase_store.py     # Private Supabase JSONB persistence through PostgREST
-│   ├── supabase_schema.sql   # Idempotent table, RLS policy, and least-privilege grants
-│   ├── config_manager.py     # api_keys.json access — key, OS, name, voice, colour, plugin toggles
-│   └── long_term.json        # Persistent store: identity, preferences, projects, sessions, monitors
+│   ├── dev_agent.py          # Builds multi-file projects: plan, write, run, fix
+│   └── desktop.py            # Wallpaper and desktop organising
 ├── core/
 │   ├── prompt.txt            # Assistant personality and tool-routing rules
+│   ├── openai_realtime.py    # OpenAI Realtime session over WebSocket, and the browser tutor's WebRTC call
+│   ├── echo_canceller.py     # Local WebRTC echo cancellation for the OpenAI voice
 │   ├── plugin_loader.py      # Plugin engine — discovery, validation, crash isolation
 │   ├── undo.py               # One shared undo stack — actions register how to reverse themselves
 │   ├── confirm.py            # Irreversible-action gate — the token is issued by the UI, not the model
 │   └── audio_devices.py      # Microphone / speaker list — filtered, measured, resolved by name
+├── memory/
+│   ├── memory_manager.py     # Offline-first memory, recall, sessions, and remote reconciliation
+│   ├── conversation_log.py   # Conversation turns kept in Supabase for recall
+│   ├── supabase_store.py     # Private Supabase JSONB persistence through PostgREST
+│   ├── supabase_schema.sql   # Idempotent tables, RLS policies, and least-privilege grants
+│   ├── config_manager.py     # api_keys.json access — keys, voice engine and voices, name, colour, plugin toggles
+│   └── long_term.json        # Created at runtime: identity, preferences, projects, sessions, monitors
+├── learning_english/         # English Learning Studio — course, tutor services, local LanguageTool and OpenPronounce
+├── dashboard/                # Phone dashboard with QR pairing, and the Learning English studio page
+├── tests/                    # Unit tests — python -m unittest discover -s tests
 └── config/
-    └── api_keys.json         # API key, OS setting, assistant name, user name, voice, UI colour, audio devices
+    └── api_keys.json         # Created on first launch: keys, OS, names, voice engine and voices, UI colour, audio devices
 ```
 
 ---

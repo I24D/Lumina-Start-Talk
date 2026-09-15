@@ -41,9 +41,15 @@ body:
     id: python
     attributes:
       label: Python version
-      placeholder: "3.12.4"
+      placeholder: "3.14.5"
     validations:
       required: true
+  - type: dropdown
+    id: voice
+    attributes:
+      label: Voice engine / Motor de voz
+      description: Chosen in ⚙ Customise Assistant. The two engines behave differently.
+      options: ["Gemini Live", "OpenAI Realtime", "Not about voice"]
   - type: dropdown
     id: admin
     attributes:

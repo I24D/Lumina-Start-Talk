@@ -50,6 +50,8 @@ a fallback data source, filtering, and a background thread.
   lines. Comments explain *why*, not *what*.
 - Say in the PR **how you tested it**. "Ran the app and asked X, got Y" is a real test and is
   worth more than a description of what the code should do.
+- Run the unit tests before opening it: `python -m unittest discover -s tests` from the project
+  root.
 - If your change touches Windows-, macOS- or Linux-specific behaviour, say which of them you
   actually ran it on. Nobody has all three; being honest about coverage helps the reviewer.
 
